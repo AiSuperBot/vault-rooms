@@ -30,11 +30,16 @@ export function founder(workspaceName = "Team", userName = "Ana"): { chain: Work
 }
 
 /** Sign the next version with `device`, apply it to `chain`, and return it. Throws if the change isn't allowed. */
-export function step(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, now = Date.now()): SignedVersion {
-  const version = nextVersion(chain.workspaceId, chain.head, device.sign, change, now);
+export function step(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, now = Date.now(), joins: JoinRecord[] = []): SignedVersion {
+  const version = nextVersion(chain.workspaceId, chain.head, device.sign, change, now, joins);
   const result = chain.offer([version]);
   if (result.status !== "appended") throw new Error(`step not appended: ${JSON.stringify(result)}`);
   return version;
+}
+
+/** Record a join in the chain, with the joiner's proof. */
+export function fold(chain: WorkspaceChain, device: TestDevice, join: JoinRecord): SignedVersion {
+  return step(chain, device, (state) => foldJoinInto(state, join), Date.now(), [join]);
 }
 
 export function createRoom(chain: WorkspaceChain, device: TestDevice, name = "Design", members: Record<string, Role> = {}): { roomId: string; key: Uint8Array } {
@@ -73,6 +78,6 @@ export function invite(
     agreementPublicKey: joiner.agree.publicKey,
     tlsFingerprint: joiner.tls
   });
-  if (options.fold !== false) step(chain, admin, (state) => foldJoinInto(state, join));
+  if (options.fold !== false) fold(chain, admin, join);
   return { joiner, join, inviteId: fresh.inviteId, secret: fresh.secret };
 }

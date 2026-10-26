@@ -2,14 +2,14 @@ import { describe, expect, it } from "vitest";
 import { WorkspaceChain } from "./chain.js";
 import { SecureError } from "./errors.js";
 import { randomId } from "./ids.js";
-import { createJoinRecord, foldJoinInto, newInvite } from "./invite.js";
+import { createJoinRecord, foldJoinInto, JOIN_EXPIRY_SLACK_MS, newInvite, type JoinRecord } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName } from "./keys.js";
-import { createRoom, founder, invite, newDevice, step, type TestDevice } from "./testkit.js";
+import { createRoom, fold, founder, invite, newDevice, step, type TestDevice } from "./testkit.js";
 import { nextVersion, parseSignedVersion, roleIn, signVersion, verifyGenesis, type WorkspaceState } from "./workspace.js";
 
-function forbidden(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void): string {
+function forbidden(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, joins: JoinRecord[] = [], now = Date.now()): string {
   try {
-    nextVersion(chain.workspaceId, chain.head, device.sign, change);
+    nextVersion(chain.workspaceId, chain.head, device.sign, change, now, joins);
   } catch (error) {
     if (error instanceof SecureError) return `${error.code}:${error.message}`;
     throw error;
@@ -133,7 +133,7 @@ describe("devices and users", () => {
     step(chain, ben, (state) => (state.invites[own.inviteId] = own.record));
     const laptop = newDevice(ben.userId, "Ben laptop");
     const join = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: own.inviteId, secret: own.secret, user: { id: ben.userId, name: "Ben" }, deviceName: laptop.name, deviceKey: laptop.sign, agreementPublicKey: laptop.agree.publicKey, tlsFingerprint: laptop.tls });
-    step(chain, ben, (state) => foldJoinInto(state, join));
+    fold(chain, ben, join);
     expect(chain.state.devices[laptop.id]?.user).toBe(ben.userId);
     // The laptop is Ben's, so it has Ben's role.
     expect(roleIn(chain.state, roomId, chain.state.devices[laptop.id]!.user)).toBe("write");
@@ -164,11 +164,61 @@ describe("devices and users", () => {
     step(chain, admin, (state) => delete state.rooms[roomId]!.members[admin.userId]);
     const { join } = invite(chain, admin, { fold: false });
     expect(
-      forbidden(chain, admin, (state) => {
-        foldJoinInto(state, join);
-        state.rooms[roomId]!.members[join.body.user.id] = "manage";
-      })
+      forbidden(
+        chain,
+        admin,
+        (state) => {
+          foldJoinInto(state, join);
+          state.rooms[roomId]!.members[join.body.user.id] = "manage";
+        },
+        [join]
+      )
     ).toBe(`forbidden:room_members:${roomId}`);
+  });
+
+  it("recording a join needs the joiner's proof, and only what it proves", () => {
+    const { chain, admin } = founder();
+    const { roomId } = createRoom(chain, admin, "Docs");
+    const { join, inviteId } = invite(chain, admin, { rooms: { [roomId]: "write" }, fold: false });
+    // Without the record.
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join))).toBe(`forbidden:invite_proof:${inviteId}`);
+    // With the record, but the admin's own device keys put in its place.
+    const swap = newDevice(join.body.user.id, "Swapped");
+    expect(
+      forbidden(
+        chain,
+        admin,
+        (state) => {
+          foldJoinInto(state, join);
+          const device = state.devices[join.body.device.id]!;
+          delete state.devices[join.body.device.id];
+          state.devices[swap.id] = { ...device, sign: swap.sign.publicKey, agree: swap.agree.publicKey };
+          state.invites[inviteId]!.used = swap.id;
+        },
+        [join]
+      )
+    ).toBe(`forbidden:invite_device:${inviteId}`);
+    // Too late.
+    const expires = chain.state.invites[inviteId]!.expires;
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join], expires + JOIN_EXPIRY_SLACK_MS + 1)).toBe(`forbidden:invite_expired:${inviteId}`);
+    // A stray record that this version doesn't use.
+    const other = invite(chain, admin, { fold: false });
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join, other.join])).toBe("forbidden:join_unused");
+  });
+
+  it("any member may record a proven join, and nobody can fill someone else's invite", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "write" });
+    const { join } = invite(chain, admin, { rooms: { [roomId]: "read" }, fold: false });
+    fold(chain, ben, join); // Ben isn't an admin, but the proof is all that's needed.
+    expect(roleIn(chain.state, roomId, join.body.user.id)).toBe("read");
+    // Ben's own-device invite: Ana (admin) doesn't know its secret, so she can't fill it with her device.
+    const own = newInvite(ben.userId, {}, Date.now() + 3_600_000, ben.userId);
+    step(chain, ben, (state) => (state.invites[own.inviteId] = own.record));
+    const anasDevice = newDevice(ben.userId, "Ana's spare");
+    const forged = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: own.inviteId, secret: newInvite(ben.userId, {}, 0).secret, user: { id: ben.userId, name: "Ben" }, deviceName: anasDevice.name, deviceKey: anasDevice.sign, agreementPublicKey: anasDevice.agree.publicKey, tlsFingerprint: anasDevice.tls });
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, forged), [forged])).toBe(`forbidden:invite_proof:${own.inviteId}`);
   });
 
   it("removed users and revoked devices can't sign", () => {

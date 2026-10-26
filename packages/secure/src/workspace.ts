@@ -3,6 +3,7 @@ import { canonicalJson } from "./canonical.js";
 import { hashTagged, sign, verify, type KeyPair } from "./crypto.js";
 import { fail } from "./errors.js";
 import { deviceIdFor, randomId } from "./ids.js";
+import { JOIN_EXPIRY_SLACK_MS, parseJoinRecord, verifyJoinProof, type JoinRecord } from "./invite.js";
 import * as v from "./validate.js";
 
 /**
@@ -94,6 +95,8 @@ export interface WorkspaceBody {
   /** Signer's clock, informational only. */
   at: number;
   state: WorkspaceState;
+  /** Join records this version writes into the record (each invite it marks used needs its joiner's proof). */
+  joins?: JoinRecord[];
 }
 
 export interface SignedVersion {
@@ -201,7 +204,7 @@ export function parseState(value: unknown): WorkspaceState {
 
 export function parseSignedVersion(value: unknown): SignedVersion {
   const o = v.obj(value, "version", ["body", "sig"]);
-  const b = v.obj(o.body, "body", ["kind", "ws", "v", "prev", "by", "at", "state"]);
+  const b = v.obj(o.body, "body", ["kind", "ws", "v", "prev", "by", "at", "state", "joins"]);
   if (b.kind !== "vr-ws-v1") v.bad("body.kind");
   const version = v.int(b.v, "body.v", 0, 1e12);
   const body: WorkspaceBody = {
@@ -213,6 +216,10 @@ export function parseSignedVersion(value: unknown): SignedVersion {
     at: v.int(b.at, "body.at", 0, Number.MAX_SAFE_INTEGER),
     state: parseState(b.state)
   };
+  if (b.joins !== undefined) {
+    if (!Array.isArray(b.joins) || b.joins.length === 0 || b.joins.length > 20) v.bad("body.joins");
+    body.joins = b.joins.map(parseJoinRecord);
+  }
   return { body, sig: v.b64(o.sig, "sig", 64) };
 }
 
@@ -321,27 +328,29 @@ function deny(reason: string): never {
  *
  * The rules, chosen so that no single role can quietly read a room it isn't in:
  * - Admins manage the workspace: its settings, new users, removing users, revoking devices, and invites for new people.
- * - A device is only ever added through an invite marked used in the same version. A new device of an existing user
- *   needs an invite that this same user created, so an admin can't slip a device under someone else's name
- *   (which would make that user's rooms share their keys with it).
+ * - A device is only ever added through an invite marked used in the same version, together with the joiner's record
+ *   signed with the invite secret's key; the device and user added must match that record exactly. A new device of
+ *   an existing user needs an invite this same user created. So nobody, admins included, can put a device of their
+ *   choosing into an invite (which would make the invite's rooms, or that user's rooms, share their keys with it).
  * - Room membership is changed by the room's managers only. An admin's invite may grant rooms the admin manages.
  *   Anyone may leave a room. Writers may add a key epoch (key rotation) but change nothing else.
  * - Users may rename themselves and revoke their own devices.
  */
-export function authorize(prev: WorkspaceState, next: WorkspaceState, signerUserId: string, at: number): void {
+export function authorize(prev: WorkspaceState, next: WorkspaceState, signerUserId: string, at: number, workspaceId: string, joins: readonly JoinRecord[] = []): void {
   const signer = prev.users[signerUserId]!;
   const admin = signer.admin;
 
   if ((next.name !== prev.name || next.roomCreation !== prev.roomCreation) && !admin) deny("settings");
 
-  // Invites marked used in this version: they justify the devices, users and room grants they bring.
+  // Invites marked used in this version: with their joiner's proof they justify the devices, users and room grants they bring.
   const newDevices = new Map<string, InviteRecord>();
+  const newUsers = new Set<string>();
+  const foldedInvites = new Set<string>();
   const grants = new Map<string, Role>();
   for (const inviteId of keysOf(prev.invites, next.invites)) {
     const before = prev.invites[inviteId];
     const after = next.invites[inviteId];
     if (before && after && sameJson(before, after)) continue;
-    const ownDeviceInvite = (before ?? after)!.forUser === signerUserId && (before ?? after)!.by === signerUserId;
     if (!after) {
       if (!(admin || before!.by === signerUserId)) deny(`invite_withdraw:${inviteId}`);
       continue;
@@ -359,17 +368,37 @@ export function authorize(prev: WorkspaceState, next: WorkspaceState, signerUser
       }
       continue;
     }
-    // The only change to an existing invite: recording the device that used it.
+    // The only change to an existing invite: recording the device that used it. Any member may record it, but only
+    // with the joiner's own record, signed with the invite secret's key, and only exactly what that record says.
     const { used: usedAfter, ...restAfter } = after;
     const { used: usedBefore, ...restBefore } = before;
     if (!sameJson(restAfter, restBefore) || usedBefore !== undefined || usedAfter === undefined) deny(`invite_changed:${inviteId}`);
-    if (!(admin || ownDeviceInvite)) deny(`invite_fold:${inviteId}`);
+    const proofs = joins.filter((join) => join.body.invite === inviteId);
+    if (proofs.length !== 1) deny(`invite_proof:${inviteId}`);
+    const join = proofs[0]!;
+    try {
+      verifyJoinProof(workspaceId, inviteId, before, join);
+    } catch {
+      deny(`invite_proof:${inviteId}`);
+    }
+    if (at > before.expires + JOIN_EXPIRY_SLACK_MS) deny(`invite_expired:${inviteId}`);
+    const { user: joiner, device: joinDevice } = join.body;
     const device = next.devices[usedAfter];
-    if (!device || prev.devices[usedAfter] || newDevices.has(usedAfter)) deny(`invite_device:${inviteId}`);
-    if (after.forUser !== undefined ? device.user !== after.forUser : prev.users[device.user] !== undefined) deny(`invite_device_user:${inviteId}`);
-    newDevices.set(usedAfter, after);
-    for (const [roomId, role] of Object.entries(after.rooms)) grants.set(`${roomId}:${device.user}`, role);
+    const expected: DeviceRecord = { user: joiner.id, name: joinDevice.name, sign: joinDevice.sign, agree: joinDevice.agree, tls: joinDevice.tls };
+    if (joinDevice.id !== usedAfter || !device || prev.devices[usedAfter] || newDevices.has(usedAfter) || !sameJson(device, expected)) deny(`invite_device:${inviteId}`);
+    if (before.forUser !== undefined) {
+      if (device.user !== before.forUser) deny(`invite_device_user:${inviteId}`);
+    } else {
+      if (prev.users[device.user] !== undefined || newUsers.has(device.user)) deny(`invite_device_user:${inviteId}`);
+      if (!sameJson(next.users[device.user], { name: joiner.name, admin: false })) deny(`invite_user:${inviteId}`);
+      newUsers.add(device.user);
+    }
+    newDevices.set(usedAfter, before);
+    foldedInvites.add(inviteId);
+    for (const [roomId, role] of Object.entries(before.rooms)) grants.set(`${roomId}:${device.user}`, role);
   }
+
+  for (const join of joins) if (!foldedInvites.has(join.body.invite)) deny("join_unused");
 
   for (const userId of keysOf(prev.users, next.users)) {
     const before = prev.users[userId];
@@ -377,8 +406,7 @@ export function authorize(prev: WorkspaceState, next: WorkspaceState, signerUser
     if (!after) deny(`user_deleted:${userId}`);
     if (before && sameJson(before, after)) continue;
     if (!before) {
-      if (!admin) deny(`user_add:${userId}`);
-      if (after.removed) deny(`user_add:${userId}`);
+      if (!(admin || newUsers.has(userId)) || after.removed) deny(`user_add:${userId}`);
       continue;
     }
     if (before.removed && !after.removed) deny(`user_restored:${userId}`);
@@ -450,7 +478,7 @@ export function verifyNext(workspaceId: string, prev: SignedVersion, prevHash: s
   const device = activeDevice(prev.body.state, body.by);
   if (!device) fail("forbidden", "signer");
   if (!verify(device.sign, SIG_PURPOSE, utf8(canonicalJson(body)), next.sig)) fail("bad_signature");
-  authorize(prev.body.state, body.state, device.user, body.at);
+  authorize(prev.body.state, body.state, device.user, body.at, workspaceId, body.joins ?? []);
 }
 
 /** Build the next version from the current head. `change` edits a deep copy of the state. */
@@ -459,11 +487,13 @@ export function nextVersion(
   head: SignedVersion,
   deviceKey: KeyPair,
   change: (state: WorkspaceState) => void,
-  now = Date.now()
+  now = Date.now(),
+  joins: JoinRecord[] = []
 ): SignedVersion {
   const state = structuredClone(head.body.state);
   change(state);
   const body: WorkspaceBody = { kind: "vr-ws-v1", ws: workspaceId, v: head.body.v + 1, prev: versionHash(head), by: deviceIdFor(deviceKey.publicKey), at: now, state: parseState(state) };
+  if (joins.length > 0) body.joins = joins;
   const next = signVersion(body, deviceKey);
   verifyNext(workspaceId, head, versionHash(head), next);
   return next;

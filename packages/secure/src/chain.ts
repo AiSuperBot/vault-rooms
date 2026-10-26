@@ -108,31 +108,69 @@ export class WorkspaceChain {
       this.hashes.push(...theirHashes);
       return { status: "appended", count: theirs.length };
     }
+    // A conflict reaching far back is refused: only a long partition with admins busy on both sides produces one
+    // legitimately, while a once-trusted signer could otherwise try to rewrite old history.
+    if (ours.length > MAX_FORK_DEPTH) return { status: "rejected", reason: "fork_too_deep" };
     const forkState = this.versions[divergeAt - 1]!.body.state;
-    if (!preferBranch(forkState, theirs, theirHashes[0]!, ours, this.hashes[divergeAt]!)) return { status: "rejected", reason: "loses" };
+    const seniority = this.seniority(divergeAt - 1);
+    if (!preferBranch(forkState, seniority, theirs, theirHashes[0]!, ours, this.hashes[divergeAt]!)) return { status: "rejected", reason: "loses" };
     this.versions.splice(divergeAt, ours.length, ...theirs);
     this.hashes.splice(divergeAt, ours.length, ...theirHashes);
     return { status: "replaced", lost: ours, count: theirs.length };
   }
+
+  /** For each user present at version `upTo`, the version that first listed them (lower = more senior). */
+  private seniority(upTo: number): Map<string, number> {
+    const firstSeen = new Map<string, number>();
+    for (let v = 0; v <= upTo; v++) for (const userId of Object.keys(this.versions[v]!.body.state.users)) if (!firstSeen.has(userId)) firstSeen.set(userId, v);
+    return firstSeen;
+  }
 }
 
-/** Whether `a` removes the signer of any version in `b`: revokes its device or removes its user. */
-function revokesSignerOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
+export const MAX_FORK_DEPTH = 64;
+
+/**
+ * Whether branch `a` takes away authority that a version in `b` relied on: it revokes that version's signing
+ * device, removes its user, or demotes an admin signer.
+ */
+function removesAuthorityOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
   const finalState = a[a.length - 1]!.body.state;
   return b.some((version) => {
     const signer = activeDevice(forkState, version.body.by);
-    return signer !== null && activeDevice(finalState, version.body.by) === null;
+    if (!signer) return false;
+    if (activeDevice(finalState, version.body.by) === null) return true;
+    return forkState.users[signer.user]!.admin && !finalState.users[signer.user]?.admin;
   });
 }
 
+/** Ordering of a branch's first signer: admins first, then the user listed earliest, then the device id. */
+function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: SignedVersion): [number, number, string] {
+  const device = activeDevice(forkState, first.body.by)!;
+  return [forkState.users[device.user]!.admin ? 0 : 1, seniority.get(device.user) ?? Number.MAX_SAFE_INTEGER, first.body.by];
+}
+
 /**
- * True if branch `a` should replace branch `b` (both start at the same version after the fork).
- * A branch that removes a signer of the other wins, so a device or admin being removed can't race a branch of
- * its own past the removal. Otherwise the branch whose first version has the lower hash wins.
+ * True if branch `a` should replace branch `b` (both start right after the same version, which has `forkState`).
+ *
+ * 1. A branch that takes away authority a version of the other relied on wins, so a device or admin being removed
+ *    can't race a branch of its own past the removal.
+ * 2. If both or neither do, the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the
+ *    signer, unlike a hash, which a signer can grind by re-signing with small changes.
+ * 3. Only two versions from the same device (which has no one to outrank) fall back to the lower hash.
  */
-export function preferBranch(forkState: WorkspaceState, a: SignedVersion[], aFirstHash: string, b: SignedVersion[], bFirstHash: string): boolean {
-  const aRemovesB = revokesSignerOf(forkState, a, b);
-  const bRemovesA = revokesSignerOf(forkState, b, a);
+export function preferBranch(
+  forkState: WorkspaceState,
+  seniority: Map<string, number>,
+  a: SignedVersion[],
+  aFirstHash: string,
+  b: SignedVersion[],
+  bFirstHash: string
+): boolean {
+  const aRemovesB = removesAuthorityOf(forkState, a, b);
+  const bRemovesA = removesAuthorityOf(forkState, b, a);
   if (aRemovesB !== bRemovesA) return aRemovesB;
+  const ra = rank(forkState, seniority, a[0]!);
+  const rb = rank(forkState, seniority, b[0]!);
+  for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i]! < rb[i]!;
   return aFirstHash < bFirstHash;
 }

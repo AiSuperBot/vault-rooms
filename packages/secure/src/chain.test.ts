@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { WorkspaceChain } from "./chain.js";
+import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { nextVersion, versionHash } from "./workspace.js";
 
@@ -45,10 +45,10 @@ describe("workspace chain", () => {
     const anaResult = anaChain.offer([fromBen]);
     const benResult = benChain.offer([fromAna]);
     expect(anaChain.headHash).toBe(benChain.headHash);
-    const winner = versionHash(fromAna) < versionHash(fromBen) ? "Ana's name" : "Ben's name";
-    expect(anaChain.state.name).toBe(winner);
-    // Exactly one side lost its version and is told so.
-    expect([anaResult.status, benResult.status].sort()).toEqual(["rejected", "replaced"]);
+    // Ana has been an admin longer, so her version wins, whatever the hashes; Ben is told his was replaced.
+    expect(anaChain.state.name).toBe("Ana's name");
+    expect(anaResult.status).toBe("rejected");
+    expect(benResult).toMatchObject({ status: "replaced", lost: [fromBen] });
   });
 
   it("a branch that revokes the other side's signer always wins", () => {
@@ -68,7 +68,58 @@ describe("workspace chain", () => {
     }
   });
 
-  it("settles a deeper fork by its first differing version", () => {
+  it("two admins revoking each other: the senior one stands, however the other grinds hashes", () => {
+    for (let round = 0; round < 8; round++) {
+      const { chain: anaChain, admin: ana } = founder();
+      const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+      step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
+      const benChain = WorkspaceChain.load(anaChain.all());
+      const anaRevokesBen = nextVersion(anaChain.workspaceId, anaChain.head, ana.sign, (state) => (state.devices[ben.id]!.revoked = true));
+      // Ben tries many timestamps and keeps the lowest hash he can find.
+      let benRevokesAna = nextVersion(benChain.workspaceId, benChain.head, ben.sign, (state) => (state.devices[ana.id]!.revoked = true), 1);
+      for (let at = 2; at < 40; at++) {
+        const attempt = nextVersion(benChain.workspaceId, benChain.head, ben.sign, (state) => (state.devices[ana.id]!.revoked = true), at);
+        if (versionHash(attempt) < versionHash(benRevokesAna)) benRevokesAna = attempt;
+      }
+      anaChain.offer([anaRevokesBen]);
+      benChain.offer([benRevokesAna]);
+      anaChain.offer([benRevokesAna]);
+      benChain.offer([anaRevokesBen]);
+      expect(anaChain.headHash).toBe(benChain.headHash);
+      expect(anaChain.state.devices[ben.id]!.revoked).toBe(true);
+      expect(anaChain.state.devices[ana.id]!.revoked).toBeUndefined();
+    }
+  });
+
+  it("demoting an admin counts like revoking them", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
+    const benChain = WorkspaceChain.load(anaChain.all());
+    const demote = nextVersion(anaChain.workspaceId, anaChain.head, ana.sign, (state) => (state.users[ben.userId]!.admin = false));
+    const revokeAna = nextVersion(benChain.workspaceId, benChain.head, ben.sign, (state) => (state.devices[ana.id]!.revoked = true));
+    anaChain.offer([demote]);
+    benChain.offer([revokeAna]);
+    anaChain.offer([revokeAna]);
+    benChain.offer([demote]);
+    expect(benChain.headHash).toBe(anaChain.headHash);
+    expect(benChain.state.users[ben.userId]!.admin).toBe(false);
+  });
+
+  it("refuses to rewrite history further back than the fork limit", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
+    const benChain = WorkspaceChain.load(anaChain.all());
+    const benVersion = step(benChain, ben, (state) => (state.name = "Ben's"));
+    for (let i = 0; i <= MAX_FORK_DEPTH; i++) step(anaChain, ana, (state) => (state.name = `Ana ${i}`));
+    expect(anaChain.offer([benVersion])).toEqual({ status: "rejected", reason: "fork_too_deep" });
+    // The other way round it is an ordinary conflict, which Ana's branch wins.
+    expect(benChain.offer(anaChain.since(benVersion.body.v)).status).toBe("replaced");
+    expect(benChain.headHash).toBe(anaChain.headHash);
+  });
+
+  it("settles a deeper fork the same way", () => {
     const { chain: anaChain, admin: ana } = founder();
     const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
     step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
@@ -79,6 +130,7 @@ describe("workspace chain", () => {
     anaChain.offer([b1]);
     benChain.offer([a1, a2]);
     expect(anaChain.headHash).toBe(benChain.headHash);
-    expect(anaChain.state.name).toBe(versionHash(a1) < versionHash(b1) ? "A2" : "B1");
+    expect(anaChain.state.name).toBe("A2");
+    expect(versionHash(a1)).not.toBe(versionHash(b1));
   });
 });

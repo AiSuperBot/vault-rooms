@@ -150,6 +150,21 @@ export function joinHash(join: JoinRecord): string {
 export const JOIN_EXPIRY_SLACK_MS = 10 * 60_000;
 
 /**
+ * The proof part of a join: it names this workspace and invite, it is signed with the key derived from the
+ * invite's secret, and with the new device's own key. Whoever records a join in the workspace chain must include
+ * the record, and every peer re-checks this, so no one can fill an invite with a device of their own choosing.
+ */
+export function verifyJoinProof(workspaceId: string, inviteId: string, invite: InviteRecord, join: JoinRecord): void {
+  const { body } = join;
+  if (body.ws !== workspaceId || body.invite !== inviteId) fail("join_workspace");
+  if (deviceIdFor(body.device.sign) !== body.device.id) fail("join_device");
+  if (invite.forUser !== undefined && body.user.id !== invite.forUser) fail("join_user");
+  const message = utf8(canonicalJson(body));
+  if (!verify(invite.key, JOIN_INVITE_SIG, message, join.inviteSig)) fail("join_invite_signature");
+  if (!verify(body.device.sign, JOIN_DEVICE_SIG, message, join.deviceSig)) fail("join_device_signature");
+}
+
+/**
  * Throws unless `join` is a valid, still-unrecorded use of an open invite in `state`.
  * `firstSeen` is when this peer first saw the record (its own clock, not the record's claim).
  */
@@ -165,9 +180,7 @@ export function verifyJoinRecord(state: WorkspaceState, workspaceId: string, joi
     if (body.user.id !== invite.forUser || !user || user.removed) fail("join_user");
   } else if (state.users[body.user.id]) fail("join_user");
   if (state.devices[body.device.id]) fail("join_device");
-  const message = utf8(canonicalJson(body));
-  if (!verify(invite.key, JOIN_INVITE_SIG, message, join.inviteSig)) fail("join_invite_signature");
-  if (!verify(body.device.sign, JOIN_DEVICE_SIG, message, join.deviceSig)) fail("join_device_signature");
+  verifyJoinProof(workspaceId, body.invite, invite, join);
 }
 
 /**
