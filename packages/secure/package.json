@@ -8,6 +8,8 @@
   },
   "types": "./src/index.ts",
   "dependencies": {
+    "@peculiar/x509": "2.0.0",
+    "reflect-metadata": "0.2.2",
     "yjs": "13.6.31"
   }
 }

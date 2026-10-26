@@ -17,15 +17,16 @@ export interface TestDevice {
   tls: string;
 }
 
-export function newDevice(userId: string, name = "PC"): TestDevice {
+/** `tls`: a real certificate fingerprint when the test opens real connections; otherwise a random stand-in. */
+export function newDevice(userId: string, name = "PC", tls?: string): TestDevice {
   const sign = newSigningKeyPair();
-  return { id: deviceIdFor(sign.publicKey), userId, name, sign, agree: newAgreementKeyPair(), tls: b64u(hashTagged("tls-test", randomBytes(16))) };
+  return { id: deviceIdFor(sign.publicKey), userId, name, sign, agree: newAgreementKeyPair(), tls: tls ?? b64u(hashTagged("tls-test", randomBytes(16))) };
 }
 
-export function founder(workspaceName = "Team", userName = "Ana"): { chain: WorkspaceChain; ws: string; admin: TestDevice } {
+export function founder(workspaceName = "Team", userName = "Ana", tlsFingerprint?: string): { chain: WorkspaceChain; ws: string; admin: TestDevice } {
   const sign = newSigningKeyPair();
   const agree = newAgreementKeyPair();
-  const tls = b64u(hashTagged("tls-test", randomBytes(16)));
+  const tls = tlsFingerprint ?? b64u(hashTagged("tls-test", randomBytes(16)));
   const { genesis, workspaceId, userId, deviceId } = createGenesis({ workspaceName, userName, deviceName: "Ana PC", deviceKey: sign, agreementPublicKey: agree.publicKey, tlsFingerprint: tls });
   return { chain: new WorkspaceChain(genesis), ws: workspaceId, admin: { id: deviceId, userId, name: "Ana PC", sign, agree, tls } };
 }
@@ -61,14 +62,14 @@ export function createRoom(chain: WorkspaceChain, device: TestDevice, name = "De
 export function invite(
   chain: WorkspaceChain,
   admin: TestDevice,
-  options: { rooms?: Record<string, Role>; userName?: string; fold?: boolean; forUser?: TestDevice; expires?: number } = {}
+  options: { rooms?: Record<string, Role>; userName?: string; fold?: boolean; forUser?: TestDevice; expires?: number; tls?: string } = {}
 ): { joiner: TestDevice; join: JoinRecord; inviteId: string; secret: Uint8Array } {
   const forUser = options.forUser;
   const fresh = newInvite(admin.userId, options.rooms ?? {}, options.expires ?? Date.now() + 86_400_000, forUser?.userId);
   step(chain, admin, (state) => {
     state.invites[fresh.inviteId] = fresh.record;
   });
-  const joiner = newDevice(forUser?.userId ?? randomId("u"), `${options.userName ?? "Ben"} PC`);
+  const joiner = newDevice(forUser?.userId ?? randomId("u"), `${options.userName ?? "Ben"} PC`, options.tls);
   const join = createJoinRecord({
     workspaceId: chain.workspaceId,
     inviteId: fresh.inviteId,

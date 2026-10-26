@@ -12,3 +12,8 @@ export * from "./paths.js";
 export * from "./replica.js";
 export * from "./store.js";
 export * from "./workspace.js";
+export * from "./discovery.js";
+export * from "./frames.js";
+export * from "./peers.js";
+export * from "./tlsIdentity.js";
+export * from "./transport.js";

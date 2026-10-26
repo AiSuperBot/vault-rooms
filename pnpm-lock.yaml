@@ -114,6 +114,12 @@ importers:
 
   packages/secure:
     dependencies:
+      '@peculiar/x509':
+        specifier: 2.0.0
+        version: 2.0.0
+      reflect-metadata:
+        specifier: 0.2.2
+        version: 0.2.2
       yjs:
         specifier: 13.6.31
         version: 13.6.31

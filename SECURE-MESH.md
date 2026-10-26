@@ -49,15 +49,17 @@ Peers can see: which devices are online, which rooms exist (as random ids), how 
 - **Updates** are signed by the author device and numbered per document per author. Peers verify the signature and that the author's user had `write` in the room when they accept it; read-only members' updates are dropped.
 - **Snapshots** compact a document: a writer encrypts the full state and lists the update counters it covers; peers that verify the snapshot contains what they hold may prune covered updates.
 
-## 6. Sync protocol between two peers
+## 6. Connections and sync between two peers
 
-1. TLS connect; the dialling peer pins the other's certificate fingerprint from the workspace state.
-2. Both sign a challenge bound to the TLS channel (exported keying material) with their device keys, which authenticates the dialler too and defeats relayed handshakes.
-3. Exchange workspace and room state heads; the side behind fetches newer versions.
-4. Exchange per-room digests; for rooms that differ, per-document version vectors; send the missing updates, snapshots and blobs.
-5. Stay connected: live updates and cursor positions are pushed as they happen and forwarded to other connected peers that don't have them yet.
+(`transport.ts`, `discovery.ts`, `peers.ts`, `mesh.ts`)
 
-Discovery: signed UDP announcements (workspace, device, port, time) to a multicast group and the subnet broadcast; peers with a known address are also dialled directly. Unauthenticated packets only ever trigger a TLS dial that must then pass steps 1–2.
+1. **TLS 1.3.** Each device has its own self-signed ECDSA P-256 certificate; the workspace record lists each device's certificate fingerprint. There is no certificate authority, so instead of Node's chain check the dialling peer checks the exact certificate against the fingerprint of the device it meant to reach, before it sends anything.
+2. **Authentication bound to the connection.** The dialler signs the TLS session's exported keying material together with both device ids; the acceptor answers with its own signature over the same. A signature only verifies on that very connection, so nobody in the middle can relay someone else's authentication. A device that isn't a member yet sends its public key and may then only present its join record.
+3. **Framing.** Length-prefixed JSON frames: at most 64 KiB and 10 seconds before authentication, 64 MiB after. Heartbeats every 15 seconds; a peer silent for 45 seconds is dropped. At most 16 unauthenticated connections at a time.
+4. **Sync.** Both sides exchange workspace record heads (each sends what the other lacks; conflicting branches are settled as in §3), pending joins and key wraps, then per-room digests, and for rooms that differ, per-document version vectors and snapshot keys. Each side then sends exactly what the other is missing.
+5. **Live.** Updates and cursor positions are pushed as they happen and passed on to the other connected peers that don't have them yet.
+
+**Discovery.** Every 15 seconds each peer announces "device D listens on port P" by UDP multicast and broadcast, signed by its device key and tagged with a hash of the workspace id. Receivers drop anything not signed by a current member or older than two minutes. A valid announcement only leads to a dial, which must still pass steps 1–2. Peers can also be given by address where multicast is blocked. One connection is kept per peer: if both dial at once, the one dialled by the lower device id stays.
 
 ## 7. Joining
 
