@@ -84,6 +84,8 @@ export class MeshService {
   private presenceListeners = new Set<(env: PresenceEnvelope) => void>();
   private replicas = new Map<string, RoomReplica>();
   private replicaListeners = new Set<(roomId: string, replica: RoomReplica | null) => void>();
+  private activityListeners = new Set<(roomId: string) => void>();
+  private refusedListeners = new Set<(roomId: string, docId: string) => void>();
   private server: PeerServer | null = null;
   private manager: PeerManager | null = null;
   private discovery: Discovery | null = null;
@@ -92,6 +94,8 @@ export class MeshService {
   private automateTimer: ReturnType<typeof setTimeout> | null = null;
   private saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private automating = false;
+  /** Keys of rooms this device just created, handed to the replica before anyone hears of it. */
+  private ownKeys = new Map<string, { n: number; key: Uint8Array }>();
   private stopped = false;
 
   private constructor(
@@ -111,11 +115,16 @@ export class MeshService {
     };
     events.wraps = () => {
       this.saveSoon("wraps", () => this.disk.saveWraps(this.node.allWraps()));
-      for (const replica of this.replicas.values()) replica.refreshKeys();
+      for (const [roomId, replica] of this.replicas) if (replica.refreshKeys()) this.roomActivity(roomId);
       this.automateSoon();
       this.emit();
     };
-    events.envelope = (env) => this.replicas.get(env.room)?.receive(env);
+    events.envelope = (env) => {
+      const replica = this.replicas.get(env.room);
+      if (!replica) return;
+      replica.receive(env);
+      this.roomActivity(env.room);
+    };
     events.presence = (env) => {
       for (const listener of this.presenceListeners) listener(env);
     };
@@ -281,6 +290,22 @@ export class MeshService {
     return () => this.replicaListeners.delete(listener);
   }
 
+  /** Something arrived for a room (content or a key): its folder should look again. */
+  onRoomActivity(listener: (roomId: string) => void): () => void {
+    this.activityListeners.add(listener);
+    return () => this.activityListeners.delete(listener);
+  }
+
+  /** A local edit was refused (this user may only read): rebuild the document from the shared history. */
+  onLocalRefused(listener: (roomId: string, docId: string) => void): () => void {
+    this.refusedListeners.add(listener);
+    return () => this.refusedListeners.delete(listener);
+  }
+
+  private roomActivity(roomId: string): void {
+    for (const listener of this.activityListeners) listener(roomId);
+  }
+
   private emit(): void {
     for (const listener of this.listeners) listener();
   }
@@ -374,9 +399,9 @@ export class MeshService {
     return version;
   }
 
-  async createRoom(name: string, members: Record<string, Role> = {}): Promise<string> {
-    const roomId = randomId("r");
+  async createRoom(name: string, members: Record<string, Role> = {}, roomId = randomId("r")): Promise<string> {
     const key = newRoomKey();
+    this.ownKeys.set(roomId, { n: 1, key });
     await this.commit((state) => {
       state.rooms[roomId] = {
         creator: this.settings.userId,
@@ -386,7 +411,7 @@ export class MeshService {
       };
     });
     this.syncReplicas();
-    this.replicas.get(roomId)?.addOwnKey(1, key);
+    this.ownKeys.delete(roomId);
     this.automateSoon();
     return roomId;
   }
@@ -515,7 +540,14 @@ export class MeshService {
     }
     for (const roomId of mine) {
       if (this.replicas.has(roomId)) continue;
-      const replica = new RoomReplica(this.node, roomId, { sign: this.secrets.sign, agree: this.secrets.agree });
+      const replica = new RoomReplica(this.node, roomId, { sign: this.secrets.sign, agree: this.secrets.agree }, {
+        // A local edit that can't be shared (a reader, or access just ended): the owner rebuilds that document.
+        localRefused: (docId) => {
+          for (const listener of this.refusedListeners) listener(roomId, docId);
+        }
+      });
+      const own = this.ownKeys.get(roomId);
+      if (own) replica.addOwnKey(own.n, own.key);
       this.replicas.set(roomId, replica);
       for (const listener of this.replicaListeners) listener(roomId, replica);
     }

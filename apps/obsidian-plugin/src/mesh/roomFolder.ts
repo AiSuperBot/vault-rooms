@@ -106,6 +106,11 @@ export class RoomFolder {
     return id && this.o.replica.files().get(id)?.kind === "md" ? id : null;
   }
 
+  /** Hash of what was last synced for a file (for the editor binding), or null. */
+  syncedHash(fileId: string): string | null {
+    return this.known.get(fileId)?.hash ?? null;
+  }
+
   // ---- running ----
 
   private run(task: () => Promise<void>): Promise<void> {
@@ -420,7 +425,8 @@ export class RoomFolder {
         return this.createEntry(relative);
       }
       if (hash === this.known.get(id)?.hash) return this.remember(id, relative, hash);
-      if (entry.kind === "md" && this.o.isBound(id)) return this.remember(id, relative, sha(this.o.replica.noteText(id)));
+      // An editor owns the note while bound (its edits already went into the shared text); a reader's never do.
+      if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) return this.remember(id, relative, sha(this.o.replica.noteText(id)));
       await this.localChanged(id, entry, content, hash);
     });
   }

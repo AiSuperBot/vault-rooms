@@ -1,0 +1,104 @@
+import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import type VaultRoomsPlugin from "../plugin.js";
+import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
+
+export class RoomsSettingTab extends PluginSettingTab {
+  constructor(
+    app: App,
+    private readonly plugin: VaultRoomsPlugin
+  ) {
+    super(app, plugin);
+  }
+
+  display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    const svc = this.plugin.service;
+    const ws = this.plugin.settings.mesh.workspace;
+    if (!ws) {
+      new Setting(containerEl)
+        .setName("Workspace")
+        .setDesc("This vault doesn't belong to a workspace yet.")
+        .addButton((button) => button.setButtonText("Create").onClick(() => new CreateWorkspaceModal(this.plugin).open()))
+        .addButton((button) => button.setButtonText("Join with an invite link").onClick(() => new JoinModal(this.plugin).open()));
+      return;
+    }
+    const state = svc?.state;
+    new Setting(containerEl).setName("Workspace").setDesc(state ? `${state.name} · you are ${state.users[ws.userId]?.name ?? "?"} on ${state.devices[ws.deviceId]?.name ?? "this computer"}` : (this.plugin.serviceError ?? "Not running."));
+
+    if (svc && svc.isMember()) {
+      new Setting(containerEl).setName("Your name").addText((text) => {
+        text.setValue(state!.users[ws.userId]?.name ?? "");
+        text.inputEl.addEventListener("change", () => void this.apply(() => svc.renameUser(ws.userId, text.getValue().trim())));
+      });
+      if (svc.isAdmin()) {
+        new Setting(containerEl)
+          .setName("Who may share folders as rooms")
+          .addDropdown((dropdown) =>
+            dropdown
+              .addOptions({ admins: "Admins only", members: "Everyone in the workspace" })
+              .setValue(state!.roomCreation)
+              .onChange((value) => void this.apply(() => svc.setRoomCreation(value as "admins" | "members")))
+          );
+      }
+    }
+
+    new Setting(containerEl)
+      .setName("Folder for rooms shared with you")
+      .setDesc("New rooms you're added to appear here, each in its own folder. You can move a room's folder later.")
+      .addText((text) =>
+        text.setValue(this.plugin.settings.mountRoot).onChange(async (value) => {
+          this.plugin.settings.mountRoot = value.trim() || "Rooms";
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Port")
+      .setDesc("The port other computers connect to. Every computer needs an inbound firewall rule for Obsidian on this port (local network only). Takes effect after restarting Obsidian.")
+      .addText((text) =>
+        text.setValue(String(ws.port)).onChange(async (value) => {
+          const port = Number(value);
+          if (!Number.isInteger(port) || port < 1024 || port > 65535) return;
+          ws.port = port;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Computers to connect to by address")
+      .setDesc("Only needed where automatic discovery doesn't reach (multicast blocked): one host:port per line.")
+      .addTextArea((text) =>
+        text.setValue(ws.peers.join("\n")).onChange(async (value) => {
+          ws.peers = value
+            .split(/\s+/)
+            .map((line) => line.trim())
+            .filter(Boolean);
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Leave the workspace on this computer")
+      .setDesc("Deletes the workspace data and this computer's keys from this vault. Your files stay but no longer sync. To join again you need a new invite.")
+      .addButton((button) =>
+        button
+          .setButtonText("Leave")
+          .setWarning()
+          .onClick(async () => {
+            if (!(await confirmAction(this.app, "Leave the workspace", "Leave on this computer? Others keep working; this computer stops syncing.", "Leave"))) return;
+            await this.plugin.leaveWorkspace();
+            this.display();
+          })
+      );
+  }
+
+  private async apply(action: () => Promise<void>): Promise<void> {
+    try {
+      await action();
+      new Notice("Saved.");
+    } catch (error) {
+      new Notice((error as Error).message, 8000);
+    }
+  }
+}

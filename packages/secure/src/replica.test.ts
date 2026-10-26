@@ -136,6 +136,22 @@ describe("room replica", () => {
     expect(c.replica.noteText(fileId)).toBe("Secret plan");
   });
 
+  it("keeps edits made before any key arrived, and sends them once one does", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const fileId = randomId("f");
+    a.replica.editIndex((files) => files.set(fileId, { path: "Early.md", kind: "md" }));
+    expect(a.node.store.envelopesOf(s.roomId, "index").updates).toHaveLength(0);
+    a.replica.addOwnKey(1, s.key);
+    expect(a.node.store.envelopesOf(s.roomId, "index").updates).toHaveLength(1);
+    const c = s.member(s.cy);
+    s.wrapFor(s.cy);
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    expect(c.replica.files().get(fileId)?.path).toBe("Early.md");
+  });
+
   it("never lists a path that could leave the room folder", () => {
     const s = setup();
     const a = s.member(s.ana);

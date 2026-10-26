@@ -61,6 +61,8 @@ export class RoomReplica {
   private keys = new Map<number, Uint8Array>();
   private docs = new Map<DocId, DocState>();
   private waiting = new Map<string, StoredEnvelope>();
+  /** Local edits made before this device had any room key; published as soon as one arrives. */
+  private unsent = new Map<DocId, Uint8Array[]>();
   private destroyed = false;
 
   constructor(
@@ -88,7 +90,10 @@ export class RoomReplica {
         // A wrong or stale wrap: ignore it, another member will wrap again.
       }
     }
-    if (added) this.retryWaiting();
+    if (added) {
+      this.retryWaiting();
+      this.flushUnsent();
+    }
     return added;
   }
 
@@ -96,6 +101,7 @@ export class RoomReplica {
   addOwnKey(n: number, key: Uint8Array): void {
     this.keys.set(n, key);
     this.retryWaiting();
+    this.flushUnsent();
   }
 
   keyFor(n: number): Uint8Array | undefined {
@@ -173,7 +179,10 @@ export class RoomReplica {
       try {
         this.publishLocal(docId, update);
       } catch (error) {
-        this.events.localRefused?.(docId, error instanceof SecureError ? error.code : "error");
+        const code = error instanceof SecureError ? error.code : "error";
+        // No key yet: keep the edit and send it once a key arrives, so local and shared state can't drift apart.
+        if (code === "no_room_key") this.unsent.set(docId, [...(this.unsent.get(docId) ?? []), update]);
+        else this.events.localRefused?.(docId, code);
       }
     });
     return state;
@@ -258,6 +267,18 @@ export class RoomReplica {
       if (this.applyEnvelope(state, env.doc, env)) touched.add(env.doc);
     }
     for (const docId of touched) this.changed(docId, this.docs.get(docId)!);
+  }
+
+  private flushUnsent(): void {
+    if (!this.currentEpoch()) return;
+    for (const [docId, updates] of [...this.unsent]) {
+      this.unsent.delete(docId);
+      try {
+        this.publishLocal(docId, Y.mergeUpdates(updates));
+      } catch (error) {
+        this.events.localRefused?.(docId, error instanceof SecureError ? error.code : "error");
+      }
+    }
   }
 
   // ---- outgoing ----
