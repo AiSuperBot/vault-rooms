@@ -6,6 +6,7 @@ import { deviceIdFor, randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, newInvite, type JoinRecord } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName } from "./keys.js";
 import { createGenesis, nextVersion, type Role, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import type { Channel, MeshNode, PeerMessage, PeerSession } from "./mesh.js";
 
 export interface TestDevice {
   id: string;
@@ -81,3 +82,51 @@ export function invite(
   if (options.fold !== false) fold(chain, admin, join);
   return { joiner, join, inviteId: fresh.inviteId, secret: fresh.secret };
 }
+
+/** An in-memory network: messages queue up and are delivered (as JSON, like on the wire) by `pump`. */
+export class Network {
+  private queue: Array<() => void> = [];
+  links: Array<{ a: string; b: string; cut: () => void }> = [];
+
+  /** Connect two nodes, as if the transport had authenticated both ends. */
+  link(a: MeshNode, b: MeshNode): { ab: PeerSession; ba: PeerSession; cut: () => void } {
+    let open = true;
+    const sessions: { ab?: PeerSession; ba?: PeerSession } = {};
+    // Closing either end closes the connection, so the other end's session ends too (as with a real socket).
+    const channel = (to: () => PeerSession | undefined): Channel => ({
+      send: (message: PeerMessage) => {
+        const wire = JSON.stringify(message);
+        this.queue.push(() => open && to()?.receive(JSON.parse(wire)));
+      },
+      close: () => {
+        if (!open) return;
+        open = false;
+        this.queue.push(() => to()?.close("remote_closed"));
+      }
+    });
+    sessions.ab = a.connect(channel(() => sessions.ba), b.deviceId);
+    sessions.ba = b.connect(channel(() => sessions.ab), a.deviceId);
+    const cut = () => {
+      open = false;
+      sessions.ab!.close("cut");
+      sessions.ba!.close("cut");
+    };
+    this.links.push({ a: a.deviceId, b: b.deviceId, cut });
+    return { ab: sessions.ab, ba: sessions.ba, cut };
+  }
+
+  pump(limit = 100_000): number {
+    let delivered = 0;
+    while (this.queue.length > 0 && delivered < limit) {
+      this.queue.shift()!();
+      delivered++;
+    }
+    if (this.queue.length > 0) throw new Error("network did not settle");
+    return delivered;
+  }
+
+  enqueue(fn: () => void): void {
+    this.queue.push(fn);
+  }
+}
+
