@@ -5,7 +5,7 @@ import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, JOIN_EXPIRY_SLACK_MS, newInvite, type JoinRecord } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName } from "./keys.js";
 import { createRoom, fold, founder, invite, newDevice, step, type TestDevice } from "./testkit.js";
-import { nextVersion, parseSignedVersion, roleIn, signVersion, verifyGenesis, type WorkspaceState } from "./workspace.js";
+import { nextVersion, parseSignedVersion, roleIn, signVersion, verifyGenesis, versionHash, type WorkspaceState } from "./workspace.js";
 
 function forbidden(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, joins: JoinRecord[] = [], now = Date.now()): string {
   try {
@@ -204,6 +204,21 @@ describe("devices and users", () => {
     // A stray record that this version doesn't use.
     const other = invite(chain, admin, { fold: false });
     expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join, other.join])).toBe("forbidden:join_unused");
+  });
+
+  it("record time can't go backwards, so an expired invite can't be recorded by backdating", () => {
+    const { chain, admin } = founder();
+    const { join, inviteId } = invite(chain, admin, { fold: false, expires: Date.now() + 60_000 });
+    const expires = chain.state.invites[inviteId]!.expires;
+    // Someone moves the record's clock past the expiry with an unrelated change...
+    step(chain, admin, (state) => (state.name = "Later"), expires + JOIN_EXPIRY_SLACK_MS + 1000);
+    // ...after which no version may claim an earlier time, so the join can't be slipped in.
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join], expires)).toBe(`forbidden:invite_expired:${inviteId}`);
+    // Built by hand (nextVersion itself refuses), with a time before the previous version's.
+    const state = structuredClone(chain.state);
+    foldJoinInto(state, join);
+    const backdated = signVersion({ kind: "vr-ws-v1", ws: chain.workspaceId, v: chain.head.body.v + 1, prev: versionHash(chain.head), by: admin.id, at: expires, state, joins: [join] }, admin.sign);
+    expect(chain.offer([backdated])).toEqual({ status: "rejected", reason: "forbidden:time_backwards" });
   });
 
   it("any member may record a proven join, and nobody can fill someone else's invite", () => {

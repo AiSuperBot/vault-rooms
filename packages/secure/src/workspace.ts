@@ -475,6 +475,9 @@ export function authorize(prev: WorkspaceState, next: WorkspaceState, signerUser
 export function verifyNext(workspaceId: string, prev: SignedVersion, prevHash: string, next: SignedVersion): void {
   const { body } = next;
   if (body.ws !== workspaceId || body.v !== prev.body.v + 1 || body.prev !== prevHash) fail("not_successor");
+  // Record time never goes backwards, so a version can't be backdated before its predecessor (e.g. to record a
+  // join for an invite that has expired by the record's own clock).
+  if (body.at < prev.body.at) fail("forbidden", "time_backwards");
   const device = activeDevice(prev.body.state, body.by);
   if (!device) fail("forbidden", "signer");
   if (!verify(device.sign, SIG_PURPOSE, utf8(canonicalJson(body)), next.sig)) fail("bad_signature");
@@ -492,7 +495,8 @@ export function nextVersion(
 ): SignedVersion {
   const state = structuredClone(head.body.state);
   change(state);
-  const body: WorkspaceBody = { kind: "vr-ws-v1", ws: workspaceId, v: head.body.v + 1, prev: versionHash(head), by: deviceIdFor(deviceKey.publicKey), at: now, state: parseState(state) };
+  const at = Math.max(now, head.body.at);
+  const body: WorkspaceBody = { kind: "vr-ws-v1", ws: workspaceId, v: head.body.v + 1, prev: versionHash(head), by: deviceIdFor(deviceKey.publicKey), at, state: parseState(state) };
   if (joins.length > 0) body.joins = joins;
   const next = signVersion(body, deviceKey);
   verifyNext(workspaceId, head, versionHash(head), next);

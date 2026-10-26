@@ -31,6 +31,7 @@ What this needs from the network: every PC accepts inbound TCP on one port (TLS)
   - A device is only ever added through an invite marked used in the same version. A new device for an existing user needs an invite that user created, so nobody (not even an admin) can register a device under someone else's name and receive their room keys.
   - Room membership changes only by that room's managers. An admin's invite can grant only rooms the admin manages, and an admin who isn't a manager can't add themselves. Anyone may leave a room; writers may add a key epoch (rotate the key); key epochs are append-only.
   - Users may rename themselves and revoke their own devices. Revocations and removals are permanent. There is always at least one admin, and every room keeps a manager.
+  - Record time (each version's `at`) never goes backwards. Validity can't depend on when a peer receives a version (peers must agree), so invite expiry for recorded joins is judged against record time; monotonic time stops a version being backdated before its predecessor.
 - **Concurrent edits.** Two admins changing things while cut off from each other produce competing branches. Every peer picks the same winner: a branch that takes away authority a version of the other relied on (revokes its device, removes its user, or demotes an admin signer) wins, so a device or admin being removed can't race its own branch past the removal. If both or neither do, the branch whose first signer ranks higher wins: admins before members, then whoever joined the workspace earlier. A signer can't change their rank, unlike a hash, which they could grind by re-signing. Conflicts reaching more than 64 versions back are refused. The losing device re-applies its change on top.
 - **Room keys** (`keys.ts`). A random 256-bit key per key epoch. It is delivered to each entitled device as a key wrap (X25519 ECIES with HKDF-SHA256 and AES-256-GCM), signed by the wrapping device. Any device already holding the key may wrap it for an entitled device, so a new device of an existing member gets keys from whoever is online. Recipients check the unwrapped key against the commitment, so a member can't hand out a wrong key. Removing a reader or revoking a device starts a new key epoch; new content uses the newest key.
 
@@ -71,6 +72,7 @@ Per workspace under the plugin folder: the state chains, the encrypted update lo
 ## 9. Limits and known residual risks
 
 - A removed member keeps whatever they had already synced.
+- Someone holding a leaked invite secret plus a colluding member could record a join shortly after the invite expires, as long as the record's clock hasn't moved past the expiry yet. Admins' devices withdraw expired invites automatically, which closes this.
 - A malicious peer can withhold updates or delay a newer state version for peers that only talk to it; it can't forge or read them.
 - A removed writer colluding with another peer could try to backdate updates to before their removal; peers order removal by the room state version they have seen.
 - Two people offline from each other with conflicting binary edits get a conflict copy; notes always merge.
