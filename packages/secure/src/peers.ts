@@ -190,7 +190,7 @@ export async function joinWorkspace(input: {
     workspaceId: invite.workspaceId,
     inviteId: invite.inviteId,
     secret: invite.secret,
-    user: { id: input.existingUserId ?? input.newUserId, name: input.userName },
+    user: { id: input.existingUserId ?? invite.forUser ?? input.newUserId, name: input.userName },
     deviceName: input.deviceName,
     deviceKey: input.deviceKey,
     agreementPublicKey: input.agreementKey.publicKey,

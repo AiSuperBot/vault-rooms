@@ -134,6 +134,18 @@ export class MeshNode {
     return [...this.joins.values()].map((entry) => entry.join);
   }
 
+  /** Joins and when this device first saw them, for saving; `restore` puts them back after a restart. */
+  joinEntries(): Array<{ join: JoinRecord; firstSeen: number }> {
+    return [...this.joins.values(), ...this.pendingJoins.values()];
+  }
+
+  /** Reload saved joins and wraps without passing them on (peers get them at the next sync). */
+  restore(joins: Array<{ join: JoinRecord; firstSeen: number }>, wraps: KeyWrap[]): void {
+    for (const entry of joins) this.pendingJoins.set(joinHash(entry.join), entry);
+    for (const wrap of wraps) this.pendingWraps.set(hashOf("wrap-hash", wrap), wrap);
+    this.membershipChanged();
+  }
+
   allWraps(): KeyWrap[] {
     return [...this.wraps.values()];
   }

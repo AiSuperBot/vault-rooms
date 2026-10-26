@@ -39,11 +39,14 @@ importers:
       '@vault-rooms/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      '@vault-rooms/secure':
+        specifier: workspace:*
+        version: link:../../packages/secure
       esbuild:
         specifier: ^0.25.8
         version: 0.25.12
       obsidian:
-        specifier: ^1.8.7
+        specifier: 1.13.1
         version: 1.13.1(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
       sql.js:
         specifier: ^1.14.1

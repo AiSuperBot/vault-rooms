@@ -40,6 +40,8 @@ export interface InviteLink {
   secret: Uint8Array;
   /** "host:port" of peers that were online when the link was made; discovery finds others. */
   peers: string[];
+  /** Set for an invite to add another device of this existing user. */
+  forUser?: string;
 }
 
 const PEER_PATTERN = /^[A-Za-z0-9.-]{1,253}:\d{1,5}$|^\[[0-9A-Fa-f:.]{2,45}\]:\d{1,5}$/;
@@ -47,6 +49,7 @@ const PEER_PATTERN = /^[A-Za-z0-9.-]{1,253}:\d{1,5}$|^\[[0-9A-Fa-f:.]{2,45}\]:\d
 export function formatInviteLink(link: InviteLink): string {
   const params = new URLSearchParams({ mode: "join-secure", ws: link.workspaceId, i: link.inviteId, s: b64u(link.secret) });
   if (link.peers.length > 0) params.set("p", link.peers.slice(0, 8).join(","));
+  if (link.forUser) params.set("u", link.forUser);
   return `obsidian://vault-rooms?${params.toString()}`;
 }
 
@@ -71,7 +74,8 @@ export function parseInviteLink(input: string | Record<string, string>): InviteL
   if (!isHash(workspaceId) || !isId(inviteId, "i") || typeof params.s !== "string") fail("bad_invite_link");
   const peers = (params.p ?? "").split(",").filter(Boolean);
   if (peers.length > 8 || peers.some((peer) => !PEER_PATTERN.test(peer))) fail("bad_invite_link");
-  return { workspaceId, inviteId, secret: fromB64u(params.s, 32), peers };
+  if (params.u !== undefined && !isId(params.u, "u")) fail("bad_invite_link");
+  return { workspaceId, inviteId, secret: fromB64u(params.s, 32), peers, ...(params.u ? { forUser: params.u } : {}) };
 }
 
 // ---- join records ----

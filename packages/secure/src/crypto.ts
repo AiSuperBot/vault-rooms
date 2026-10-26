@@ -149,7 +149,10 @@ export function open(key: Uint8Array, sealed: Sealed, aad: Uint8Array): Uint8Arr
 // ---- X25519 sealed boxes ----
 
 export function newAgreementKeyPair(): KeyPair {
-  const secretKey = b64u(randomBytes(32));
+  return agreementKeyPairFromSecret(b64u(randomBytes(32)));
+}
+
+export function agreementKeyPairFromSecret(secretKey: string): KeyPair {
   return { publicKey: rawPublic(privateKeyFrom(X25519_PKCS8, secretKey, "x")), secretKey };
 }
 
