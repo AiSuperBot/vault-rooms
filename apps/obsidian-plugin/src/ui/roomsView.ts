@@ -91,8 +91,15 @@ export class RoomsView extends ItemView {
     const head = root.createDiv({ cls: "vault-rooms-head" });
     head.createEl("h4", { text: state.name });
     head.createDiv({ cls: "vault-rooms-status", text: `${online.size} of ${otherDevices.length} other computer${otherDevices.length === 1 ? "" : "s"} online` });
-    if (!svc.isMember()) root.createEl("p", { cls: "vault-rooms-error", text: "This computer is no longer part of the workspace (it was revoked or its user removed). Rooms don't sync any more." });
-    else root.createDiv({ cls: "vault-rooms-me", text: `You: ${me?.name ?? "?"}${me?.admin ? " (admin)" : ""} · ${state.devices[svc.me.deviceId]?.name ?? ""}` });
+    if (!svc.isMember()) {
+      // Cut off: nothing here would be accepted any more, so offer only the clean-up.
+      root.createEl("p", { cls: "vault-rooms-error", text: "This computer is no longer part of the workspace (it was revoked or its user removed). Rooms don't sync any more; their files stay on this computer." });
+      root.createEl("button", { text: "Remove the workspace from this computer" }).onclick = async () => {
+        if (await confirmAction(this.app, "Remove the workspace", "This deletes the workspace data and this computer's keys from this vault. Your files stay.", "Remove")) await this.act(() => this.plugin.leaveWorkspace());
+      };
+      return;
+    }
+    root.createDiv({ cls: "vault-rooms-me", text: `You: ${me?.name ?? "?"}${me?.admin ? " (admin)" : ""} · ${state.devices[svc.me.deviceId]?.name ?? ""}` });
 
     // Rooms
     const roomsHead = root.createDiv({ cls: "vault-rooms-section" });
