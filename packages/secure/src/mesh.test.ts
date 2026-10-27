@@ -293,6 +293,23 @@ describe("mesh", () => {
     expect(a.effective().devices[mal.id]).toBeUndefined();
   });
 
+  it("a join comes back when its person only left a room themselves in the losing branch", () => {
+    const { chain, ws, ana, ben, roomId } = setup();
+    const { roomId: other } = createRoom(chain, ana, "Other", { [ben.userId]: "write" });
+    step(chain, ana, (state) => {
+      state.users[ben.userId]!.admin = true;
+      state.rooms[roomId]!.members[ben.userId] = "manage";
+    });
+    const { joiner: mal, join } = invite(chain, ben, { userName: "Mal", rooms: { [roomId]: "write" }, fold: false });
+    const a = nodeFor(chain, ana);
+    const parent = a.chain.head;
+    // Ben records Mal's join and Mal leaves the room he was given; Ana, at the same moment, takes Ben out of another room.
+    a.offerVersions([nextVersion(ws, parent, ben.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    a.offerVersions([nextVersion(ws, a.chain.head, mal.sign, (state) => void delete state.rooms[roomId]!.members[mal.userId])]);
+    expect(a.offerVersions([nextVersion(ws, parent, ana.sign, (state) => void delete state.rooms[other]!.members[ben.userId])]).status).toBe("replaced");
+    expect(a.pendingJoinRecords()).toEqual([join]);
+  });
+
   it("a join whose recording lost a race waits to be recorded again", () => {
     const { chain, ws, ana, ben, cy, roomId } = setup();
     step(chain, ana, (state) => (state.rooms[roomId]!.members[ben.userId] = "manage"));

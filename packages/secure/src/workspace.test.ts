@@ -404,6 +404,28 @@ describe("devices and users", () => {
     expect(rebaseChange(demoted, promoted, structuredClone(demoted), demoted).users[ben.userId]!.admin).toBe(true);
   });
 
+  it("re-applies a lost branch's own demotion and promotion in order, when the winner took nothing away", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "write" });
+    step(chain, admin, (state) => (state.users[ben.userId]!.admin = true));
+    const fork = chain.state;
+    const v1 = structuredClone(fork);
+    v1.users[ben.userId]!.admin = false;
+    v1.rooms[roomId]!.members[ben.userId] = "read";
+    const v2 = structuredClone(v1);
+    v2.users[ben.userId]!.admin = true;
+    v2.rooms[roomId]!.members[ben.userId] = "write";
+    const winner = structuredClone(fork);
+    winner.name = "Renamed";
+    // Made again one version at a time on top of the winner, as a device does after losing a race.
+    const once = rebaseChange(fork, v1, winner, fork, winner);
+    const twice = rebaseChange(v1, v2, once, fork, winner);
+    expect(twice.users[ben.userId]!.admin).toBe(true);
+    expect(twice.rooms[roomId]!.members[ben.userId]).toBe("write");
+    expect(twice.name).toBe("Renamed");
+  });
+
   it("never gives back, when re-applying, room standing the winner took away", () => {
     const { chain, admin } = founder();
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
