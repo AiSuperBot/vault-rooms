@@ -586,6 +586,61 @@ describe("room folder", () => {
     expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["New.md"]);
   });
 
+  it("takes an editor's last save, made just after it stopped co-editing, as already shared", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Live.md", "start\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    const [id] = [...a.replica.files().keys()];
+    // Ana types in an editor bound to the note and closes it; Cy goes on typing; then Ana's editor's last save lands.
+    a.bound.add(id!);
+    a.replica.noteDoc(id!).getText("content").insert(5, " typed");
+    await s.settle();
+    a.bound.delete(id!);
+    a.folder.editorLeft(id!, a.replica.noteText(id!));
+    await c.vault.writeText("Team/Live.md", "start typed\nfrom Cy\n");
+    await c.folder.settled();
+    s.net.pump();
+    await a.vault.writeText("Team/Live.md", "start typed\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Live.md")).toBe("start typed\nfrom Cy\n");
+    expect([...a.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+  });
+
+  it("shares again a note made while the room key was missing, if Obsidian stopped before its entry was stored", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const c = s.make(s.cy, "Team");
+    s.net.link(a.node, c.node);
+    await a.folder.start();
+    // No room key yet: Ana's new note waits for it; when it comes, her disk fails, and Obsidian stops.
+    await a.vault.writeText("Team/Early.md", "early\n");
+    await s.settle();
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.folder.remoteChanged();
+    await s.settle();
+    await a.folder.stop();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["Early.md"]);
+  });
+
   it("keeps a change another program made as a copy, rather than undo someone's edit not written here yet", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");
