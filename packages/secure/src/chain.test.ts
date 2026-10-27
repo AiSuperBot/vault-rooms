@@ -149,6 +149,24 @@ describe("workspace chain", () => {
     expect(fork.offer([rename]).status).toBe("rejected");
   });
 
+  it("a removal can't be undone by an unrelated change made at the same moment, whoever ranks higher", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    const { joiner: mal } = invite(anaChain, ana, { userName: "Mal" });
+    step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
+    const { roomId } = createRoom(anaChain, ben, "Docs", { [mal.userId]: "write" });
+    const fork = WorkspaceChain.load(anaChain.all());
+    // Ben, who manages the room, takes Mal out of it and starts a new key; Ana, senior to him, renames the workspace.
+    const removal = nextVersion(fork.workspaceId, fork.head, ben.sign, (state) => {
+      delete state.rooms[roomId]!.members[mal.userId];
+      state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(fork.workspaceId, roomId, 2, newRoomKey()) });
+    });
+    step(anaChain, ana, (state) => (state.name = "Ana's"));
+    expect(anaChain.offer([removal]).status).toBe("replaced");
+    expect(anaChain.state.rooms[roomId]!.members[mal.userId]).toBeUndefined();
+    expect(anaChain.state.rooms[roomId]!.epochs).toHaveLength(2);
+  });
+
   it("a writer's key rotation can't push aside the changes of someone who ranks higher", () => {
     const { chain: anaChain, admin: ana } = founder();
     const { joiner: wen } = invite(anaChain, ana, { userName: "Wen" });

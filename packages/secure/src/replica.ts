@@ -256,10 +256,20 @@ export class RoomReplica {
     return this.unsent.has(docId);
   }
 
-  /** Whether something this device made isn't safely stored yet: edits of these documents, or its blob with this id. */
-  hasUnstored(docs: DocId[], blobId?: string): boolean {
-    if (docs.some((doc) => this.node.hasUnpersisted(`${this.roomId}/${doc}/`))) return true;
-    return blobId !== undefined && this.node.hasUnpersisted(`${this.roomId}/b/${blobKeyOf(this.node.deviceId, blobId)}`);
+  /** Whether something this device made isn't safely stored yet: any edit of these documents, or these envelopes (by key). */
+  hasUnstored(docs: DocId[], keys: string[] = []): boolean {
+    return docs.some((doc) => this.node.hasUnpersisted(`${this.roomId}/${doc}/`)) || keys.some((key) => this.node.isUnpersisted(key));
+  }
+
+  /** Key (see envelopeKey) of this device's latest update of a document, to check later whether it is stored. */
+  ownUpdateKey(docId: DocId): string | null {
+    const clock = this.node.store.maxClock(this.roomId, docId, this.node.deviceId);
+    return clock > 0 ? envelopeKey({ k: "u", room: this.roomId, doc: docId, author: this.node.deviceId, clock } as StoredEnvelope) : null;
+  }
+
+  /** Key (see envelopeKey) of a blob this device made. */
+  ownBlobKey(blobId: string): string {
+    return envelopeKey({ k: "b", room: this.roomId, author: this.node.deviceId, id: blobId } as StoredEnvelope);
   }
 
   /** Resolves once what this device is storing right now is stored (or failed to be, this time). */
