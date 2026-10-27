@@ -68,30 +68,33 @@ export interface ReplicaEvents {
 }
 
 /** A run of characters in a document by their Yjs ids. */
-interface IdRange {
+export interface IdRange {
   client: number;
   clock: number;
   length: number;
 }
 
-/** A whole-note save made here: what it took out (by id) and what it put in (where). */
-interface FileSave {
+/** A whole-note save made here (when, ms): what it took out, and each run it put in with the text that run replaced. */
+export interface FileSave {
+  at: number;
   deleted: IdRange[];
-  inserted: Array<IdRange & { origin: Y.ID | null; right: Y.ID | null }>;
+  inserted: Array<IdRange & { replaces: IdRange[] }>;
 }
 
 const MAX_FILE_SAVES = 20;
+/** Saves are remembered for this many notes at most, for this long (ms), across restarts too (see recentSaves). */
+const MAX_SAVED_NOTES = 200;
+const SAVE_KEPT_MS = 30 * 24 * 3600_000;
+const MAX_SAVED_RANGES = 10_000;
 
 function deletedRanges(update: Uint8Array): IdRange[] {
   const { ds } = Y.decodeUpdate(update) as unknown as { ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   return [...ds.clients].flatMap(([client, items]) => items.map(({ clock, len }) => ({ client, clock, length: len })));
 }
 
-function insertedRanges(update: Uint8Array): FileSave["inserted"] {
-  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; length: number; origin?: Y.ID | null; rightOrigin?: Y.ID | null; content?: unknown }> };
-  return structs
-    .filter((struct) => struct.content !== undefined)
-    .map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length, origin: struct.origin ?? null, right: struct.rightOrigin ?? null }));
+function insertedRanges(update: Uint8Array): IdRange[] {
+  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; length: number; content?: unknown }> };
+  return structs.filter((struct) => struct.content !== undefined).map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length }));
 }
 
 function overlap(a: IdRange[], b: IdRange[]): IdRange[] {
@@ -107,8 +110,33 @@ function overlap(a: IdRange[], b: IdRange[]): IdRange[] {
   return out;
 }
 
-function within(ranges: IdRange[], id: Y.ID | null): boolean {
-  return id !== null && ranges.some((r) => r.client === id.client && id.clock >= r.clock && id.clock < r.clock + r.length);
+function validRanges(value: unknown): IdRange[] | null {
+  if (!Array.isArray(value) || value.length > MAX_SAVED_RANGES) return null;
+  const out: IdRange[] = [];
+  for (const range of value) {
+    const { client, clock, length } = (typeof range === "object" && range !== null ? range : {}) as Record<string, unknown>;
+    if (![client, clock, length].every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return null;
+    out.push({ client: client as number, clock: clock as number, length: length as number });
+  }
+  return out;
+}
+
+function validSave(value: unknown): FileSave | null {
+  const { at, deleted, inserted } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const gone = validRanges(deleted);
+  const added = validRanges(inserted);
+  if (!Number.isSafeInteger(at) || !gone || !added) return null;
+  const replaces = (inserted as Array<{ replaces?: unknown }>).map((item) => validRanges(item.replaces));
+  if (replaces.some((ranges) => ranges === null)) return null;
+  return { at: at as number, deleted: gone, inserted: added.map((range, i) => ({ ...range, replaces: replaces[i]! })) };
+}
+
+/** A Y.Text's items in document order, deleted ones too. */
+type TextItem = { id: Y.ID; length: number; deleted: boolean; countable: boolean; right: TextItem | null };
+function textItems(text: Y.Text): TextItem[] {
+  const items: TextItem[] = [];
+  for (let item = (text as unknown as { _start: TextItem | null })._start; item; item = item.right) items.push(item);
+  return items;
 }
 
 function validBlobRef(value: unknown): BlobRef | undefined {
@@ -394,8 +422,8 @@ export class RoomReplica {
   private localUpdate(docId: DocId, update: Uint8Array): void {
     this.localEditAt.set(docId, Date.now());
     if (this.saving) {
-      const saves = [...(this.fileSaves.get(docId) ?? []), { deleted: deletedRanges(update), inserted: insertedRanges(update) }];
-      this.fileSaves.set(docId, saves.slice(-MAX_FILE_SAVES));
+      const deleted = deletedRanges(update);
+      this.rememberSave(docId, { at: Date.now(), deleted, inserted: this.replacedBy(docId, insertedRanges(update), deleted) });
     }
     try {
       this.publishLocal(docId, update);
@@ -537,30 +565,107 @@ export class RoomReplica {
   // ---- clashing saves ----
 
   /**
+   * For each run of text a save put in: what the save took out right before it, the text that run replaced (a note saved
+   * outside the editor is changed line by line, each new line put in where its old one was taken out).
+   */
+  private replacedBy(docId: DocId, inserted: IdRange[], deleted: IdRange[]): FileSave["inserted"] {
+    const runs = inserted.map((range) => ({ ...range, replaces: [] as IdRange[] }));
+    // A run starts an item of its own (one that starts inside another, right after this save's own text, replaced nothing).
+    const starts = new Map(runs.map((run) => [`${run.client}:${run.clock}`, run]));
+    const text = this.docs.get(docId)?.doc.getText("content");
+    let gone: IdRange[] = [];
+    for (const item of text ? textItems(text) : []) {
+      const range = { client: item.id.client, clock: item.id.clock, length: item.length };
+      if (item.deleted) {
+        gone.push(...overlap([range], deleted));
+        continue;
+      }
+      const run = starts.get(`${range.client}:${range.clock}`);
+      if (run) run.replaces = gone;
+      gone = [];
+    }
+    return runs;
+  }
+
+  private rememberSave(docId: DocId, save: FileSave): void {
+    const saves = [...(this.fileSaves.get(docId) ?? []), save].slice(-MAX_FILE_SAVES);
+    this.fileSaves.delete(docId);
+    this.fileSaves.set(docId, saves);
+    for (const oldest of this.fileSaves.keys()) {
+      if (this.fileSaves.size <= MAX_SAVED_NOTES) break;
+      this.fileSaves.delete(oldest);
+    }
+  }
+
+  /** Whole-note saves made here lately, for the owner to keep across restarts (see restoreSaves). */
+  recentSaves(): Record<DocId, FileSave[]> {
+    const since = Date.now() - SAVE_KEPT_MS;
+    const out: Record<DocId, FileSave[]> = {};
+    for (const [docId, saves] of this.fileSaves) {
+      const kept = saves.filter((save) => save.at >= since);
+      if (kept.length > 0) out[docId] = kept;
+    }
+    return out;
+  }
+
+  /**
+   * Saves made here in an earlier session (see recentSaves). Each is checked against what is already held of its note
+   * too, so a clash with a change that came in while this computer was off, or before this call, still counts (one
+   * found again changes nothing more).
+   */
+  restoreSaves(saved: unknown): void {
+    if (typeof saved !== "object" || saved === null) return;
+    const since = Date.now() - SAVE_KEPT_MS;
+    for (const [docId, list] of Object.entries(saved).slice(-MAX_SAVED_NOTES)) {
+      if (!isId(docId, "f") || !Array.isArray(list)) continue;
+      const saves = list.slice(-MAX_FILE_SAVES).map(validSave).filter((save): save is FileSave => save !== null && save.at >= since);
+      if (saves.length === 0) continue;
+      this.fileSaves.set(docId, [...saves, ...(this.fileSaves.get(docId) ?? [])].slice(-MAX_FILE_SAVES));
+      // A note not loaded yet is checked as it loads.
+      if (!this.docs.has(docId)) continue;
+      const { snapshots, updates } = this.node.store.envelopesOf(this.roomId, docId);
+      for (const env of [...snapshots, ...updates]) {
+        const key = this.keys.get(env.n);
+        if (env.author === this.node.deviceId || !key) continue;
+        try {
+          this.checkClash(docId, env, openEnvelope(env, key));
+        } catch {
+          // can't be read: nothing to check
+        }
+      }
+    }
+  }
+
+  /**
    * Did someone else's change, made at the same moment, take out text a whole-note save of ours took out too? Then both
-   * replaced the same text (a date changed to two different values, say), and merging them character by character would
-   * mix the two. The save of the computer with the lower device id is kept: the other's new text there is taken out
-   * again, by both computers alike (taking out twice changes nothing), and the other keeps its version as a copy.
+   * replaced the same lines (a date changed to two different values, say), and keeping both would mix them. The save of
+   * the computer with the lower device id is kept: the other computer takes its own new lines there out again (it knows
+   * what each of them replaced), and keeps its version as a copy. Only an update made on one computer tells whose
+   * change it is; against anything else (a snapshot, content passed on again) a save made here gives way, so two
+   * computers never both keep theirs.
    */
   private checkClash(docId: DocId, env: UpdateEnvelope | SnapshotEnvelope, bytes: Uint8Array): void {
     let theirs: IdRange[];
-    let theirInserted: FileSave["inserted"];
+    let theirInserted: IdRange[];
     try {
       theirs = deletedRanges(bytes);
       theirInserted = insertedRanges(bytes);
     } catch {
       return;
     }
-    const lost = this.node.deviceId > env.author;
+    // How far it reaches per writer of the text it holds.
+    const reach = new Map<number, number>();
+    for (const t of theirInserted) reach.set(t.client, Math.max(reach.get(t.client) ?? 0, t.clock + t.length));
+    const single = env.k === "u" && reach.size <= 1;
+    const lost = !single || this.node.deviceId > env.author;
     const remove: IdRange[] = [];
     for (const save of this.fileSaves.get(docId) ?? []) {
-      // A snapshot that already holds this save was made after it: no clash, whatever it took out since.
-      if (env.k === "s" && save.inserted.some((mine) => theirInserted.some((t) => t.client === mine.client && t.clock + t.length >= mine.clock + mine.length))) continue;
-      if (env.k === "s" && save.inserted.length === 0) continue;
+      // It holds this save's new text, so it was made after the save. (Of a save that only took text out, nothing tells.)
+      if (save.inserted.some((mine) => (reach.get(mine.client) ?? 0) >= mine.clock + mine.length)) continue;
+      if (!single && save.inserted.length === 0) continue;
       const both = overlap(save.deleted, theirs);
       if (both.length === 0) continue;
-      const loser = lost ? save.inserted : theirInserted;
-      remove.push(...loser.filter((item) => within(both, item.origin) || within(both, item.right)));
+      if (lost) remove.push(...save.inserted.filter((run) => overlap(run.replaces, both).length > 0));
       this.events.clash?.(docId, lost);
     }
     if (remove.length > 0) queueMicrotask(() => this.takeOut(docId, remove));
@@ -573,8 +678,7 @@ export class RoomReplica {
     const text = state.doc.getText("content");
     const spans: Array<[number, number]> = [];
     let index = 0;
-    type Item = { id: Y.ID; length: number; deleted: boolean; countable: boolean; right: Item | null };
-    for (let item = (text as unknown as { _start: Item | null })._start; item; item = item.right) {
+    for (const item of textItems(text)) {
       if (item.deleted || !item.countable) continue;
       for (const r of ranges) {
         if (r.client !== item.id.client) continue;
