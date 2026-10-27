@@ -155,8 +155,6 @@ export class RoomFolder {
   private told = new Set<string>();
   /** Files remembered in this session while something made here for them was still being stored: what to check. */
   private unstoredNow = new Map<string, Pending>();
-  /** Notes whose save made here clashed with someone else's and lost (see noteClashed). */
-  private clashed = new Set<string>();
   /** Notes whose new entry had to wait for the room key, by file id: their path. Remembered (when shared) as entries made here. */
   private queuedEntries = new Map<string, string>();
   private needsAdopt = false;
@@ -314,13 +312,16 @@ export class RoomFolder {
   }
 
   /**
-   * A save of a note made here outside the editor and someone else's, made at the same moment, replaced the same text;
-   * `lost`: the shared note keeps theirs (see RoomReplica), so ours is kept next to it as a copy.
+   * A save of a note made here outside the editor and someone else's, made at the same moment, changed the same line,
+   * and the other's was kept (see RoomReplica): `version`, the note as it was here, is kept as a copy. Whether or not
+   * the note is open in an editor, so the version saved here is never lost.
    */
-  noteClashed(fileId: string, lost: boolean): void {
-    if (!lost || this.stopped) return;
-    this.clashed.add(fileId);
-    this.remoteChanged();
+  noteClashed(fileId: string, version: string): void {
+    if (this.stopped) return;
+    void this.run(async () => {
+      const entry = this.o.replica.files().get(fileId);
+      if (entry?.kind === "md" && !entry.deleted) await this.keepAside(entry.path, version);
+    });
   }
 
   /** Whether a note's local version is held back (couldn't be shared): the editor shouldn't be bound to it. */
@@ -585,17 +586,6 @@ export class RoomFolder {
     // Left from a session that may have ended before what it made was stored: proven only by a matching shared copy.
     const doubtful = this.doubtful(id);
     const stat = this.o.vault.stat(path);
-    if (stat && this.clashed.delete(id)) {
-      // Our save lost a clash: kept as a copy before the shared version is written (a file changed again since it was
-      // last synced is settled by the rules below).
-      const local = await this.readNote(path);
-      const localHash = sha(local);
-      if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash);
-      if (known && !doubtful && localHash === known.hash) {
-        await this.keepAside(entry.path, local);
-        return this.write(id, entry, remote, remoteHash, localHash);
-      }
-    }
     if (!stat) {
       const variant = this.untrackedCaseVariant(entry.path);
       if (variant) {
@@ -637,7 +627,6 @@ export class RoomFolder {
 
   /** Write the shared version, only if the file is still what the decision was based on (checked as it is written). */
   private async write(id: string, entry: FileEntry, remote: string | Uint8Array, remoteHash: string, basedOn?: string): Promise<void> {
-    if (this.clashed.has(id)) return; // decided before a clash was known: the next pass keeps our version first
     // Changed meanwhile (saved again while its copy was being kept, say), or an editor bound meanwhile (which owns the
     // note now): left as it is and looked at again next time.
     const wrote =

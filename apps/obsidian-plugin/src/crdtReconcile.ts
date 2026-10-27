@@ -175,46 +175,64 @@ export function reconcileYTextWithDiskText(ytext: Y.Text, diskText: string, orig
   return true;
 }
 
-/** Lines, each with its "\n" (the last may have none). */
-function lines(text: string): string[] {
-  return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
-}
-
 /**
  * Like reconcileYTextWithDiskText, for a whole note saved outside the editor (by another program, or a plugin writing
- * a date): each changed line is replaced whole, its old text taken out and the new line put in right there, line after
- * line. Two computers changing the same line at the same moment then take out exactly the same text, which is how such
- * a clash is noticed (see RoomReplica), and each new line is tied to the line it replaced, so one line is kept and
- * never a mix of the two.
+ * a date). Lines are compared by their text, and each changed line is replaced whole: the new line is put in right
+ * before the old, which is then taken out. Yjs remembers what an insertion was put in front of,
+ * so each new line stays tied to the line it replaced: two computers that change the same line at the same moment can
+ * be told from two changing lines next to each other (see RoomReplica, clashing saves). Lines added or removed touch
+ * no other line, at the end of a note too, with or without a final line break.
  */
 export function reconcileYTextByLines(ytext: Y.Text, text: string, origin: unknown): boolean {
   const oldText = ytext.toString();
   if (oldText === text) return false;
-  const a = lines(oldText);
-  const b = lines(text);
+  const a = oldText.split("\n");
+  const b = text.split("\n");
+  const last = a.length - 1;
   let prefix = 0;
   while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
   let suffix = 0;
-  while (suffix < a.length - prefix && suffix < b.length - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
+  while (suffix < a.length - prefix && suffix < b.length - prefix && a[last - suffix] === b[b.length - 1 - suffix]) suffix++;
   const oldMid = a.slice(prefix, a.length - suffix);
   const newMid = b.slice(prefix, b.length - suffix);
   const ops = oldMid.length * newMid.length > MAX_DIFF_CELLS ? lcsOps(oldMid, []).concat(lcsOps([], newMid)) : lcsOps(oldMid, newMid);
   const apply = (): void => {
-    let pos = a.slice(0, prefix).join("").length;
+    // `line`: the next old line; `pos`: where it starts now (or the end of the text, past the last one).
+    let line = prefix;
+    let pos = 0;
+    for (let k = 0; k < prefix; k++) pos += a[k]!.length + (k < last ? 1 : 0);
     for (let i = 0; i < ops.length; ) {
       if (ops[i]!.op === "equal") {
-        pos += ops[i++]!.text.length;
+        pos += a[line]!.length + (line < last ? 1 : 0);
+        line++;
+        i++;
         continue;
       }
       const gone: string[] = [];
       const added: string[] = [];
       for (; i < ops.length && ops[i]!.op !== "equal"; i++) (ops[i]!.op === "delete" ? gone : added).push(ops[i]!.text);
-      for (let k = 0; k < Math.max(gone.length, added.length); k++) {
-        if (k < gone.length) ytext.delete(pos, gone[k]!.length);
-        if (k < added.length) {
-          ytext.insert(pos, added[k]!);
-          pos += added[k]!.length;
-        }
+      const pairs = Math.min(gone.length, added.length);
+      for (let k = 0; k < pairs; k++) {
+        // With its line break (the last line has none): two computers that changed the same line, if both are kept,
+        // leave two whole lines, never one run together.
+        const end = line < last ? 1 : 0;
+        ytext.insert(pos, end ? `${added[k]}\n` : added[k]!);
+        ytext.delete(pos + added[k]!.length + end, gone[k]!.length + end);
+        pos += added[k]!.length + end;
+        line++;
+      }
+      for (let k = pairs; k < gone.length; k++) {
+        // A line taken out goes with one line break: its own, or (the last line) the one before it.
+        if (line < last) ytext.delete(pos, gone[k]!.length + 1);
+        else if (pos > 0) ytext.delete(--pos, gone[k]!.length + 1);
+        else ytext.delete(pos, gone[k]!.length);
+        line++;
+      }
+      for (let k = pairs; k < added.length; k++) {
+        // A new line goes before the next old line, or after a new line break at the end.
+        const inserted = line <= last ? `${added[k]}\n` : `\n${added[k]}`;
+        ytext.insert(pos, inserted);
+        pos += inserted.length;
       }
     }
   };

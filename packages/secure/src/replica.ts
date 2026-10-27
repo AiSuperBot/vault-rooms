@@ -42,6 +42,8 @@ export type EditResult = "published" | "queued" | "refused";
 
 export const REMOTE = Symbol("vault-rooms-remote");
 const SNAPSHOT_EVERY = 200;
+/** A writer that isn't the first to pass on a former writer's work steps in after this long (ms) if it is still there. */
+const PASS_ON_STEP_IN_MS = 10 * 60_000;
 
 interface DocState {
   doc: Y.Doc;
@@ -60,11 +62,11 @@ export interface ReplicaEvents {
   /** A local edit made outside `edit` (an editor) couldn't be shared ("read_only", "too_large", ...). */
   localRefused?(docId: string, code: string): void;
   /**
-   * A whole-note save made here (see `edit`, `save`) and someone else's, made at the same moment, replaced the same text
-   * (two values written over one, say). One of them is kept in the shared note, the same on every computer; `lost`:
-   * this computer's wasn't, so the owner keeps it as a copy.
+   * A whole-note save made here (see `edit`, `save`) and someone else's, made at the same moment, replaced the same line
+   * (two values written over one, say), and the other's is kept in the shared note. `version`: the note as this computer
+   * had it, with its own line, for the owner to keep as a copy.
    */
-  clash?(docId: string, lost: boolean): void;
+  clash?(docId: string, version: string): void;
 }
 
 /** A run of characters in a document by their Yjs ids. */
@@ -74,40 +76,68 @@ export interface IdRange {
   length: number;
 }
 
-/** A whole-note save made here (when, ms): what it took out, and each run it put in with the text that run replaced. */
+/** A run of text put in, and the character it was put in front of (for a changed line: the first of the old one). */
+export interface InsertedRun extends IdRange {
+  right: { client: number; clock: number } | null;
+}
+
+/** A whole-note save made here (when, ms): what it took out and what it put in. */
 export interface FileSave {
   at: number;
   deleted: IdRange[];
-  inserted: Array<IdRange & { replaces: IdRange[] }>;
+  inserted: InsertedRun[];
 }
 
 const MAX_FILE_SAVES = 20;
 /** Saves are remembered for this many notes at most, for this long (ms), across restarts too (see recentSaves). */
 const MAX_SAVED_NOTES = 200;
 const SAVE_KEPT_MS = 30 * 24 * 3600_000;
-const MAX_SAVED_RANGES = 10_000;
+/** Larger saves (a whole note rewritten) aren't remembered: they would cost too much to keep and check. */
+const MAX_SAVED_RANGES = 500;
+/** All remembered saves together, at most (the oldest notes' are let go first). */
+const MAX_SAVED_TOTAL = 20_000;
+/** What is remembered of text typed here, per note (the newest), and for how many notes (see typedClash). */
+const MAX_TYPED_RANGES = 2_000;
+const MAX_TYPED_NOTES = 50;
 
 function deletedRanges(update: Uint8Array): IdRange[] {
   const { ds } = Y.decodeUpdate(update) as unknown as { ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   return [...ds.clients].flatMap(([client, items]) => items.map(({ clock, len }) => ({ client, clock, length: len })));
 }
 
-function insertedRanges(update: Uint8Array): IdRange[] {
-  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; length: number; content?: unknown }> };
-  return structs.filter((struct) => struct.content !== undefined).map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length }));
+function insertedRuns(update: Uint8Array): InsertedRun[] {
+  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; length: number; rightOrigin?: Y.ID | null; content?: unknown }> };
+  return structs
+    .filter((struct) => struct.content !== undefined)
+    .map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length, right: struct.rightOrigin ? { client: struct.rightOrigin.client, clock: struct.rightOrigin.clock } : null }));
 }
 
+/** The parts of `a` also in `b`; `b` is a set of ranges without overlaps (a Yjs delete set, say). */
 function overlap(a: IdRange[], b: IdRange[]): IdRange[] {
+  const byClient = new Map<number, IdRange[]>();
+  for (const y of b) byClient.set(y.client, [...(byClient.get(y.client) ?? []), y]);
+  for (const list of byClient.values()) list.sort((x, y) => x.clock - y.clock);
   const out: IdRange[] = [];
   for (const x of a) {
-    for (const y of b) {
-      if (x.client !== y.client) continue;
-      const from = Math.max(x.clock, y.clock);
-      const to = Math.min(x.clock + x.length, y.clock + y.length);
+    const list = byClient.get(x.client) ?? [];
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (list[mid]!.clock + list[mid]!.length <= x.clock) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; i < list.length && list[i]!.clock < x.clock + x.length; i++) {
+      const from = Math.max(x.clock, list[i]!.clock);
+      const to = Math.min(x.clock + x.length, list[i]!.clock + list[i]!.length);
       if (from < to) out.push({ client: x.client, clock: from, length: to - from });
     }
   }
   return out;
+}
+
+function within(ranges: IdRange[], id: { client: number; clock: number }): boolean {
+  return ranges.some((r) => r.client === id.client && id.clock >= r.clock && id.clock < r.clock + r.length);
 }
 
 function validRanges(value: unknown): IdRange[] | null {
@@ -126,9 +156,13 @@ function validSave(value: unknown): FileSave | null {
   const gone = validRanges(deleted);
   const added = validRanges(inserted);
   if (!Number.isSafeInteger(at) || !gone || !added) return null;
-  const replaces = (inserted as Array<{ replaces?: unknown }>).map((item) => validRanges(item.replaces));
-  if (replaces.some((ranges) => ranges === null)) return null;
-  return { at: at as number, deleted: gone, inserted: added.map((range, i) => ({ ...range, replaces: replaces[i]! })) };
+  const rights = (inserted as Array<{ right?: unknown }>).map((run) => {
+    if (run.right === null) return null;
+    const { client, clock } = (typeof run.right === "object" && run.right !== null ? run.right : {}) as Record<string, unknown>;
+    return [client, clock].every((n) => Number.isSafeInteger(n) && (n as number) >= 0) ? { client: client as number, clock: clock as number } : undefined;
+  });
+  if (rights.some((right) => right === undefined)) return null;
+  return { at: at as number, deleted: gone, inserted: added.map((range, i) => ({ ...range, right: rights[i]! })) };
 }
 
 /** A Y.Text's items in document order, deleted ones too. */
@@ -137,6 +171,51 @@ function textItems(text: Y.Text): TextItem[] {
   const items: TextItem[] = [];
   for (let item = (text as unknown as { _start: TextItem | null })._start; item; item = item.right) items.push(item);
   return items;
+}
+
+/** Where the characters of `ranges` still in a text are: [index, length] spans. */
+function spansOf(text: Y.Text, ranges: IdRange[]): Array<[number, number]> {
+  const spans: Array<[number, number]> = [];
+  let index = 0;
+  for (const item of textItems(text)) {
+    if (item.deleted || !item.countable) continue;
+    for (const r of ranges) {
+      if (r.client !== item.id.client) continue;
+      const from = Math.max(r.clock, item.id.clock);
+      const to = Math.min(r.clock + r.length, item.id.clock + item.length);
+      if (from < to) spans.push([index + from - item.id.clock, to - from]);
+    }
+    index += item.length;
+  }
+  return spans.sort((x, y) => y[0] - x[0]);
+}
+
+/** `ranges`, and each run since put in front of one of them, in turn (as when a line changed again replaced it). */
+function withLaterRuns(text: Y.Text, ranges: IdRange[]): IdRange[] {
+  const out = [...ranges];
+  const items = textItems(text) as Array<TextItem & { rightOrigin: Y.ID | null }>;
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const item of items) {
+      if (!item.rightOrigin || !within(out, item.rightOrigin) || within(out, item.id)) continue;
+      out.push({ client: item.id.client, clock: item.id.clock, length: item.length });
+      grew = true;
+    }
+  }
+  return out;
+}
+
+/** A note's text with the characters of `ranges` taken out (the note itself left as it is). */
+function textWithout(doc: Y.Doc, ranges: IdRange[]): string {
+  const probe = new Y.Doc({ gc: true });
+  try {
+    Y.applyUpdate(probe, Y.encodeStateAsUpdate(doc));
+    const text = probe.getText("content");
+    for (const [at, length] of spansOf(text, ranges)) text.delete(at, length);
+    return text.toString();
+  } finally {
+    probe.destroy();
+  }
 }
 
 function validBlobRef(value: unknown): BlobRef | undefined {
@@ -161,10 +240,20 @@ export class RoomReplica {
   private saving = false;
   /** Recent whole-note saves made here, per note, to spot a clash with someone else's (see ReplicaEvents.clash). */
   private fileSaves = new Map<DocId, FileSave[]>();
+  /** Text typed here in this session (not whole-note saves), per note: what it took out and put in (see typedClash). */
+  private typed = new Map<DocId, { deleted: IdRange[]; inserted: InsertedRun[] }>();
+  /** What lost a clash, per note, to take out (see settle). */
+  private takeOuts = new Map<DocId, IdRange[]>();
+  /** Notes where taking out what lost a clash was refused (no room left, say): not tried again in this session. */
+  private unsettled = new Set<DocId>();
   /** Documents this device passed on, with the work of former writers it covered then (see passOnOldWork). */
   private passedOn = new Map<DocId, Set<string>>();
   /** Files whose version by a former writer is being passed on (see passOnOldWork). */
   private passingOn = new Set<string>();
+  /** Former writers' work, by document or file version: when it was first seen here (see passOnOldWork). */
+  private oldSince = new Map<string, number>();
+  /** File versions that couldn't be passed on (no room left for them, say): not tried again in this session. */
+  private cantPassOn = new Set<string>();
   private refusal: string | null = null;
   private destroyed = false;
 
@@ -406,11 +495,15 @@ export class RoomReplica {
     state = { doc, applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0 };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
-    for (const env of [...snapshots, ...updates]) this.applyEnvelope(state, docId, env);
+    const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
+    for (const env of [...snapshots, ...updates]) this.applyEnvelope(state, docId, env, checks);
     doc.on("update", (update: Uint8Array, origin: unknown) => {
       if (origin !== REMOTE) this.localUpdate(docId, update);
     });
     if (updates.some((u) => snapshots.some((s) => u.clock <= (s.covers[u.author] ?? 0)))) this.compact(docId);
+    // Clashes are looked for once the whole note is in (this computer's own saves too), and settled before it is read.
+    for (const [env, bytes] of checks) this.checkClash(docId, env, bytes);
+    this.settle(docId);
     return state;
   }
 
@@ -423,7 +516,16 @@ export class RoomReplica {
     this.localEditAt.set(docId, Date.now());
     if (this.saving) {
       const deleted = deletedRanges(update);
-      this.rememberSave(docId, { at: Date.now(), deleted, inserted: this.replacedBy(docId, insertedRanges(update), deleted) });
+      const inserted = insertedRuns(update);
+      if (deleted.length + inserted.length <= MAX_SAVED_RANGES) this.rememberSave(docId, { at: Date.now(), deleted, inserted });
+    } else if (docId !== INDEX_DOC) {
+      const typed = this.typed.get(docId) ?? { deleted: [], inserted: [] };
+      this.typed.delete(docId);
+      this.typed.set(docId, { deleted: [...typed.deleted, ...deletedRanges(update)].slice(-MAX_TYPED_RANGES), inserted: [...typed.inserted, ...insertedRuns(update)].slice(-MAX_TYPED_RANGES) });
+      for (const oldest of this.typed.keys()) {
+        if (this.typed.size <= MAX_TYPED_NOTES) break;
+        this.typed.delete(oldest);
+      }
     }
     try {
       this.publishLocal(docId, update);
@@ -486,8 +588,8 @@ export class RoomReplica {
     else this.events.doc?.(docId);
   }
 
-  /** Decrypt and merge one envelope. Returns true if it changed the document. */
-  private applyEnvelope(state: DocState, docId: DocId, env: UpdateEnvelope | SnapshotEnvelope): boolean {
+  /** Decrypt and merge one envelope. Returns true if it changed the document. `checks`: clashes are looked for later. */
+  private applyEnvelope(state: DocState, docId: DocId, env: UpdateEnvelope | SnapshotEnvelope, checks?: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]>): boolean {
     const key = this.keys.get(env.n);
     if (!key) {
       this.waiting.set(`${env.k}/${docId}/${env.author}/${env.k === "u" ? env.clock : env.seq}`, env);
@@ -499,13 +601,24 @@ export class RoomReplica {
     } catch {
       return false; // can't be decrypted with the committed key: ignore
     }
+    const typed = checks ? null : this.typedClash(state, docId, env, bytes);
     const before = Y.encodeStateVector(state.doc);
     try {
       Y.applyUpdate(state.doc, bytes, REMOTE);
     } catch {
       return false; // not a valid Yjs update: ignore it rather than corrupt the document
     }
-    if (env.author !== this.node.deviceId && this.fileSaves.has(docId)) this.checkClash(docId, env, bytes);
+    if (typed) {
+      if (typed.strays.length > 0) {
+        this.takeOuts.set(docId, [...(this.takeOuts.get(docId) ?? []), ...typed.strays]);
+        queueMicrotask(() => this.settle(docId));
+      }
+      if (typed.version !== textWithout(state.doc, typed.strays)) this.events.clash?.(docId, typed.version);
+    }
+    if (env.author !== this.node.deviceId && this.fileSaves.has(docId)) {
+      if (checks) checks.push([env, bytes]);
+      else this.checkClash(docId, env, bytes);
+    }
     // A snapshot's "covers" is only its author's claim: it never counts as applied updates here.
     if (env.k === "u") this.markApplied(state, env.author, env.clock);
     state.sinceSnapshot++;
@@ -564,35 +677,15 @@ export class RoomReplica {
 
   // ---- clashing saves ----
 
-  /**
-   * For each run of text a save put in: what the save took out right before it, the text that run replaced (a note saved
-   * outside the editor is changed line by line, each new line put in where its old one was taken out).
-   */
-  private replacedBy(docId: DocId, inserted: IdRange[], deleted: IdRange[]): FileSave["inserted"] {
-    const runs = inserted.map((range) => ({ ...range, replaces: [] as IdRange[] }));
-    // A run starts an item of its own (one that starts inside another, right after this save's own text, replaced nothing).
-    const starts = new Map(runs.map((run) => [`${run.client}:${run.clock}`, run]));
-    const text = this.docs.get(docId)?.doc.getText("content");
-    let gone: IdRange[] = [];
-    for (const item of text ? textItems(text) : []) {
-      const range = { client: item.id.client, clock: item.id.clock, length: item.length };
-      if (item.deleted) {
-        gone.push(...overlap([range], deleted));
-        continue;
-      }
-      const run = starts.get(`${range.client}:${range.clock}`);
-      if (run) run.replaces = gone;
-      gone = [];
-    }
-    return runs;
-  }
-
   private rememberSave(docId: DocId, save: FileSave): void {
     const saves = [...(this.fileSaves.get(docId) ?? []), save].slice(-MAX_FILE_SAVES);
     this.fileSaves.delete(docId);
     this.fileSaves.set(docId, saves);
-    for (const oldest of this.fileSaves.keys()) {
-      if (this.fileSaves.size <= MAX_SAVED_NOTES) break;
+    const size = (list: FileSave[]) => list.reduce((sum, one) => sum + one.deleted.length + one.inserted.length, 0);
+    let total = [...this.fileSaves.values()].reduce((sum, list) => sum + size(list), 0);
+    for (const [oldest, list] of this.fileSaves) {
+      if (this.fileSaves.size <= MAX_SAVED_NOTES && total <= MAX_SAVED_TOTAL) break;
+      total -= size(list);
       this.fileSaves.delete(oldest);
     }
   }
@@ -623,8 +716,7 @@ export class RoomReplica {
       this.fileSaves.set(docId, [...saves, ...(this.fileSaves.get(docId) ?? [])].slice(-MAX_FILE_SAVES));
       // A note not loaded yet is checked as it loads.
       if (!this.docs.has(docId)) continue;
-      const { snapshots, updates } = this.node.store.envelopesOf(this.roomId, docId);
-      for (const env of [...snapshots, ...updates]) {
+      for (const env of this.node.store.envelopesOf(this.roomId, docId).updates) {
         const key = this.keys.get(env.n);
         if (env.author === this.node.deviceId || !key) continue;
         try {
@@ -633,65 +725,97 @@ export class RoomReplica {
           // can't be read: nothing to check
         }
       }
+      this.settle(docId);
     }
   }
 
   /**
-   * Did someone else's change, made at the same moment, take out text a whole-note save of ours took out too? Then both
-   * replaced the same lines (a date changed to two different values, say), and keeping both would mix them. The save of
-   * the computer with the lower device id is kept: the other computer takes its own new lines there out again (it knows
-   * what each of them replaced), and keeps its version as a copy. Only an update made on one computer tells whose
-   * change it is; against anything else (a snapshot, content passed on again) a save made here gives way, so two
-   * computers never both keep theirs.
+   * Did someone else's save, made at the same moment, replace a line a whole-note save of ours replaced too (a date
+   * changed to two different values, say)? Both took the old line out and put their own in front of it (see
+   * reconcileYTextByLines), so keeping both would leave the line twice. The line put in by the lower Yjs client id is
+   * kept: each computer can tell, from the two lines alone, and the other computer takes its own out again (with any
+   * line it later put in its place) and keeps its version as a copy. Only an update made on one computer in one go says
+   * whose lines it holds: anything else (a snapshot, content passed on) decides nothing, so no line is ever taken out
+   * on a guess. A line one side changed only in part is merged as it is.
    */
   private checkClash(docId: DocId, env: UpdateEnvelope | SnapshotEnvelope, bytes: Uint8Array): void {
+    if (env.k !== "u" || this.unsettled.has(docId)) return;
     let theirs: IdRange[];
-    let theirInserted: IdRange[];
+    let theirRuns: InsertedRun[];
     try {
       theirs = deletedRanges(bytes);
-      theirInserted = insertedRanges(bytes);
+      theirRuns = insertedRuns(bytes);
     } catch {
       return;
     }
-    // How far it reaches per writer of the text it holds.
-    const reach = new Map<number, number>();
-    for (const t of theirInserted) reach.set(t.client, Math.max(reach.get(t.client) ?? 0, t.clock + t.length));
-    const single = env.k === "u" && reach.size <= 1;
-    const lost = !single || this.node.deviceId > env.author;
-    const remove: IdRange[] = [];
-    for (const save of this.fileSaves.get(docId) ?? []) {
-      // It holds this save's new text, so it was made after the save. (Of a save that only took text out, nothing tells.)
-      if (save.inserted.some((mine) => (reach.get(mine.client) ?? 0) >= mine.clock + mine.length)) continue;
-      if (!single && save.inserted.length === 0) continue;
+    if (theirs.length === 0 || theirRuns.length === 0 || new Set(theirRuns.map((run) => run.client)).size > 1) return;
+    const lost: InsertedRun[] = [];
+    const rivals: InsertedRun[] = [];
+    const saves = this.fileSaves.get(docId) ?? [];
+    for (const save of saves) {
       const both = overlap(save.deleted, theirs);
       if (both.length === 0) continue;
-      if (lost) remove.push(...save.inserted.filter((run) => overlap(run.replaces, both).length > 0));
-      this.events.clash?.(docId, lost);
+      for (const run of save.inserted) {
+        if (!run.right || !within(both, run.right)) continue;
+        const others = theirRuns.filter((t) => t.right?.client === run.right!.client && t.right.clock === run.right!.clock);
+        if (!others.some((t) => t.client < run.client)) continue;
+        lost.push(run);
+        rivals.push(...others);
+      }
     }
-    if (remove.length > 0) queueMicrotask(() => this.takeOut(docId, remove));
+    if (lost.length === 0) return;
+    // Lines this computer put in place of a losing one later go with it.
+    const ours = saves.flatMap((save) => save.inserted);
+    for (let i = 0; i < lost.length; i++) for (const run of ours) if (run.right && within([lost[i]!], run.right) && !lost.includes(run)) lost.push(run);
+    const state = this.docs.get(docId);
+    if (!state || spansOf(state.doc.getText("content"), lost).length === 0) return; // settled before
+    const version = textWithout(state.doc, withLaterRuns(state.doc.getText("content"), rivals));
+    this.takeOuts.set(docId, [...(this.takeOuts.get(docId) ?? []), ...lost]);
+    queueMicrotask(() => this.settle(docId));
+    if (version !== textWithout(state.doc, lost)) this.events.clash?.(docId, version);
   }
 
-  /** Take characters out of a note by their ids (those still there). */
-  private takeOut(docId: DocId, ranges: IdRange[]): void {
-    const state = this.docs.get(docId);
-    if (!state || this.destroyed || !this.canWrite() || !this.sealEpoch()) return;
-    const text = state.doc.getText("content");
-    const spans: Array<[number, number]> = [];
-    let index = 0;
-    for (const item of textItems(text)) {
-      if (item.deleted || !item.countable) continue;
-      for (const r of ranges) {
-        if (r.client !== item.id.client) continue;
-        const from = Math.max(r.clock, item.id.clock);
-        const to = Math.min(r.clock + r.length, item.id.clock + item.length);
-        if (from < to) spans.push([index + from - item.id.clock, to - from]);
-      }
-      index += item.length;
+  /**
+   * Before someone else's update goes in: did it replace a line (a whole-note save, see reconcileYTextByLines) that text
+   * typed here at the same moment went into? Then the save's line is kept, the same on both computers (theirs finds no
+   * line of its own to give way for): what was typed into the old line is taken out again here, and the note as it was
+   * here is kept as a copy. Only text typed in this session counts.
+   */
+  private typedClash(state: DocState, docId: DocId, env: UpdateEnvelope | SnapshotEnvelope, bytes: Uint8Array): { version: string; strays: IdRange[] } | null {
+    const typed = this.typed.get(docId);
+    if (!typed || env.k !== "u" || env.author === this.node.deviceId) return null;
+    let theirs: IdRange[];
+    let runs: InsertedRun[];
+    try {
+      theirs = deletedRanges(bytes);
+      runs = insertedRuns(bytes);
+    } catch {
+      return null;
     }
+    if (theirs.length === 0 || new Set(runs.map((run) => run.client)).size !== 1 || !runs.some((run) => run.right && within(theirs, run.right))) return null;
+    // Typed into a line it took out without knowing (it would have taken the typed text out too), or took out the same.
+    const strays = typed.inserted.filter((run) => run.right && within(theirs, run.right) && overlap([run], theirs).length === 0);
+    const live = spansOf(state.doc.getText("content"), strays).length > 0;
+    if (!live && overlap(typed.deleted, theirs).length === 0) return null;
+    return { version: state.doc.getText("content").toString(), strays: live ? strays : [] };
+  }
+
+  /** Take out what lost a clash in a note, now. */
+  private settle(docId: DocId): void {
+    const ranges = this.takeOuts.get(docId);
+    const state = this.docs.get(docId);
+    if (!ranges || !state) return;
+    this.takeOuts.delete(docId);
+    if (this.destroyed || !this.canWrite()) return;
+    const text = state.doc.getText("content");
+    const spans = spansOf(text, ranges);
     if (spans.length === 0) return;
-    this.edit(docId, () => {
-      for (const [at, length] of spans.sort((x, y) => y[0] - x[0])) text.delete(at, length);
+    // Marked while it runs: a refused edit rebuilds the note, which must not find the same clash and try again.
+    this.unsettled.add(docId);
+    const result = this.edit(docId, () => {
+      for (const [at, length] of spans) text.delete(at, length);
     });
+    if (result !== "refused") this.unsettled.delete(docId);
   }
 
   // ---- passing on the work of former writers ----
@@ -700,41 +824,59 @@ export class RoomReplica {
    * Work peers no longer take from its authors (`writes(author)` false: revoked, removed, made readers), though they did
    * it while they could, is passed on as this device's own: a snapshot of each document holding some of it, and a copy
    * of each file version of theirs still in use. Without that, a computer that catches up later would never get it.
-   * Call it now and then; once everything is passed on it does nothing.
+   * One writer does it (`lead`: the first of those online); any other steps in once the work has waited a while, so
+   * nothing depends on one computer. Call it now and then; once everything is passed on it does nothing.
    */
-  passOnOldWork(writes: (author: string) => boolean): void {
+  passOnOldWork(writes: (author: string) => boolean, lead = true): void {
     if (this.destroyed || !this.canWrite() || !this.sealEpoch()) return;
     const store = this.node.store;
+    const now = Date.now();
+    const seen = new Map<string, number>();
+    const due = (key: string) => {
+      const since = this.oldSince.get(key) ?? now;
+      seen.set(key, since);
+      return lead || now - since >= PASS_ON_STEP_IN_MS;
+    };
     for (const docId of store.docs(this.roomId)) {
       const { updates, snapshots } = store.envelopesOf(this.roomId, docId);
       const old = [...updates, ...snapshots].filter((env) => !writes(env.author)).map((env) => envelopeKey(env));
       const done = this.passedOn.get(docId);
-      if (old.length === 0 || (done && old.every((key) => done.has(key))) || !this.isComplete(docId)) continue;
+      if (old.length === 0 || (done && old.every((key) => done.has(key))) || !due(`doc/${docId}`) || !this.isComplete(docId)) continue;
       const mine = snapshots.filter((s) => s.author === this.node.deviceId).sort((a, b) => b.seq - a.seq)[0];
       const held = mine ? this.contentsOf(mine) : null;
       if ((held && Y.equalSnapshots(held, Y.snapshot(this.loadDoc(docId).doc))) || this.snapshot(docId, true)) this.passedOn.set(docId, new Set(old));
     }
     for (const [fileId, entry] of this.files()) {
       const blob = entry.blob;
-      if (!blob || writes(blob.by) || this.passingOn.has(fileId)) continue;
+      const version = `${fileId}/${blob?.id}`;
+      if (!blob || writes(blob.by) || this.passingOn.has(fileId) || this.cantPassOn.has(version) || !due(`file/${version}`)) continue;
       this.passingOn.add(fileId);
       void this.readBlob(blob)
         .then((bytes) => {
           if (!bytes || this.destroyed) return;
           const copy = this.putBlob(bytes);
           this.editIndex((files) => {
-            const now = files.get(fileId);
-            if (now?.blob?.by === blob.by && now.blob.id === blob.id) files.set(fileId, { ...now, blob: copy, base: blob.id });
+            const current = files.get(fileId);
+            if (current?.blob?.by === blob.by && current.blob.id === blob.id) files.set(fileId, { ...current, blob: copy, base: blob.id });
           });
         })
-        .catch(() => {
-          // can't be passed on now (no room key, storage full): tried again next time
+        .catch((error) => {
+          // Without the room key yet: tried again next time. Anything else (no room left for it) isn't retried for now.
+          if (!(error instanceof SecureError && error.code === "no_room_key")) this.cantPassOn.add(version);
         })
         .finally(() => this.passingOn.delete(fileId));
     }
+    this.oldSince = seen;
   }
 
   // ---- compaction ----
+
+  /** Whether peers take envelopes of this device in this room now (see verifyEnvelope). */
+  private writes(deviceId: string): boolean {
+    const state = this.node.effective();
+    const device = activeDevice(state, deviceId);
+    return device !== null && roleAtLeast(roleIn(state, this.roomId, device.user), "write");
+  }
 
   /** The Yjs snapshot (state vector and deletions) of a held snapshot envelope, or null if it can't be read. */
   private contentsOf(snapshot: SnapshotEnvelope): Y.Snapshot | null {
@@ -767,7 +909,8 @@ export class RoomReplica {
     const reach = (s: SnapshotEnvelope) => Object.values(s.covers).reduce((sum, clock) => sum + clock, 0);
     const ordered = [...snapshots].sort((a, b) => reach(b) - reach(a) || (envelopeKey(a) < envelopeKey(b) ? -1 : 1));
     for (const snapshot of ordered) {
-      if (remove.has(snapshot)) continue;
+      // One by someone who may no longer write never takes another's place: peers catching up would refuse it.
+      if (remove.has(snapshot) || !this.writes(snapshot.author)) continue;
       const contents = this.contentsOf(snapshot);
       if (!contents) continue;
       const contains = (env: StoredEnvelope): boolean => {

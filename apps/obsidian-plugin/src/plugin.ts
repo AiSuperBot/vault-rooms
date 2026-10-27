@@ -196,7 +196,7 @@ export default class VaultRoomsPlugin extends Plugin {
       svc.onPresence((env) => this.presences.get(env.room)?.receive(env)),
       svc.onLocalRefused((roomId, docId, code) => this.onLocalRefused(roomId, docId, code)),
       svc.onLostRoom((roomId) => void this.forgetFolder(roomId)),
-      svc.onClash((roomId, docId, lost) => this.folders.get(roomId)?.noteClashed(docId, lost))
+      svc.onClash((roomId, docId, version) => this.folders.get(roomId)?.noteClashed(docId, version))
     );
     for (const room of svc.rooms()) {
       const replica = svc.replica(room.id);

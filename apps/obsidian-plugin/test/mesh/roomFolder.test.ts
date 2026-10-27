@@ -42,7 +42,7 @@ function setup() {
     const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, {
       index: () => pcs.get(device.id)?.folder.remoteChanged(),
       doc: () => pcs.get(device.id)?.folder.remoteChanged(),
-      clash: (docId, lost) => pcs.get(device.id)?.folder.noteClashed(docId, lost)
+      clash: (docId, version) => pcs.get(device.id)?.folder.noteClashed(docId, version)
     });
     const folder = new RoomFolder({
       folder: folderPath,
@@ -849,10 +849,119 @@ describe("room folder", () => {
     await s.settle();
     const main = text(a.vault, "Team/Task.md")!;
     expect(text(c.vault, "Team/Task.md")).toBe(main);
-    const start = a.device.id < c.device.id ? "2030-01-12" : "2030-02-03";
+    // One start date, whole (either may be kept, the same everywhere); what only one side changed stays.
+    const start = /start: (.*)/.exec(main)?.[1];
+    expect(["2030-01-12", "2030-02-03"]).toContain(start);
     expect(main).toBe(`---\ntitle: Plan B\nstart: ${start}\nend: 2030-01-23\n---\n`);
+    // The other date is kept in a copy (shared like any file), in the note as it then was.
+    const other = start === "2030-01-12" ? "2030-02-03" : "2030-01-12";
     const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
-    expect(copies).toContain(start === "2030-01-12" ? cy : ana);
+    expect(new Set(copies)).toEqual(new Set([`---\ntitle: Plan B\nstart: ${other}\nend: 2030-01-23\n---\n`]));
+  });
+
+  /** Each computer saves `saves` (in turn) of a note while apart; then they meet. Returns the note and the copies. */
+  async function savedApart(base: string, ana: string[], cy: string[], bind = false, restart = false) {
+    const { s, a, c, link } = await pair({ "Team/Task.md": base });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    for (const [pc, saves] of [[a, ana], [c, cy]] as const) {
+      for (const save of saves) {
+        await pc.vault.writeText("Team/Task.md", save);
+        await pc.folder.settled();
+      }
+      if (bind) pc.bound.add(id);
+    }
+    let pcs = [a, c];
+    if (restart) {
+      // Both stop and start again; each has all of the other's saves before its folder starts.
+      for (const pc of pcs) await pc.folder.stop();
+      pcs = [s.make(s.ana, "Team", a.vault, a), s.make(s.cy, "Team", c.vault, c)];
+      s.net.link(a.node, c.node);
+      s.net.pump();
+      for (const pc of pcs) {
+        pc.replica.refreshKeys();
+        await pc.folder.start();
+      }
+    } else s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const notes = pcs.map((pc) => pc.replica.noteText(id));
+    const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
+    return { notes, copies };
+  }
+
+  it("keeps one line of two computers that each changed it twice while apart", async () => {
+    const { notes, copies } = await savedApart("due: 2030-01-09\n", ["due: 2030-01-10\n", "due: 2030-01-11\n"], ["due: 2030-02-01\n", "due: 2030-02-02\n"]);
+    expect(notes[1]).toBe(notes[0]);
+    expect(["due: 2030-01-11\n", "due: 2030-02-02\n"]).toContain(notes[0]);
+    expect(copies).toEqual(new Set([notes[0] === "due: 2030-01-11\n" ? "due: 2030-02-02\n" : "due: 2030-01-11\n"]));
+  });
+
+  it("keeps one line of two computers that each changed it twice while apart, after a restart too", async () => {
+    const { notes, copies } = await savedApart("due: 2030-01-09\n", ["due: 2030-01-10\n", "due: 2030-01-11\n"], ["due: 2030-02-01\n", "due: 2030-02-02\n"], false, true);
+    expect(notes[1]).toBe(notes[0]);
+    expect(["due: 2030-01-11\n", "due: 2030-02-02\n"]).toContain(notes[0]);
+    expect(copies).toEqual(new Set([notes[0] === "due: 2030-01-11\n" ? "due: 2030-02-02\n" : "due: 2030-01-11\n"]));
+  });
+
+  it("keeps the losing version as a copy when the note is open in an editor", async () => {
+    const { notes, copies } = await savedApart("due: 2030-01-09\n", ["due: 2030-01-12\n"], ["due: 2030-02-03\n"], true);
+    expect(notes[1]).toBe(notes[0]);
+    expect(["due: 2030-01-12\n", "due: 2030-02-03\n"]).toContain(notes[0]);
+    expect(copies).toEqual(new Set([notes[0] === "due: 2030-01-12\n" ? "due: 2030-02-03\n" : "due: 2030-01-12\n"]));
+  });
+
+  it("keeps a line a plugin wrote over one typed into at the same moment, and the typed version as a copy", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-09\n---\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    // A plugin on Ana's computer writes a new date; on Cy's, someone types over one digit of the old one.
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-02-03\n---\n");
+    await a.folder.settled();
+    c.bound.add(id);
+    const typed = c.replica.noteDoc(id);
+    const at = typed.getText("content").toString().indexOf("9");
+    typed.transact(() => {
+      typed.getText("content").delete(at, 1);
+      typed.getText("content").insert(at, "7");
+    });
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    // Ana's line is kept whole, on both computers; what was typed is kept on Cy's as a copy.
+    expect(a.replica.noteText(id)).toBe("---\ndue: 2030-02-03\n---\n");
+    expect(c.replica.noteText(id)).toBe("---\ndue: 2030-02-03\n---\n");
+    const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
+    expect(copies).toEqual(new Set(["---\ndue: 2030-01-07\n---\n"]));
+  });
+
+  it("never runs two lines together, even when the other's save only comes inside a snapshot", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-09\n---\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-12\n---\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "---\ndue: 2030-02-03\n---\n");
+    await c.folder.settled();
+    // Cy's save now travels only inside a snapshot, which tells nobody whose lines it holds.
+    expect(c.replica.snapshot(id, true)).not.toBeNull();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const note = a.replica.noteText(id);
+    expect(c.replica.noteText(id)).toBe(note);
+    const dates = note.split("\n").filter((line) => line.startsWith("due"));
+    expect(dates.length).toBeGreaterThan(0);
+    for (const line of dates) expect(line).toMatch(/^due: 2030-\d\d-\d\d$/);
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    for (const date of ["2030-01-12", "2030-02-03"]) expect([note, ...copies].join()).toContain(date);
+  });
+
+  it("keeps both of two lines added at the same moment to a note without a final line break", async () => {
+    const { notes, copies } = await savedApart("# Log\n- one", ["# Log\n- one\n- from Ana"], ["# Log\n- one\n- from Cy"]);
+    expect(notes[1]).toBe(notes[0]);
+    expect(["# Log\n- one\n- from Ana\n- from Cy", "# Log\n- one\n- from Cy\n- from Ana"]).toContain(notes[0]);
+    expect(copies.size).toBe(0);
   });
 
   it("still notices a clash with a save made before a restart", async () => {

@@ -56,14 +56,45 @@ describe("computeTextDiff", () => {
 });
 
 describe("reconcileYTextByLines", () => {
+  /** Reconcile `from` to `to`; returns the result and the update it made. */
+  function byLines(from: string, to: string): { result: string; update: ReturnType<typeof Y.decodeUpdate> } {
+    const doc = new Y.Doc();
+    const text = doc.getText("content");
+    text.insert(0, from);
+    let update: ReturnType<typeof Y.decodeUpdate> | null = null;
+    doc.once("update", (bytes: Uint8Array) => (update = Y.decodeUpdate(bytes)));
+    reconcileYTextByLines(text, to, null);
+    return { result: text.toString(), update: update! };
+  }
+
   it("turns a note into another", () => {
-    const cases = [["", "a\n"], ["a\n", ""], ["a\nb\nc\n", "a\nB\nc\n"], ["a\nb", "a\nb\nc"], ["a\nb\nc\n", "x\nb\ny\nz\n"], ["a\nb\nc\nd\n", "a\nd\n"], ["😃 a\n", "😃 b\n"]];
-    for (const [from, to] of cases) {
-      const text = new Y.Doc().getText("content");
-      text.insert(0, from!);
-      expect(reconcileYTextByLines(text, to!, null)).toBe(true);
-      expect(text.toString()).toBe(to);
+    const cases = [["", "a\n"], ["a\n", ""], ["a", ""], ["", "a"], ["a\nb\nc\n", "a\nB\nc\n"], ["a\nb", "a\nb\nc"], ["a\nb\nc\n", "x\nb\ny\nz\n"], ["a\nb\nc\nd\n", "a\nd\n"], ["a\nb\nc", "a"], ["a\nb\nc", "c"], ["😃 a\n", "😃 b\n"], ["\n\n", "\n"], ["x", "\n\nx\n\n"]];
+    for (const [from, to] of cases) expect(byLines(from!, to!).result, JSON.stringify([from, to])).toBe(to);
+    // And any edit of lines, at random (fixed seed).
+    let seed = 7;
+    const random = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2147483648), seed % n);
+    const words = ["", "a", "bb", "start: 2030-01-09", "end", "😃"];
+    for (let round = 0; round < 300; round++) {
+      const note = () => Array.from({ length: random(6) }, () => words[random(words.length)]).join("\n");
+      const [from, to] = [note(), note()];
+      expect(byLines(from, to).result, JSON.stringify([from, to])).toBe(to);
     }
+  });
+
+  it("only adds when lines are added at either end, with or without a final line break", () => {
+    for (const [from, to] of [["a\nb", "a\nb\nc"], ["a\nb\n", "a\nb\nc\n"], ["a\nb", "x\na\nb"], ["a\nb", "a\nb\n"]]) {
+      expect(byLines(from!, to!).update.ds.clients.size, JSON.stringify([from, to])).toBe(0);
+    }
+  });
+
+  it("puts each new line in front of the line it replaced", () => {
+    const { update } = byLines("---\nstart: 2030-01-09\nend: 2030-01-20\n---\n", "---\nstart: 2030-01-12\nend: 2030-01-23\n---\n");
+    const runs = update.structs.map((struct) => ({ text: ((struct as Y.Item).content as Y.ContentString).str, right: (struct as Y.Item).rightOrigin!.clock }));
+    // Positions in the original text: "start..." begins at 4, "end..." at 22.
+    expect(runs).toEqual([
+      { text: "start: 2030-01-12\n", right: 4 },
+      { text: "end: 2030-01-23\n", right: 22 }
+    ]);
   });
 
   it("replaces a changed line whole, so two computers changing it take out the same text", () => {

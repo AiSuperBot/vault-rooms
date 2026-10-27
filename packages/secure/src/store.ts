@@ -17,6 +17,12 @@ interface DocEntry {
   marks: VersionVector;
   /** The same on a snapshot's word alone, in rooms this device only relays; dropped if it joins the room. */
   claimed: VersionVector;
+  /**
+   * Per author: the newest of their snapshots dropped here as contained in another kept one. An author's snapshot holds
+   * all its earlier ones did, so one up to here is never wanted again: remembering this keeps a dropped snapshot that is
+   * still going around the mesh from being taken in and passed on again, forever.
+   */
+  dropped: VersionVector;
 }
 
 /** What is kept in memory of a blob; the ciphertext itself stays in a BlobStorage. */
@@ -107,7 +113,7 @@ export class EnvelopeStore {
     let docs = this.docsByRoom.get(room);
     if (!docs) this.docsByRoom.set(room, (docs = new Map()));
     let entry = docs.get(doc);
-    if (!entry) docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {} }));
+    if (!entry) docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {} }));
     return entry;
   }
 
@@ -128,8 +134,9 @@ export class EnvelopeStore {
     const member = this.isMember(env.room);
     if (env.k === "u") {
       if (env.clock <= this.markOf(entry, env.author)) return "duplicate";
-    } else if (!member) {
-      for (const kept of entry.snapshots.values()) if (kept.author === env.author && vvDominates(kept.covers, env.covers)) return "duplicate";
+    } else {
+      if (env.seq <= (entry.dropped[env.author] ?? 0)) return "duplicate";
+      if (!member) for (const kept of entry.snapshots.values()) if (kept.author === env.author && vvDominates(kept.covers, env.covers)) return "duplicate";
     }
     const bytes = this.docBytes.get(env.room) ?? 0;
     if (bytes + env.ct.length > STORE_LIMITS.roomDocBytes) return "quota";
@@ -189,6 +196,7 @@ export class EnvelopeStore {
         if (byClock?.size === 0) entry.updates.delete(env.author);
       } else {
         entry.snapshots.delete(key);
+        entry.dropped[env.author] = Math.max(entry.dropped[env.author] ?? 0, env.seq);
       }
       this.signatures.delete(key);
       this.docBytes.set(room, (this.docBytes.get(room) ?? 0) - env.ct.length);
@@ -205,16 +213,17 @@ export class EnvelopeStore {
   }
 
   /** A document's marks, for saving next to its envelopes. */
-  marksOf(room: string, doc: DocId): { marks: VersionVector; claimed: VersionVector } {
+  marksOf(room: string, doc: DocId): { marks: VersionVector; claimed: VersionVector; dropped: VersionVector } {
     const entry = this.docsByRoom.get(room)?.get(doc);
-    return { marks: { ...(entry?.marks ?? {}) }, claimed: { ...(entry?.claimed ?? {}) } };
+    return { marks: { ...(entry?.marks ?? {}) }, claimed: { ...(entry?.claimed ?? {}) }, dropped: { ...(entry?.dropped ?? {}) } };
   }
 
   /** Put saved marks back (loading from disk). */
-  restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector): void {
+  restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector, dropped: VersionVector = {}): void {
     const entry = this.entry(room, doc);
     for (const [author, clock] of Object.entries(marks)) entry.marks[author] = Math.max(entry.marks[author] ?? 0, clock);
     for (const [author, clock] of Object.entries(claimed)) entry.claimed[author] = Math.max(entry.claimed[author] ?? 0, clock);
+    for (const [author, seq] of Object.entries(dropped)) entry.dropped[author] = Math.max(entry.dropped[author] ?? 0, seq);
   }
 
   has(env: StoredEnvelope): boolean {
@@ -261,7 +270,7 @@ export class EnvelopeStore {
   }
 
   maxSnapshotSeq(room: string, doc: DocId, author: string): number {
-    let max = 0;
+    let max = this.docsByRoom.get(room)?.get(doc)?.dropped[author] ?? 0;
     for (const snapshot of this.docsByRoom.get(room)?.get(doc)?.snapshots.values() ?? []) if (snapshot.author === author) max = Math.max(max, snapshot.seq);
     return max;
   }

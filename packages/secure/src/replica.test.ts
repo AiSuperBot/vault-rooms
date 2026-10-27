@@ -4,11 +4,12 @@ import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { randomId } from "./ids.js";
 import { keyCommitment, newRoomKey, wrapRoomKey } from "./keys.js";
-import { openEnvelope, sealSnapshot } from "./envelope.js";
+import { envelopeKey, openEnvelope, sealSnapshot } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
 import { RoomReplica, type FileEntry } from "./replica.js";
-import { createRoom, founder, invite, Network, type TestDevice } from "./testkit.js";
+import { STORE_LIMITS } from "./store.js";
+import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion } from "./workspace.js";
 
 describe("room paths", () => {
@@ -225,6 +226,94 @@ describe("room replica", () => {
     s.net.pump();
     expect(c.replica.noteText(fileId)).toBe("Keep me and more");
   });
+
+  /** Ana, Cy and Ben, all writers, each linked to the other two, sharing a note. */
+  function triangle() {
+    const s = setup();
+    step(s.chain, s.ana, (state) => void (state.rooms[s.roomId]!.members[s.ben.userId] = "write"));
+    for (const device of [s.ana, s.cy, s.ben, s.rae]) s.wrapFor(device);
+    const [a, c, b] = [s.member(s.ana), s.member(s.cy), s.member(s.ben)];
+    s.net.link(a.node, c.node);
+    s.net.link(c.node, b.node);
+    s.net.link(a.node, b.node);
+    s.net.pump();
+    for (const m of [a, c, b]) m.replica.refreshKeys();
+    return { s, a, c, b };
+  }
+
+  it("lets go of a snapshot dropped as contained in another, instead of passing it around for ever", () => {
+    const { s, a, c, b } = triangle();
+    const fileId = addNote(a.replica, "Plan.md", "hello\n");
+    s.net.pump();
+    for (const m of [a, c, b]) m.replica.noteText(fileId);
+    // Two writers snapshot the same note at once: one snapshot stays everywhere, and the network goes quiet.
+    c.replica.snapshot(fileId);
+    b.replica.snapshot(fileId);
+    expect(() => s.net.pump(5_000)).not.toThrow();
+    const kept = [a, c, b].map((m) => m.node.store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => envelopeKey(snapshot)).join());
+    expect(new Set(kept).size).toBe(1);
+  });
+
+  it("passes a former writer's work on only once it waited, if not the first writer to do it", () => {
+    const { s, a, b } = triangle();
+    const fileId = addNote(b.replica, "Ben.md", "Ben's work\n");
+    s.net.pump();
+    a.replica.noteText(fileId);
+    const snapshots = () => a.node.store.envelopesOf(s.roomId, fileId).snapshots.length;
+    a.replica.passOnOldWork((author) => author !== s.ben.id, false);
+    expect(snapshots()).toBe(0);
+    a.replica.passOnOldWork((author) => author !== s.ben.id, true);
+    expect(snapshots()).toBe(1);
+  });
+
+  it("doesn't read and seal a former writer's file again and again when there is no room left for a copy", async () => {
+    const { s, a, b } = triangle();
+    const blob = b.replica.putBlob(utf8("Ben's picture"));
+    b.replica.editIndex((files) => files.set(randomId("f"), { path: "pic.png", kind: "bin", blob }));
+    s.net.pump();
+    let reads = 0;
+    const read = a.replica.readBlob.bind(a.replica);
+    a.replica.readBlob = (ref) => (reads++, read(ref));
+    const limit = STORE_LIMITS.memberBlobBytes;
+    STORE_LIMITS.memberBlobBytes = 0;
+    try {
+      for (let run = 0; run < 3; run++) {
+        a.replica.passOnOldWork((author) => author !== s.ben.id);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    } finally {
+      STORE_LIMITS.memberBlobBytes = limit;
+    }
+    expect(reads).toBe(1);
+  });
+
+  it("never lets the snapshot of someone who may no longer write push out a writer's", () => {
+    // Device ids are random, and which of two equal snapshots stays depends on them: tried several times.
+    for (let round = 0; round < 8; round++) passedOnToLatePeer();
+  });
+
+  function passedOnToLatePeer() {
+    const { s, a, c, b } = triangle();
+    const fileId = addNote(b.replica, "Ben.md", "Ben's work\n");
+    s.net.pump();
+    for (const m of [a, c]) m.replica.noteText(fileId);
+    // Ben snapshots his note; then his computer is revoked, and Ana passes his work on (the same content).
+    b.replica.snapshot(fileId);
+    s.net.pump();
+    const revoked = nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.devices[s.ben.id]!.revoked = true));
+    for (const m of [a, c]) m.node.offerVersions([revoked]);
+    const writes = (author: string) => author !== s.ben.id;
+    a.replica.passOnOldWork(writes);
+    s.net.pump();
+    for (const m of [a, c]) expect(m.node.store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => snapshot.author)).toEqual([s.ana.id]);
+    // Rae's computer catches up later, from Cy's alone.
+    const r = s.member(s.rae);
+    r.node.offerVersions([revoked]);
+    s.net.link(c.node, r.node);
+    s.net.pump();
+    r.replica.refreshKeys();
+    expect(r.replica.noteText(fileId)).toBe("Ben's work\n");
+  }
 
   it("an honest snapshot is checked, then replaces what it really contains", () => {
     const s = setup();
