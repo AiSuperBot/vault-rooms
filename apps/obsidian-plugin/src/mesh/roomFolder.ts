@@ -316,12 +316,13 @@ export class RoomFolder {
    * and the other's was kept (see RoomReplica): `version`, the note as it was here, is kept as a copy. Whether or not
    * the note is open in an editor, so the version saved here is never lost.
    */
-  noteClashed(fileId: string, version: string): void {
-    if (this.stopped) return;
+  noteClashed(fileId: string, version: string): boolean {
+    if (this.stopped) return false;
     void this.run(async () => {
       const entry = this.o.replica.files().get(fileId);
       if (entry?.kind === "md" && !entry.deleted) await this.keepAside(entry.path, version);
     });
+    return true;
   }
 
   /** Whether a note's local version is held back (couldn't be shared): the editor shouldn't be bound to it. */

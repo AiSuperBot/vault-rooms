@@ -619,6 +619,25 @@ describe("devices and users", () => {
     expect(chain.state.devices[e.id]!.revoked).toBeUndefined();
   });
 
+  it("takes back every device of someone the thief let in, their own second one too", () => {
+    const { chain, a, b, v, roomId } = stolen();
+    const fork = chain.state;
+    const forkV = chain.head.body.v;
+    const lost = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true));
+    // On the stolen laptop: V removed (so this branch wins), E let in with the room, and E adds another device.
+    const thief = WorkspaceChain.load(chain.all());
+    step(thief, b, (state) => (state.users[v.userId]!.removed = true));
+    const { joiner: e } = invite(thief, b, { userName: "E", rooms: { [roomId]: "write" } });
+    const { joiner: e2 } = invite(thief, e, { forUser: e });
+    const won = thief.all().filter((version) => version.body.v > forkV);
+    expect(chain.offer(won).status).toBe("appended");
+    chain.offer([nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true))]);
+    reduce(chain, a, fork, [lost], won);
+    expect(chain.state.rooms[roomId]!.members[e.userId]).toBeUndefined();
+    expect(chain.state.devices[e.id]!.revoked).toBe(true);
+    expect(chain.state.devices[e2.id]!.revoked).toBe(true);
+  });
+
   it("takes back what someone granted with a role the thief gave them", () => {
     const { chain, a, b, m, v, w, roomId } = stolen();
     settleTheft(chain, a, b, v, [{ change: (state) => void (state.rooms[roomId]!.members[m.userId] = "manage") }, { by: m, change: (state) => void (state.rooms[roomId]!.members[w.userId] = "write") }]);

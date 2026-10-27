@@ -53,8 +53,6 @@ export default class VaultRoomsPlugin extends Plugin {
   service: MeshService | null = null;
   serviceError: string | null = null;
   private folders = new Map<string, RoomFolder>();
-  /** Versions of notes saved here that lost a clash while the room's folder wasn't there (hidden, being moved): kept as copies once it is. */
-  private clashCopies = new Map<string, Array<[string, string]>>();
   private presences = new Map<string, RoomPresence>();
   private editors!: EditorBinding;
   private changeListeners = new Set<() => void>();
@@ -198,11 +196,8 @@ export default class VaultRoomsPlugin extends Plugin {
       svc.onPresence((env) => this.presences.get(env.room)?.receive(env)),
       svc.onLocalRefused((roomId, docId, code) => this.onLocalRefused(roomId, docId, code)),
       svc.onLostRoom((roomId) => void this.forgetFolder(roomId)),
-      svc.onClash((roomId, docId, version) => {
-        const folder = this.folders.get(roomId);
-        if (folder) folder.noteClashed(docId, version);
-        else this.clashCopies.set(roomId, [...(this.clashCopies.get(roomId) ?? []), [docId, version]]);
-      })
+      // Without the room's folder (hidden, being moved) the clash waits for it, and is settled when it starts again.
+      svc.onClash((roomId, docId, version) => this.folders.get(roomId)?.noteClashed(docId, version) ?? false)
     );
     for (const room of svc.rooms()) {
       const replica = svc.replica(room.id);
@@ -449,8 +444,6 @@ export default class VaultRoomsPlugin extends Plugin {
     });
     this.folders.set(roomId, folder);
     await folder.start();
-    for (const [docId, version] of this.clashCopies.get(roomId) ?? []) folder.noteClashed(docId, version);
-    this.clashCopies.delete(roomId);
     this.syncEditors();
     this.changed();
   }

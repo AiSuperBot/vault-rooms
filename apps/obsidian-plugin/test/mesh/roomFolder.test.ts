@@ -987,6 +987,102 @@ describe("room folder", () => {
     }
   });
 
+  it("keeps what was typed elsewhere in a note whose saved line clashed, on the winner and the loser", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-09\n---\nPlan\nNotes here\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-12\n---\nPlan\nNotes here\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "---\ndue: 2030-02-03\n---\nPlan\nNotes here\n");
+    await c.folder.settled();
+    // Both also type in the body, in an editor.
+    for (const [pc, typed] of [[a, " by Ana"], [c, " by Cy"]] as const) {
+      pc.bound.add(id);
+      const body = pc.replica.noteDoc(id).getText("content");
+      body.insert(body.toString().indexOf("here") + 4, typed);
+    }
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const note = a.replica.noteText(id);
+    expect(c.replica.noteText(id)).toBe(note);
+    expect(note.split("\n").filter((line) => line.startsWith("due"))).toHaveLength(1);
+    expect(note).toMatch(/Notes here( by Ana| by Cy){2}\n$/);
+  });
+
+  it("settles a clash whose other line comes inside a snapshot that holds both lines", async () => {
+    const s = setup("write");
+    const [a, c, r] = [s.make(s.ana, "Team"), s.make(s.cy, "Team"), s.make(s.rae, "Team")];
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-09\n---\n");
+    for (const pc of [a, c, r]) s.giveKey(a, pc.device);
+    const links = [s.net.link(a.node, c.node), s.net.link(a.node, r.node), s.net.link(c.node, r.node)];
+    for (const pc of [a, c, r]) {
+      pc.replica.refreshKeys();
+      await pc.folder.start();
+    }
+    await s.settle();
+    const id = [...a.replica.files().keys()][0]!;
+    for (const link of links) link.cut();
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-12\n---\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "---\ndue: 2030-02-03\n---\n");
+    await c.folder.settled();
+    // Rae gets Cy's save, then Ana's (and Ana settles against Cy's), and keeps both only in a snapshot of her own.
+    let link = s.net.link(c.node, r.node);
+    await s.settle();
+    link.cut();
+    link = s.net.link(a.node, r.node);
+    await s.settle();
+    expect(r.replica.snapshot(id, true)).not.toBeNull();
+    link.cut();
+    // Cy meets Rae alone: Ana's line reaches it only in that snapshot, along with Cy's own.
+    s.net.link(c.node, r.node);
+    await s.settle();
+    s.net.link(a.node, c.node);
+    s.net.link(a.node, r.node);
+    await s.settle();
+    await s.settle();
+    const note = a.replica.noteText(id);
+    for (const pc of [c, r]) expect(pc.replica.noteText(id)).toBe(note);
+    expect(note.split("\n").filter((line) => line.startsWith("due"))).toHaveLength(1);
+  });
+
+  it("keeps the line of an earlier clash in the copy of a later one", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-09\n---\nstatus: open\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-12\n---\nstatus: open\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "---\ndue: 2030-02-03\n---\nstatus: open\n");
+    await c.folder.settled();
+    let joined = s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const due = /due: .*/.exec(a.replica.noteText(id))![0];
+    joined.cut();
+    // A second clash, on another line, found as the note loads after both restart.
+    await a.vault.writeText("Team/Task.md", `---\n${due}\n---\nstatus: done A\n`);
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", `---\n${due}\n---\nstatus: done C\n`);
+    await c.folder.settled();
+    for (const pc of [a, c]) await pc.folder.stop();
+    const restarted = [s.make(s.ana, "Team", a.vault, a), s.make(s.cy, "Team", c.vault, c)];
+    joined = s.net.link(a.node, c.node);
+    s.net.pump();
+    for (const pc of restarted) {
+      pc.replica.refreshKeys();
+      await pc.folder.start();
+    }
+    await s.settle();
+    await s.settle();
+    const note = a.replica.noteText(id);
+    expect(note).toContain(`${due}\n`);
+    const kept = /status: (.*)/.exec(note)![1];
+    const other = kept === "done A" ? "done C" : "done A";
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    expect(copies).toContain(`---\n${due}\n---\nstatus: ${other}\n`);
+  });
+
   it("keeps one line of three computers that changed it at once, and nothing else is taken out", async () => {
     const s = setup("write");
     const pcs = [s.make(s.ana, "Team"), s.make(s.cy, "Team"), s.make(s.rae, "Team")];

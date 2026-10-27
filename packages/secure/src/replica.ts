@@ -64,9 +64,10 @@ export interface ReplicaEvents {
   /**
    * A whole-note save made here (see `edit`, `save`) and someone else's, made at the same moment, replaced the same line
    * (two values written over one, say), and the other's is kept in the shared note. `version`: the note as this computer
-   * had it, with its own line, for the owner to keep as a copy.
+   * had it, with its own line, for the owner to keep as a copy. Returning false (nowhere to keep it now, the room's folder
+   * being away) leaves the line in the note: the clash is settled when the saves are restored again (see restoreSaves).
    */
-  clash?(docId: string, version: string): void;
+  clash?(docId: string, version: string): boolean | void;
 }
 
 /** A run of characters in a document by their Yjs ids. */
@@ -110,6 +111,19 @@ function insertedRuns(update: Uint8Array): InsertedRun[] {
   return structs
     .filter((struct) => struct.content !== undefined)
     .map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length, right: struct.rightOrigin ? { client: struct.rightOrigin.client, clock: struct.rightOrigin.clock } : null }));
+}
+
+/**
+ * The runs of an update that may be whole lines, by `client:clock`: text ending with a line break, or text taken out
+ * since (what it was can't be seen; whether a line took its place is seen in the note, see checkClash).
+ */
+function lineRuns(update: Uint8Array): Set<string> {
+  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; content?: { str?: string; len?: number } }> };
+  return new Set(
+    structs
+      .filter((struct) => struct.content?.str?.endsWith("\n") || (struct.content !== undefined && struct.content.str === undefined && struct.content.len !== undefined))
+      .map((struct) => `${struct.id.client}:${struct.id.clock}`)
+  );
 }
 
 /** The parts of `a` also in `b`; `b` is a set of ranges without overlaps (a Yjs delete set, say). */
@@ -219,7 +233,9 @@ function withInside(text: Y.Text, runs: IdRange[], lines: boolean, replaced = fa
   const starts = new Map<string, boolean>(lines ? runs.map((run) => [key(run), gone(run)]) : []);
   for (let grew = true; grew; ) {
     grew = false;
-    for (const item of items) {
+    // Right to left: what an item was put in front of is further right, so is decided first (one pass, in a chain).
+    for (let k = items.length - 1; k >= 0; k--) {
+      const item = items[k]!;
       const right = item.rightOrigin;
       if (!right || !within(out, right) || within(out, item.id)) continue;
       const start = starts.get(key(right));
@@ -235,25 +251,36 @@ function withInside(text: Y.Text, runs: IdRange[], lines: boolean, replaced = fa
 
 /**
  * The characters of the lines that start with one of `starts` (ids), as the text has them now: from that first
- * character up to and with the line break that ends the line, one of `breaks` (a line break typed in it since doesn't
- * end it). A character taken out can't be seen: none of them ends a line here.
+ * character on, as long as the characters are `old` (the line's own text, as the other side took it out, and what was
+ * typed here inside it), up to and with the line break that ends it (one of `breaks`). A character taken out here
+ * counts as well, so a line whose break is already gone here still ends where it did.
  */
-function linesFrom(text: Y.Text, starts: Set<string>, breaks: IdRange[]): IdRange[] {
+function linesFrom(text: Y.Text, starts: Set<string>, breaks: IdRange[], old: IdRange[]): IdRange[] {
+  const startsBy = new Map<number, number[]>();
+  for (const key of starts) {
+    const [client, clock] = key.split(":").map(Number) as [number, number];
+    startsBy.set(client, [...(startsBy.get(client) ?? []), clock]);
+  }
   const out: IdRange[] = [];
   let open = false;
   for (const item of textItems(text) as Array<TextItem & { content: { str?: string } }>) {
+    // Only items with a line start in them, or inside a line, are looked at character by character.
+    if (!open && !(startsBy.get(item.id.client) ?? []).some((clock) => clock >= item.id.clock && clock < item.id.clock + item.length)) continue;
     const str = item.deleted ? undefined : item.content.str;
     let from = -1;
+    const close = (to: number) => {
+      if (from >= 0 && to > from) out.push({ client: item.id.client, clock: item.id.clock + from, length: to - from });
+      open = false;
+      from = -1;
+    };
     for (let i = 0; i < item.length; i++) {
-      if (!open && starts.has(`${item.id.client}:${item.id.clock + i}`)) open = true;
+      const id = { client: item.id.client, clock: item.id.clock + i };
+      if (open && !within(old, id)) close(i);
+      if (!open && starts.has(`${id.client}:${id.clock}`)) open = true;
       if (open && from < 0) from = i;
-      if (open && str?.[i] === "\n" && within(breaks, { client: item.id.client, clock: item.id.clock + i })) {
-        out.push({ client: item.id.client, clock: item.id.clock + from, length: i + 1 - from });
-        open = false;
-        from = -1;
-      }
+      if (open && str?.[i] === "\n" && within(breaks, id)) close(i + 1);
     }
-    if (from >= 0) out.push({ client: item.id.client, clock: item.id.clock + from, length: item.length - from });
+    if (open) close(item.length), (open = true);
   }
   return out;
 }
@@ -299,6 +326,8 @@ export class RoomReplica {
   private takeOuts = new Map<DocId, { out: IdRange[]; copy: boolean }>();
   /** Lines of others found competing with lines saved here, per note: left out of the copy kept (see settle). */
   private rivals = new Map<DocId, IdRange[]>();
+  /** A take-out of what lost a clash is being made: not text typed here. */
+  private settling = false;
   /** Notes where taking out what lost a clash was refused (no room left, say): not tried again in this session. */
   private unsettled = new Set<DocId>();
   /** Documents this device passed on, with the work of former writers it covered then (see passOnOldWork). */
@@ -573,7 +602,7 @@ export class RoomReplica {
       const deleted = deletedRanges(update);
       const inserted = insertedRuns(update);
       if (deleted.length + inserted.length <= MAX_SAVED_RANGES) this.rememberSave(docId, { at: Date.now(), deleted, inserted });
-    } else if (docId !== INDEX_DOC) {
+    } else if (docId !== INDEX_DOC && !this.settling) {
       const typed = this.typed.get(docId) ?? { deleted: [], inserted: [] };
       this.typed.delete(docId);
       this.typed.set(docId, { deleted: [...typed.deleted, ...deletedRanges(update)].slice(-MAX_TYPED_RANGES), inserted: [...typed.inserted, ...insertedRuns(update)].slice(-MAX_TYPED_RANGES) });
@@ -664,8 +693,8 @@ export class RoomReplica {
       return false; // not a valid Yjs update: ignore it rather than corrupt the document
     }
     if (typed) {
-      if (typed.version !== textWithout(state.doc, typed.strays)) this.events.clash?.(docId, typed.version);
-      if (typed.strays.length > 0) this.takeOut(docId, typed.strays, false);
+      const kept = typed.version === textWithout(state.doc, typed.strays) || this.events.clash?.(docId, typed.version) !== false;
+      if (kept && typed.strays.length > 0) this.takeOut(docId, typed.strays, false);
     }
     if (env.author !== this.node.deviceId && this.fileSaves.has(docId)) {
       if (checks) checks.push([env, bytes]);
@@ -766,10 +795,9 @@ export class RoomReplica {
       const held = this.fileSaves.get(docId) ?? [];
       const known = new Set(held.map((save) => JSON.stringify(save)));
       const saves = list.slice(-MAX_FILE_SAVES).map(validSave).filter((save): save is FileSave => save !== null && save.at >= since && !known.has(JSON.stringify(save)));
-      if (saves.length === 0) continue;
-      this.fileSaves.set(docId, [...saves, ...held].slice(-MAX_FILE_SAVES));
-      // A note not loaded yet is checked as it loads.
-      if (!this.docs.has(docId)) continue;
+      if (saves.length > 0) this.fileSaves.set(docId, [...saves, ...held].slice(-MAX_FILE_SAVES));
+      // A note not loaded yet is checked as it loads; one without saves has nothing to check.
+      if (!this.docs.has(docId) || !this.fileSaves.has(docId)) continue;
       for (const env of this.node.store.envelopesOf(this.roomId, docId).updates) {
         const key = this.keys.get(env.n);
         if (env.author === this.node.deviceId || !key) continue;
@@ -805,33 +833,32 @@ export class RoomReplica {
     }
     const single = env.k === "u" && new Set(theirRuns.map((run) => run.client)).size === 1;
     if (theirs.length === 0 || theirRuns.length === 0 || (!single && !known)) return;
-    // How far it reaches per writer of the text it holds; and the lines it brings that weren't here.
-    const reach = new Map<number, number>();
-    for (const t of theirRuns) reach.set(t.client, Math.max(reach.get(t.client) ?? 0, t.clock + t.length));
-    const fresh = single ? theirRuns : theirRuns.filter((t) => t.clock >= (known!.get(t.client) ?? 0));
+    // The lines it brings that weren't here (from anything but an update made in one go: only whole lines).
+    const lines = single ? null : lineRuns(bytes);
+    const fresh = single ? theirRuns : theirRuns.filter((t) => t.clock >= (known!.get(t.client) ?? 0) && lines!.has(`${t.client}:${t.clock}`));
+    const state = this.docs.get(docId);
+    if (!state) return;
+    const text = state.doc.getText("content");
     const lost: InsertedRun[] = [];
     const rivals: InsertedRun[] = [];
+    const beaten: InsertedRun[] = [];
     const same = (a: IdRange, b: IdRange) => a.client === b.client && a.clock === b.clock;
     const saves = this.fileSaves.get(docId) ?? [];
     for (const save of saves) {
-      // It holds this save's new lines, so it was made after the save.
-      if (!single && save.inserted.some((mine) => (reach.get(mine.client) ?? 0) >= mine.clock + mine.length)) continue;
       const both = overlap(save.deleted, theirs);
       if (both.length === 0) continue;
       for (const run of save.inserted) {
         if (!run.right || !within(both, run.right)) continue;
         const others = fresh.filter((t) => t.client !== run.client && t.right?.client === run.right!.client && t.right.clock === run.right!.clock);
-        for (const other of others) if (!rivals.some((r) => same(r, other))) rivals.push(other);
-        if (!others.some((t) => t.client < run.client) || lost.some((l) => same(l, run))) continue;
+        // Gives way only to a line still in the note (or one that took its place since): never to leave none.
+        const loses = others.some((t) => t.client < run.client) && spansOf(text, withInside(text, others, true, true)).length > 0;
+        // The lines a line of ours lost to count against the copy only if that clash isn't settled yet (see below).
+        for (const other of others) if (!(loses ? beaten : rivals).some((r) => same(r, other))) (loses ? beaten : rivals).push(other);
+        if (!loses || lost.some((l) => same(l, run))) continue;
         lost.push(run);
       }
     }
-    if (rivals.length > 0) {
-      this.rivals.set(docId, [...(this.rivals.get(docId) ?? []), ...rivals]);
-      queueMicrotask(() => {
-        if (!this.takeOuts.has(docId)) this.rivals.delete(docId);
-      });
-    }
+    this.noteRivals(docId, rivals);
     if (lost.length === 0) return;
     // Lines this computer put in place of a losing one later (with a save that took it out) go with it.
     for (let i = 0; i < lost.length; i++) {
@@ -840,12 +867,20 @@ export class RoomReplica {
         for (const run of save.inserted) if (run.right && within([lost[i]!], run.right) && !lost.some((l) => same(l, run))) lost.push(run);
       }
     }
-    const state = this.docs.get(docId);
-    if (!state) return;
-    const text = state.doc.getText("content");
-    const out = withInside(text, lost, true);
+    // A losing line goes with whatever went inside it, and whatever took its place since (a line changed again).
+    const out = withInside(text, lost, true, true);
     if (spansOf(text, out).length === 0) return; // settled before
+    this.noteRivals(docId, beaten);
     this.takeOut(docId, out, true);
+  }
+
+  /** Lines of others found competing with lines saved here: left out of the copy (see settle), until it is made. */
+  private noteRivals(docId: DocId, rivals: IdRange[]): void {
+    if (rivals.length === 0) return;
+    this.rivals.set(docId, [...(this.rivals.get(docId) ?? []), ...rivals]);
+    queueMicrotask(() => {
+      if (!this.takeOuts.has(docId)) this.rivals.delete(docId);
+    });
   }
 
   private takeOut(docId: DocId, out: IdRange[], copy: boolean): void {
@@ -877,7 +912,8 @@ export class RoomReplica {
     const starts = new Set(runs.filter((run) => run.right && within(theirs, run.right)).map((run) => `${run.right!.client}:${run.right!.clock}`));
     if (starts.size === 0) return null;
     const text = state.doc.getText("content");
-    const lines = linesFrom(text, starts, theirs);
+    const typedInside = withInside(text, typed.inserted.filter((run) => run.right && within(theirs, run.right)), false);
+    const lines = linesFrom(text, starts, theirs, [...theirs, ...typedInside]);
     const inside = typed.inserted.filter((run) => run.right && within(lines, run.right) && !starts.has(`${run.right.client}:${run.right.clock}`) && overlap([run], theirs).length === 0);
     const strays = inside.length > 0 ? withInside(text, inside, false) : [];
     const live = spansOf(text, strays).length > 0;
@@ -899,16 +935,22 @@ export class RoomReplica {
     const text = state.doc.getText("content");
     if (pending.copy) {
       const version = textWithout(state.doc, withInside(text, rivals, true, true));
-      if (version !== textWithout(state.doc, pending.out)) this.events.clash?.(docId, version);
+      if (version !== textWithout(state.doc, pending.out) && this.events.clash?.(docId, version) === false) return;
     }
     if (this.destroyed || !this.canWrite()) return;
     const spans = spansOf(text, pending.out);
     if (spans.length === 0) return;
     // Marked while it runs: a refused edit rebuilds the note, which must not find the same clash and try again.
     this.unsettled.add(docId);
-    const result = this.edit(docId, () => {
-      for (const [at, length] of spans) text.delete(at, length);
-    });
+    this.settling = true;
+    let result: EditResult;
+    try {
+      result = this.edit(docId, () => {
+        for (const [at, length] of spans) text.delete(at, length);
+      });
+    } finally {
+      this.settling = false;
+    }
     if (result !== "refused") this.unsettled.delete(docId);
   }
 
