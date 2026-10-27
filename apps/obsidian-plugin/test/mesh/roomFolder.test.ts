@@ -586,10 +586,10 @@ describe("room folder", () => {
     expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["New.md"]);
   });
 
-  it("takes an editor's last save, made just after it stopped co-editing, as already shared", async () => {
+  it("never writes over a note held back here, even when someone else changes it", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");
-    await a.vault.writeText("Team/Live.md", "start\n");
+    await a.vault.writeText("Team/Plan.md", "base\n");
     const c = s.make(s.cy, "Team");
     s.giveKey(a, s.ana);
     s.giveKey(a, s.cy);
@@ -601,19 +601,32 @@ describe("room folder", () => {
     await c.folder.start();
     await s.settle();
     const [id] = [...a.replica.files().keys()];
-    // Ana types in an editor bound to the note and closes it; Cy goes on typing; then Ana's editor's last save lands.
-    a.bound.add(id!);
-    a.replica.noteDoc(id!).getText("content").insert(5, " typed");
+    // An editor's change to the note couldn't be shared, so the note is held back here; then Cy changes it.
+    a.folder.holdBackNote(id!);
+    await c.vault.writeText("Team/Plan.md", "base\nfrom Cy\n");
     await s.settle();
-    a.bound.delete(id!);
-    a.folder.editorLeft(id!, a.replica.noteText(id!));
-    await c.vault.writeText("Team/Live.md", "start typed\nfrom Cy\n");
-    await c.folder.settled();
-    s.net.pump();
-    await a.vault.writeText("Team/Live.md", "start typed\n");
+    expect(text(a.vault, "Team/Plan.md")).toBe("base\n");
+  });
+
+  it("takes another change to a new note still waiting for the room key as a change, not as one more new note", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const c = s.make(s.cy, "Team");
+    s.net.link(a.node, c.node);
+    await a.folder.start();
+    await a.vault.writeText("Team/Early.md", "early\n");
     await s.settle();
-    expect(text(a.vault, "Team/Live.md")).toBe("start typed\nfrom Cy\n");
-    expect([...a.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+    await a.vault.writeText("Team/Early.md", "early, then more\n");
+    await s.settle();
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.folder.remoteChanged();
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["Early.md"]);
+    expect(text(c.vault, "Team/Early.md")).toBe("early, then more\n");
   });
 
   it("shares again a note made while the room key was missing, if Obsidian stopped before its entry was stored", async () => {

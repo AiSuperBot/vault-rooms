@@ -69,8 +69,7 @@ export default class VaultRoomsPlugin extends Plugin {
     await this.loadSettings();
     this.editors = new EditorBinding(
       (path) => this.bindTarget(path),
-      (delayMs) => this.syncEditorsSoon(delayMs),
-      (roomId, fileId, text) => this.folders.get(roomId)?.editorLeft(fileId, text)
+      (delayMs) => this.syncEditorsSoon(delayMs)
     );
     this.registerEditorExtension(this.editors.extension());
     this.registerView(ROOMS_VIEW, (leaf) => new RoomsView(leaf, this));
@@ -181,7 +180,7 @@ export default class VaultRoomsPlugin extends Plugin {
       return;
     }
     // Unloaded meanwhile: this instance doesn't go online (the next one opens the workspace instead).
-    if (svc && this.unloaded) return svc.stop();
+    if (svc && this.unloaded) return svc.discard();
     this.service = svc;
     if (!svc) return this.changed();
     this.unsubscribers.push(

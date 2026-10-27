@@ -150,10 +150,8 @@ export class RoomFolder {
   private told = new Set<string>();
   /** Files remembered in this session while something made here for them was still being stored: what to check. */
   private unstoredNow = new Map<string, Pending>();
-  /** Notes whose new entry had to wait for the room key: remembered (when shared) as entries made here. */
-  private queuedEntries = new Set<string>();
-  /** What an editor showed when it stopped co-editing a note (already in the shared text), by file id: its hash. */
-  private leftByEditor = new Map<string, string>();
+  /** Notes whose new entry had to wait for the room key, by file id: their path. Remembered (when shared) as entries made here. */
+  private queuedEntries = new Map<string, string>();
   private needsAdopt = false;
   /** What was last synced is loaded: decisions can be made. */
   private started = false;
@@ -339,7 +337,6 @@ export class RoomFolder {
     for (const key of made) if (key) pending.keys.add(key);
     pending.created ||= created;
     if (this.queuedEntries.delete(id)) pending.index = pending.created = true;
-    this.leftByEditor.delete(id);
     const unstored = this.unstored(pending);
     if (unstored) this.unstoredNow.set(id, pending);
     else this.unstoredNow.delete(id);
@@ -360,11 +357,6 @@ export class RoomFolder {
     const keys = [...pending.keys];
     if (pending.index) keys.push(replica.ownUpdateKey(INDEX_DOC) ?? "");
     return replica.hasUnstored([...pending.docs], keys) || (pending.index && replica.hasUnsent(INDEX_DOC));
-  }
-
-  /** An editor stopped co-editing a note; what it showed then is in the shared text (its last save may come just after). */
-  editorLeft(fileId: string, text: string): void {
-    this.leftByEditor.set(fileId, sha(normalizeNote(text)));
   }
 
   /** Tell the user once about something (per subject). */
@@ -545,6 +537,8 @@ export class RoomFolder {
     const path = this.vaultPath(entry.path);
     const known = this.known.get(id);
     if (entry.kind === "md" && this.o.isBound(id)) return;
+    // A local version that couldn't be shared stays as it is, never written over (see holdBack).
+    if (this.heldBack.has(id)) return;
     let remote: string | Uint8Array | null;
     if (entry.kind === "md") {
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
@@ -662,7 +656,7 @@ export class RoomFolder {
       }
       // Remembered only once actually shared (a missing key leaves it to the next pass).
       if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true);
-      else this.queuedEntries.add(id);
+      else this.queuedEntries.set(id, relative);
       return;
     }
     const bytes = await this.o.vault.readBytes(path);
@@ -757,7 +751,7 @@ export class RoomFolder {
         return;
       }
       if (!this.o.vault.stat(vaultPath)) return;
-      const id = this.idAt(relative);
+      const id = this.idAt(relative) ?? [...this.queuedEntries].find(([, path]) => pathKey(path) === pathKey(relative))?.[0];
       const entry = id ? this.o.replica.files().get(id) : undefined;
       const content = isMarkdownPath(relative) ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
       const hash = sha(content);
@@ -768,12 +762,15 @@ export class RoomFolder {
       }
       // In doubt whether the others ever had what was made here last time: a pass settles it with the shared copy.
       if (this.doubtful(id)) return;
-      const known = this.known.get(id)!;
+      const known = this.known.get(id);
+      // A new note whose entry still waits for the room key: the edit waits with it.
+      if (!known) return this.localChanged(id, entry, content, hash);
+      // Changed again after it was held back: looked at afresh.
+      const held = this.heldBack.get(id);
+      if (held !== undefined && held !== hash && this.heldBack.delete(id)) this.o.heldBackChanged?.();
       if (hash === known.hash) return this.remember(id, relative, hash, known.blob ? { id: known.blob, by: known.mine ? this.o.replica.deviceId : "" } : undefined);
       // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk.
       if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) return this.remember(id, relative, hash);
-      // The last save of an editor that just stopped co-editing: already in the shared text.
-      if (this.leftByEditor.get(id) === hash) return this.remember(id, relative, hash);
       // The shared version moved on since the last sync and isn't here yet: taking this change in now would undo it, so
       // the next pass settles it like any change made on both sides (keeping a copy).
       if (this.o.replica.canWrite() && (await this.sharedMovedOn(id, entry, known))) return this.remoteChanged();

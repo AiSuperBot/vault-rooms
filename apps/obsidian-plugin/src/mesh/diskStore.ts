@@ -415,6 +415,15 @@ export class DiskStore implements BlobStorage {
     while (this.queues.size > 0) await Promise.all([...this.queues.values()]);
   }
 
+  /** Drop writes that haven't started (a store let go of without saving; another instance may be using the files). */
+  discard(): void {
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flushTimer = null;
+    this.rewrites.clear();
+    this.goneWrites.clear();
+    this.store = null;
+  }
+
   /** Remove everything this workspace stored on this device (leaving a workspace). */
   async wipe(): Promise<void> {
     await this.flush();
