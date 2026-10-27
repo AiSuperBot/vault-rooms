@@ -1,6 +1,6 @@
 import { b64u, utf8 } from "./bytes.js";
 import { canonicalJson } from "./canonical.js";
-import { WorkspaceChain, type OfferResult } from "./chain.js";
+import { MAX_FORK_DEPTH, WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
 import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
@@ -265,14 +265,15 @@ export class MeshNode {
   }
 
   /**
-   * Whether a wrap that doesn't count is worth keeping: its key isn't the record's (the record may name it again), or
-   * it is of a room's newest key (it shows who holds that key, see staleWraps). Otherwise it doesn't count because of
-   * who gave or got it, or the room was deleted: should they get access again, the key is simply wrapped for them anew.
+   * Whether a wrap that doesn't count is worth keeping: its key isn't the record's (the record may name it again), it is
+   * of a room's newest key (it shows who holds that key, see staleWraps), or of a room deleted recently enough for a
+   * fork to undo that. Otherwise it doesn't count because of who gave or got it: should they get access again, the key
+   * is simply wrapped for them anew.
    */
   private worthKeeping(wrap: KeyWrap): boolean {
     const room = this.effective().rooms[wrap.body.room];
     if (!room) return true;
-    if (room.deleted) return false;
+    if (room.deleted) return this.chain.versionAt(this.chain.length - 1 - MAX_FORK_DEPTH)?.body.state.rooms[wrap.body.room]?.deleted !== true;
     return room.epochs[wrap.body.n - 1]?.commit !== wrap.body.commit || wrap.body.n === room.epochs.length;
   }
 
@@ -290,6 +291,10 @@ export class MeshNode {
 
   offerVersions(versions: SignedVersion[], from?: PeerSession): OfferResult {
     const result = this.chain.offer(versions, this.now());
+    if (result.status === "replaced") {
+      // Joins recorded in versions that lost wait again, until an admin or the invite's creator records them again.
+      for (const version of result.lost) for (const join of version.body.joins ?? []) this.pendingJoins.set(joinHash(join), { join, firstSeen: version.body.at });
+    }
     if (result.status === "appended" || result.status === "replaced") {
       this.effectiveCache = null;
       this.events.chain?.(result);

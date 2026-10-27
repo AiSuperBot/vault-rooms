@@ -389,6 +389,26 @@ describe("devices and users", () => {
     step(chain, admin, (state) => Object.assign(state, merged));
   });
 
+  it("never gives back, when re-applying, room standing the winner took away", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "write" });
+    const base = chain.state;
+    const withRole = (role: "read" | "manage" | undefined) => {
+      const state = structuredClone(base);
+      if (role) state.rooms[roomId]!.members[ben.userId] = role;
+      else delete state.rooms[roomId]!.members[ben.userId];
+      return state;
+    };
+    const merged = (lost: "read" | "manage" | undefined, winner: "read" | undefined) => rebaseChange(base, withRole(lost), withRole(winner)).rooms[roomId]!.members[ben.userId];
+    // The winner took Ben out: neither lowering nor raising him in the lost version brings him back.
+    expect(merged("read", undefined)).toBeUndefined();
+    expect(merged("manage", undefined)).toBeUndefined();
+    // The winner lowered him: raising him again doesn't apply, taking him out does.
+    expect(merged("manage", "read")).toBe("read");
+    expect(merged(undefined, "read")).toBeUndefined();
+  });
+
   it("rejects a version whose signature doesn't match its signer", () => {
     const { chain, admin } = founder();
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });

@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { fromUtf8, utf8 } from "./bytes.js";
-import { WorkspaceChain } from "./chain.js";
+import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
 import { randomBytes } from "./crypto.js";
 import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
 import { randomId } from "./ids.js";
-import { createJoinRecord, joinHash } from "./invite.js";
+import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
@@ -274,6 +274,32 @@ describe("mesh", () => {
     const restarted = nodeFor(b.chain, ben);
     restarted.restore([], b.savedWraps());
     expect(restarted.allWraps()).toEqual([receipt]);
+  });
+
+  it("a join whose recording lost a race waits to be recorded again", () => {
+    const { chain, ws, ana, ben, cy, roomId } = setup();
+    step(chain, ana, (state) => (state.rooms[roomId]!.members[ben.userId] = "manage"));
+    const { joiner: dan, join } = invite(chain, ana, { userName: "Dan", fold: false });
+    const a = nodeFor(chain, ana);
+    const parent = a.chain.head;
+    a.offerVersions([nextVersion(ws, parent, ana.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    expect(a.chain.state.devices[dan.id]).toBeDefined();
+    // At the same moment Ben lowers Cy in the room he manages: that takes standing away, so his branch wins.
+    expect(a.offerVersions([nextVersion(ws, parent, ben.sign, (state) => (state.rooms[roomId]!.members[cy.userId] = "read"))]).status).toBe("replaced");
+    expect(a.chain.state.devices[dan.id]).toBeUndefined();
+    expect(a.pendingJoinRecords()).toEqual([join]);
+    expect(a.effective().devices[dan.id]).toBeDefined();
+  });
+
+  it("keeps the wraps of a deleted room while a fork could still undo the deletion", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const toCy = wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign);
+    step(chain, ana, (state) => (state.rooms[roomId]!.deleted = true));
+    const a = nodeFor(chain, ana);
+    a.restore([], [toCy]);
+    expect(a.savedWraps()).toEqual([toCy]);
+    for (let i = 0; i <= MAX_FORK_DEPTH; i++) a.offerVersions([nextVersion(ws, a.chain.head, ana.sign, (state) => (state.name = `Team ${i}`))]);
+    expect(a.savedWraps()).toEqual([]);
   });
 
   it("after a restart, still knows who held a room's newest key, until that key is replaced", () => {
