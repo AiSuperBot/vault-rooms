@@ -85,6 +85,8 @@ interface Pending {
   out: IdRange[];
   copy: boolean;
   versions: string[];
+  /** The lines that won: if none is left when a waiting take-out goes ahead, nothing is taken out. */
+  winners: IdRange[];
 }
 
 /** A run of text put in, and the character it was put in front of (for a changed line: the first of the old one). */
@@ -269,7 +271,9 @@ function linesFrom(text: Y.Text, starts: Set<string>, breaks: IdRange[], old: Id
   const startsBy = new Map<number, number[]>();
   for (const key of starts) {
     const [client, clock] = key.split(":").map(Number) as [number, number];
-    startsBy.set(client, [...(startsBy.get(client) ?? []), clock]);
+    const list = startsBy.get(client);
+    if (list) list.push(clock);
+    else startsBy.set(client, [clock]);
   }
   for (const list of startsBy.values()) list.sort((a, b) => a - b);
   const inOld = member(old);
@@ -322,7 +326,11 @@ function firstAtLeast(list: number[], value: number): number {
 /** Whether an id is in `ranges`, by binary search over them merged per client. */
 function member(ranges: IdRange[]): (id: { client: number; clock: number }) => boolean {
   const byClient = new Map<number, Array<[number, number]>>();
-  for (const r of ranges) byClient.set(r.client, [...(byClient.get(r.client) ?? []), [r.clock, r.clock + r.length]]);
+  for (const r of ranges) {
+    const list = byClient.get(r.client);
+    if (list) list.push([r.clock, r.clock + r.length]);
+    else byClient.set(r.client, [[r.clock, r.clock + r.length]]);
+  }
   const ends = new Map<number, { from: number[]; to: number[] }>();
   for (const [client, list] of byClient) {
     list.sort((x, y) => x[0] - y[0]);
@@ -849,7 +857,12 @@ export class RoomReplica {
     // Take-outs that waited for their copies to be kept go ahead (or wait again).
     for (const [docId, waiting] of [...this.waitingTakeOuts]) {
       this.waitingTakeOuts.delete(docId);
-      this.takeOut(docId, waiting.out, waiting.copy, waiting.versions);
+      const text = this.docs.get(docId)?.doc.getText("content");
+      if (!text) continue;
+      // The line it gave way to is gone since: it stays (never to leave none).
+      if (waiting.winners.length > 0 && spansOf(text, withInside(text, waiting.winners, true, true)).length === 0) continue;
+      // With what was put inside it meanwhile.
+      this.takeOut(docId, withInside(text, waiting.out, true), waiting.copy, waiting.versions, waiting.winners);
       this.settle(docId);
     }
     if (typeof saved !== "object" || saved === null) return;
@@ -906,6 +919,7 @@ export class RoomReplica {
     const lost: InsertedRun[] = [];
     const rivals: InsertedRun[] = [];
     const beaten: InsertedRun[] = [];
+    const winners: InsertedRun[] = [];
     const same = (a: IdRange, b: IdRange) => a.client === b.client && a.clock === b.clock;
     const saves = this.fileSaves.get(docId) ?? [];
     // How far it reaches per writer of the text it holds.
@@ -921,11 +935,13 @@ export class RoomReplica {
         if (!run.right || !within(both, run.right)) continue;
         const others = fresh.filter((t) => t.client !== run.client && t.right?.client === run.right!.client && t.right.clock === run.right!.clock);
         // Gives way only to a line still in the note (or one that took its place since): never to leave none.
-        const loses = others.some((t) => t.client < run.client && spansOf(text, withInside(text, [t], true, true)).length > 0);
+        const lower = others.filter((t) => t.client < run.client && spansOf(text, withInside(text, [t], true, true)).length > 0);
+        const loses = lower.length > 0;
         // The lines a line of ours lost to count against the copy only if that clash isn't settled yet (see below).
         for (const other of others) if (!(loses ? beaten : rivals).some((r) => same(r, other))) (loses ? beaten : rivals).push(other);
         if (!loses || lost.some((l) => same(l, run))) continue;
         lost.push(run);
+        winners.push(...lower);
       }
     }
     this.noteRivals(docId, rivals);
@@ -941,7 +957,7 @@ export class RoomReplica {
     const out = withInside(text, lost, true);
     if (spansOf(text, out).length === 0) return; // settled before
     this.noteRivals(docId, beaten);
-    this.takeOut(docId, out, true);
+    this.takeOut(docId, out, true, [], winners);
   }
 
   /** Lines of others found competing with lines saved here: left out of the copy (see settle), until it is made. */
@@ -953,9 +969,14 @@ export class RoomReplica {
     });
   }
 
-  private takeOut(docId: DocId, out: IdRange[], copy: boolean, versions: string[] = []): void {
+  private takeOut(docId: DocId, out: IdRange[], copy: boolean, versions: string[] = [], winners: IdRange[] = []): void {
     const pending = this.takeOuts.get(docId);
-    this.takeOuts.set(docId, { out: [...(pending?.out ?? []), ...out], copy: copy || pending?.copy === true, versions: [...(pending?.versions ?? []), ...versions] });
+    this.takeOuts.set(docId, {
+      out: [...(pending?.out ?? []), ...out],
+      copy: copy || pending?.copy === true,
+      versions: [...(pending?.versions ?? []), ...versions],
+      winners: [...(pending?.winners ?? []), ...winners]
+    });
     queueMicrotask(() => this.settle(docId));
   }
 
@@ -1012,7 +1033,12 @@ export class RoomReplica {
       if (this.events.clash?.(docId, versions[i]!) !== false) continue;
       // Nowhere to keep it now: nothing is taken out until there is (see restoreSaves).
       const waiting = this.waitingTakeOuts.get(docId);
-      this.waitingTakeOuts.set(docId, { out: [...(waiting?.out ?? []), ...pending.out], copy: false, versions: [...(waiting?.versions ?? []), ...versions.slice(i)] });
+      this.waitingTakeOuts.set(docId, {
+        out: [...(waiting?.out ?? []), ...pending.out],
+        copy: false,
+        versions: [...(waiting?.versions ?? []), ...versions.slice(i)],
+        winners: [...(waiting?.winners ?? []), ...pending.winners]
+      });
       return;
     }
     if (this.destroyed || !this.canWrite()) return;

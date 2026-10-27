@@ -298,6 +298,49 @@ describe("room replica", () => {
     expect(copies[0]).toBe(`${dues(a)[0] === "due: 2" ? "due: 3" : "due: 2"}\nbody\n`);
   });
 
+  it("leaves a waiting clash alone once the line it gave way to is gone", async () => {
+    const s = setup();
+    let keep = false;
+    const copies: string[] = [];
+    const clash = (_doc: string, version: string) => (keep ? copies.push(version) > 0 : false);
+    const a = s.member(s.ana, { clash });
+    const c = s.member(s.cy, { clash });
+    for (const device of [s.ana, s.cy]) s.wrapFor(device);
+    a.replica.refreshKeys();
+    let link = s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Task.md", "due: 1\nbody\n");
+    s.net.pump();
+    c.replica.noteText(fileId);
+    link.cut();
+    const save = (m: Member, line: string) =>
+      m.replica.edit(fileId, (doc) => {
+        const text = doc.getText("content");
+        text.insert(0, line);
+        text.delete(line.length, "due: 1\n".length);
+      }, true);
+    save(a, "due: 2\n");
+    save(c, "due: 3\n");
+    link = s.net.link(a.node, c.node);
+    s.net.pump();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Nobody can keep a copy, so the losing line waits. Meanwhile the winning line is deleted.
+    const [winner, loser] = a.replica.noteDoc(fileId).clientID < c.replica.noteDoc(fileId).clientID ? [a, c] : [c, a];
+    const kept = winner === a ? "due: 2\n" : "due: 3\n";
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.delete(text.toString().indexOf(kept), kept.length);
+    s.net.pump();
+    keep = true;
+    for (const m of [a, c]) m.replica.restoreSaves(JSON.parse(JSON.stringify(m.replica.recentSaves())));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    s.net.pump();
+    // The losing line stays: never to leave none.
+    expect(loser.replica.noteText(fileId)).toBe(`${winner === a ? "due: 3" : "due: 2"}\nbody\n`);
+    expect(winner.replica.noteText(fileId)).toBe(loser.replica.noteText(fileId));
+    expect(copies).toEqual([]);
+  });
+
   it("doesn't hold a save twice when the same saves are restored on a running replica", () => {
     const s = setup();
     const a = s.member(s.ana);
