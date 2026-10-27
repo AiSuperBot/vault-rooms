@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { nextVersion } from "@vault-rooms/secure";
+import { createJoinRecord, nextVersion, parseInviteLink } from "@vault-rooms/secure";
+import { newDevice } from "@vault-rooms/secure/testkit";
 import { MeshService, type MeshDeps, type MeshSettings } from "../../src/mesh/meshService.js";
 import type { SecretStore } from "../../src/mesh/secrets.js";
 import { MemoryFiles } from "./memoryFiles.js";
@@ -83,6 +84,40 @@ describe("mesh service", () => {
     expect(ben.node.offerVersions([sibling]).status).toBe("replaced");
     await until(() => ben.state.rooms[roomId] !== undefined && ben.state.name === "Ana's team");
     await until(() => ben.rooms().find((room) => room.id === roomId)?.name === "Design");
+  });
+
+  it("makes a removal that lost a race again, with a new room key in the same change", async () => {
+    const ana = await started(await MeshService.create(deps("Ana4"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const ben = await started(await MeshService.join(deps("Ben4"), { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ben.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    await ana.setAdmin(ben.me.userId, true);
+    await until(() => ben.isAdmin());
+    const roomId = await ben.createRoom("Design");
+    // Mal joins the workspace, and Ben adds him to his room.
+    const invite = parseInviteLink(await ana.createInvite({}));
+    const mal = newDevice(`u${"M".repeat(22)}`, "Mal PC");
+    ana.node.addJoin(createJoinRecord({ workspaceId: ana.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: mal.userId, name: "Mal" }, deviceName: mal.name, deviceKey: mal.sign, agreementPublicKey: mal.agree.publicKey, tlsFingerprint: mal.tls }));
+    await until(() => ben.node.chain.state.devices[mal.id] !== undefined);
+    await ben.setMember(roomId, mal.userId, "write");
+    // Ben takes Mal out (with a new key) while Ana, at the same moment, makes him an admin no more: hers wins.
+    const parent = ben.node.chain.head;
+    await ben.setMember(roomId, mal.userId, null);
+    const sibling = nextVersion(ben.settings.id, parent, ana.secrets.sign, (state) => (state.users[ben.me.userId]!.admin = false));
+    expect(ben.node.offerVersions([sibling]).status).toBe("replaced");
+    await until(() => ben.node.chain.since(sibling.body.v + 1).some((version) => version.body.by === ben.me.deviceId));
+    const redo = ben.node.chain.since(sibling.body.v + 1).find((version) => version.body.by === ben.me.deviceId)!;
+    expect(redo.body.state.rooms[roomId]!.members[mal.userId]).toBeUndefined();
+    expect(redo.body.state.rooms[roomId]!.epochs).toHaveLength(2);
+    await until(() => ben.replica(roomId)?.keyFor(2) !== undefined);
+  });
+
+  it("never goes online once stopped", async () => {
+    const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
+    service.settings.port = 0;
+    await service.stop();
+    await service.start();
+    expect(service.listeningPort).toBe(0);
   });
 
   it("refuses to open when this device's keys are missing (a copied vault), and can still be left", async () => {

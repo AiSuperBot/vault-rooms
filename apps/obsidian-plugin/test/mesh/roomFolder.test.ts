@@ -523,6 +523,95 @@ describe("room folder", () => {
     expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["New.md"]);
   });
 
+  it("deletes a file it never changed when someone else does, even while its own writes are slow", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await c.vault.writeText("Team/Cy.md", "from Cy\n");
+    await s.settle();
+    // Ana's disk is stuck while she adds a note; meanwhile Cy edits his note, then deletes it.
+    a.node.persist = () => new Promise<void>(() => {});
+    await a.vault.writeText("Team/New.md", "new\n");
+    await s.settle();
+    await c.vault.writeText("Team/Cy.md", "from Cy, edited\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Cy.md")).toBe("from Cy, edited\n");
+    await c.vault.trash("Team/Cy.md");
+    await s.settle();
+    expect(a.vault.files.has("Team/Cy.md")).toBe(false);
+    expect(a.notices.filter((message) => message.includes("deleted by someone else"))).toEqual([]);
+  });
+
+  it("deletes a file it never changed when someone else did while it was off, even if its own last writes failed", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await c.vault.writeText("Team/Cy.md", "from Cy\n");
+    await s.settle();
+    // Ana's disk fails while she adds a note and Cy's edit comes in; then Obsidian stops.
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    await a.vault.writeText("Team/New.md", "new\n");
+    await s.settle();
+    await c.vault.writeText("Team/Cy.md", "from Cy, edited\n");
+    await s.settle();
+    await a.folder.stop();
+    link.cut();
+    // While Ana is away, Cy deletes his note.
+    await c.vault.trash("Team/Cy.md");
+    await s.settle();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(again.vault.files.has("Team/Cy.md")).toBe(false);
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["New.md"]);
+  });
+
+  it("keeps a change another program made as a copy, rather than undo someone's edit not written here yet", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Cy's edit reaches Ana's computer; before it is written there, a script changes the file on Ana's.
+    await c.vault.writeText("Team/Plan.md", "base\nfrom Cy\n");
+    await c.folder.settled();
+    s.net.pump();
+    await a.vault.writeText("Team/Plan.md", "base\nfrom a script\n");
+    await s.settle();
+    expect(text(c.vault, "Team/Plan.md")).toBe("base\nfrom Cy\n");
+    expect(text(a.vault, "Team/Plan.md")).toBe("base\nfrom Cy\n");
+    const copy = [...a.vault.files.keys()].find((path) => path.includes("(conflict"));
+    expect(copy && text(a.vault, copy)).toBe("base\nfrom a script\n");
+  });
+
   it("doesn't sync a folder whose last synced state can't be read, and leaves that state alone", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

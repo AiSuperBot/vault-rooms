@@ -78,11 +78,14 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   private unloaded = false;
+  /** The last start of the service, done (or given up, once unloaded) when this resolves. */
+  private starting: Promise<void> = Promise.resolve();
 
   async onunload(): Promise<void> {
-    // Obsidian doesn't wait for this: the next instance waits for it instead (see onload).
+    // Obsidian doesn't wait for this: the next instance waits for it instead (see onload). A start under way gives up
+    // first, so nothing of this instance goes (or stays) online after it.
     this.unloaded = true;
-    const done = Promise.all([shared[STOPPING], this.stopService()]).then(
+    const done = Promise.all([shared[STOPPING], this.starting.then(() => this.stopService())]).then(
       () => {},
       (error: Error) => console.debug(`Vault Rooms: stopping: ${error.message}`)
     );
@@ -142,17 +145,26 @@ export default class VaultRoomsPlugin extends Plugin {
     for (const listener of this.changeListeners) listener();
   }
 
-  async startService(service?: MeshService): Promise<void> {
+  startService(service?: MeshService): Promise<void> {
+    const started = this.startNow(service);
+    this.starting = started.catch(() => {});
+    return started;
+  }
+
+  private async startNow(service?: MeshService): Promise<void> {
     this.serviceError = null;
+    let svc: MeshService | null;
     try {
-      this.service = service ?? (await MeshService.open(this.deps()));
+      svc = service ?? (await MeshService.open(this.deps()));
     } catch (error) {
       this.service = null;
       this.serviceError = error instanceof MeshServiceError ? error.message : `Couldn't open the workspace: ${(error as Error).message}`;
       this.changed();
       return;
     }
-    const svc = this.service;
+    // Unloaded meanwhile: this instance doesn't go online (the next one opens the workspace instead).
+    if (svc && this.unloaded) return svc.stop();
+    this.service = svc;
     if (!svc) return this.changed();
     this.unsubscribers.push(
       svc.onChange(() => {
@@ -171,6 +183,7 @@ export default class VaultRoomsPlugin extends Plugin {
     for (const room of svc.rooms()) {
       const replica = svc.replica(room.id);
       if (replica) await this.onReplica(room.id, replica);
+      if (this.unloaded) return;
     }
     try {
       await svc.start();
@@ -186,6 +199,8 @@ export default class VaultRoomsPlugin extends Plugin {
     this.editors.unbindAll();
     await Promise.all([...this.folders.values()].map((folder) => folder.stop()));
     this.folders.clear();
+    // Folders let go of earlier (a room re-made, a folder moved) finish too.
+    await Promise.all(this.stopping.values());
     for (const presence of this.presences.values()) presence.destroy();
     this.presences.clear();
   }
