@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { MeshNode, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
@@ -431,7 +432,7 @@ describe("room folder", () => {
     await s.settle();
     link.cut();
     // Ana edits, but her disk never manages to store the change before Obsidian stops.
-    a.node.persist = () => new Promise<void>(() => {});
+    a.node.persist = () => Promise.reject(new Error("disk full"));
     await a.vault.writeText("Team/Plan.md", "base\nAna's last words\n");
     await s.settle();
     await a.folder.stop();
@@ -446,6 +447,124 @@ describe("room folder", () => {
     const files = [...again.vault.files.keys()];
     const copy = files.find((path) => path.includes("(conflict"));
     expect(copy && text(again.vault, copy)).toBe("base\nAna's last words\n");
+  });
+
+  it("doesn't hold in doubt an edit stored just as Obsidian stopped", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    // A slow disk: Obsidian stops while the last edit is still being written.
+    a.node.persist = () => new Promise<void>((resolve) => setTimeout(resolve, 50));
+    await a.vault.writeText("Team/Plan.md", "base\nlast words\n");
+    await a.folder.stop();
+    expect(Object.values(a.saved.state!.known).filter((known) => known.unstored)).toEqual([]);
+  });
+
+  it("keeps an edit that may not have been stored when someone else deletes the file", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    link.cut();
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    await a.vault.writeText("Team/Plan.md", "base\nAna's last words\n");
+    await s.settle();
+    await a.folder.stop();
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(text(again.vault, "Team/Plan.md")).toBe("base\nAna's last words\n");
+    expect(text(c.vault, "Team/Plan.md")).toBe("base\nAna's last words\n");
+  });
+
+  it("shares again a new file whose entry wasn't stored before Obsidian stopped", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    link.cut();
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    await a.vault.writeText("Team/New.md", "");
+    await s.settle();
+    await a.folder.stop();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["New.md"]);
+  });
+
+  it("doesn't sync a folder whose last synced state can't be read, and leaves that state alone", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.vault.writeText("Team/Plan.md", "here\n");
+    let saves = 0;
+    const folder = new RoomFolder({
+      folder: "Team",
+      replica: a.replica,
+      vault: a.vault,
+      deviceName: "PC",
+      isBound: () => false,
+      loadState: () => Promise.reject(new Error("locked")),
+      saveState: async () => void saves++,
+      notify: (message) => a.notices.push(message),
+      log: () => {}
+    });
+    await folder.start();
+    await folder.onLocalWrite("Team/Plan.md");
+    await folder.stop();
+    expect(saves).toBe(0);
+    expect(a.replica.files().size).toBe(0);
+    expect(a.notices.join()).toMatch(/isn't syncing/);
+  });
+
+  it("does nothing more once the room's replica is let go", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    const [id] = [...a.replica.files().keys()];
+    // A change still queued when the room goes (access ended, or the room is being made again).
+    void a.folder.onLocalWrite("Team/Plan.md");
+    a.vault.files.set("Team/Plan.md", new TextEncoder().encode("changed\n"));
+    a.replica.destroy();
+    expect(() => a.replica.editIndex(() => {})).toThrow(/destroyed/);
+    await a.folder.stop();
+    expect(a.saved.state!.known[id!]!.hash).toBe(createHash("sha256").update("base\n").digest("base64url"));
   });
 
   it("doesn't call a newer version of someone else's attachment a clash", async () => {

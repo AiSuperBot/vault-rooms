@@ -126,7 +126,7 @@ export class MeshService {
       this.emit();
     };
     events.wraps = () => {
-      this.saveSoon("wraps", () => this.disk.saveWraps(this.node.allWraps()));
+      this.saveSoon("wraps", () => this.disk.saveWraps(this.node.savedWraps()));
       this.refreshKeys();
       this.automateSoon();
       this.emit();
@@ -286,7 +286,7 @@ export class MeshService {
     }
     await this.disk.saveChain(this.node.chain.all());
     await this.disk.saveJoins(this.node.joinEntries());
-    await this.disk.saveWraps(this.node.allWraps());
+    await this.disk.saveWraps(this.node.savedWraps());
     await this.disk.flush();
     for (const replica of this.replicas.values()) replica.destroy();
     this.replicas.clear();
@@ -487,7 +487,7 @@ export class MeshService {
   private async keepKey(roomId: string, n: number, key: Uint8Array): Promise<void> {
     this.replicas.get(roomId)?.addOwnKey(n, key);
     this.node.addWrap(wrapRoomKey(this.settings.id, roomId, n, key, { id: this.settings.deviceId, agree: this.secrets.agree.publicKey }, this.secrets.sign));
-    await this.disk.saveWraps(this.node.allWraps());
+    await this.disk.saveWraps(this.node.savedWraps());
   }
 
   async createRoom(name: string, members: Record<string, Role> = {}, roomId = randomId("r")): Promise<string> {

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { nextVersion } from "@vault-rooms/secure";
 import { MeshService, type MeshDeps, type MeshSettings } from "../../src/mesh/meshService.js";
 import type { SecretStore } from "../../src/mesh/secrets.js";
 import { MemoryFiles } from "./memoryFiles.js";
@@ -67,6 +68,21 @@ describe("mesh service", () => {
     expect(ana.replica(roomId)!.sealEpoch()!.n).toBe(2);
     // Ben's device never received a wrap of the new key.
     expect(ana.node.allWraps().some((w) => w.body.room === roomId && w.body.n === 2 && w.body.to === ben.me.deviceId)).toBe(false);
+  });
+
+  it("keeps the key of a room whose creation lost a race to someone ranking higher", async () => {
+    const ana = await started(await MeshService.create(deps("Ana3"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    await ana.setRoomCreation("members");
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const ben = await started(await MeshService.join(deps("Ben3"), { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ben.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    const parent = ben.node.chain.head;
+    const roomId = await ben.createRoom("Design");
+    // Ana changed something else at the same moment: her version wins, and Ben's device makes the room again.
+    const sibling = nextVersion(ben.settings.id, parent, ana.secrets.sign, (state) => (state.name = "Ana's team"));
+    expect(ben.node.offerVersions([sibling]).status).toBe("replaced");
+    await until(() => ben.state.rooms[roomId] !== undefined && ben.state.name === "Ana's team");
+    await until(() => ben.rooms().find((room) => room.id === roomId)?.name === "Design");
   });
 
   it("refuses to open when this device's keys are missing (a copied vault), and can still be left", async () => {

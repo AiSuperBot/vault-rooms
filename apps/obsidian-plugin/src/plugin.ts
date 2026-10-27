@@ -335,6 +335,8 @@ export default class VaultRoomsPlugin extends Plugin {
       this.changed();
       return;
     }
+    // The room's old folder, if it is still stopping, saves its state before the new one reads it.
+    await this.stopping.get(roomId);
     if (this.folders.has(roomId) || ws.rooms[roomId]?.hidden) return;
     if (!ws.rooms[roomId]) {
       // Name the folder after the room, which needs the room key: wait for it rather than invent a name.
@@ -360,6 +362,8 @@ export default class VaultRoomsPlugin extends Plugin {
       return;
     }
     if (!this.app.vault.getAbstractFileByPath(folderPath)) await this.app.vault.createFolder(folderPath).catch(() => {});
+    // Shown meanwhile (by another call), or this replica was let go meanwhile.
+    if (this.folders.has(roomId) || svc.replica(roomId) !== replica) return;
     const presence = new RoomPresence({
       workspaceId: ws.id,
       roomId,
@@ -382,6 +386,9 @@ export default class VaultRoomsPlugin extends Plugin {
       inOtherRoom: (path) => this.roomAt(path) !== roomId,
       folderGone: () => void this.folderGone(roomId),
       heldBackChanged: () => this.syncEditorsSoon(),
+      passed: () => {
+        if (this.editorsWaiting) this.syncEditorsSoon();
+      },
       loadState: () => svc.disk.loadRoomState<RoomFolderState>(roomId),
       saveState: (state) => svc.disk.saveRoomState(roomId, state),
       notify: (message) => new Notice(message, 8000),
@@ -393,14 +400,20 @@ export default class VaultRoomsPlugin extends Plugin {
     this.changed();
   }
 
+  /** Room folders still stopping: a room shown again waits for its old folder to finish (see onReplica). */
+  private stopping = new Map<string, Promise<void>>();
+
   private async unmount(roomId: string): Promise<void> {
     this.editors.unbindRoom(roomId);
-    // Forgotten before waiting for it to stop, so the room can be shown again meanwhile.
     const folder = this.folders.get(roomId);
     this.folders.delete(roomId);
     this.presences.get(roomId)?.destroy();
     this.presences.delete(roomId);
-    await folder?.stop();
+    if (!folder) return;
+    const stopped = folder.stop();
+    this.stopping.set(roomId, stopped);
+    await stopped;
+    if (this.stopping.get(roomId) === stopped) this.stopping.delete(roomId);
   }
 
   /** The room's folder was deleted on this computer: that hides the room here; nothing is deleted for anyone else. */
@@ -527,8 +540,16 @@ export default class VaultRoomsPlugin extends Plugin {
     const presence = hit ? this.presences.get(hit.roomId) : null;
     if (!hit || !replica || !presence) return null;
     const fileId = hit.folder.noteIdAt(path);
-    if (!fileId || !replica.isComplete(fileId)) return null;
-    return { roomId: hit.roomId, fileId, ytext: replica.noteDoc(fileId).getText("content"), presence, readOnly: !replica.canWrite(), syncedHash: hit.folder.syncedHash(fileId) };
+    if (!fileId) return null;
+    return {
+      roomId: hit.roomId,
+      fileId,
+      ytext: replica.noteDoc(fileId).getText("content"),
+      presence,
+      readOnly: !replica.canWrite(),
+      fromShared: (hash) => hit.folder.fromShared(fileId, hash),
+      complete: replica.isComplete(fileId)
+    };
   }
 
   private syncTimer: number | null = null;
@@ -543,34 +564,31 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   private syncing = false;
+  /** An editor showing a room's note isn't bound yet: try again after the room folder's next pass. */
+  private editorsWaiting = false;
 
   /** Bind every open editor of a room's note; an editor not bound yet is compared with its file's text first. */
   syncEditors(): void {
     if (this.syncing) return this.syncEditorsSoon();
     this.syncing = true;
     void this.collectEditors()
-      .then((open) => this.editors.sync(open))
+      .then((open) => {
+        this.editors.sync(open);
+        this.editorsWaiting = open.some(({ path, view }) => this.folderFor(path) !== null && this.editors.needsBinding(view));
+      })
       .finally(() => (this.syncing = false));
   }
 
-  private async collectEditors(): Promise<Array<{ path: string; view: EditorView; disk: string | null; synced: string | null }>> {
-    const open: Array<{ path: string; view: EditorView; disk: string | null; synced: string | null }> = [];
+  private async collectEditors(): Promise<Array<{ path: string; view: EditorView; disk: string | null }>> {
+    const open: Array<{ path: string; view: EditorView; disk: string | null }> = [];
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
       if (!(view instanceof MarkdownView) || !view.file) continue;
       const cm = (view.editor as unknown as { cm?: EditorView }).cm;
       if (!cm) continue;
-      let disk: string | null = null;
-      let synced: string | null = null;
-      const hit = this.folderFor(view.file.path);
-      if (this.editors.needsBinding(cm) && hit) {
-        // What was synced is taken before the file is read: if the room folder writes a newer version in between, the
-        // two disagree and nothing is folded back.
-        const fileId = hit.folder.noteIdAt(view.file.path);
-        synced = fileId ? hit.folder.syncedHash(fileId) : null;
-        disk = await this.app.vault.cachedRead(view.file).then(normalizeNote, () => null);
-      }
-      open.push({ path: view.file.path, view: cm, disk, synced });
+      const needsDisk = this.editors.needsBinding(cm) && this.folderFor(view.file.path) !== null;
+      const disk = needsDisk ? await this.app.vault.cachedRead(view.file).then(normalizeNote, () => null) : null;
+      open.push({ path: view.file.path, view: cm, disk });
     }
     return open;
   }

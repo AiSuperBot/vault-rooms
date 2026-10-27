@@ -1,7 +1,23 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { EditorState } from "@codemirror/state";
 import * as Y from "yjs";
-import { WHOLE_CHARACTERS } from "../../src/mesh/editorBinding.js";
+import { safeToBind, WHOLE_CHARACTERS } from "../../src/mesh/editorBinding.js";
+
+describe("binding an editor", () => {
+  it("replaces what the editor shows only when nothing in it can be lost", () => {
+    const synced = createHash("sha256").update("old\n").digest("base64url");
+    const fromShared = (hash: string) => hash === synced;
+    expect(safeToBind("same\n", "same\n", null, fromShared)).toBe(true);
+    // The editor shows its file, which holds a version that came from the shared note: just outdated.
+    expect(safeToBind("old\n", "new\n", "old\n", fromShared)).toBe(true);
+    // Still loading (empty for a moment), or typing not saved yet.
+    expect(safeToBind("", "new\n", "old\n", fromShared)).toBe(false);
+    expect(safeToBind("old\ntyped", "new\n", "old\n", fromShared)).toBe(false);
+    // Changed while not co-edited: the room folder shares it (or keeps it as a copy) first.
+    expect(safeToBind("mine\n", "new\n", "mine\n", fromShared)).toBe(false);
+  });
+});
 
 describe("editor changes", () => {
   it("are widened so they never cut an emoji in two, and the shared text stays intact", () => {

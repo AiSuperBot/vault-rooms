@@ -71,6 +71,8 @@ export interface RoomFolderOptions {
   folderGone?(): void;
   /** A note stopped (or started) being held back: editors may be bound to it again (or not). */
   heldBackChanged?(): void;
+  /** A pass over the shared state is done: notes may have become ready for an editor (keys arrived, doubts settled). */
+  passed?(): void;
   loadState(): Promise<RoomFolderState | null>;
   saveState(state: RoomFolderState): Promise<void>;
   notify(message: string): void;
@@ -134,10 +136,13 @@ export class RoomFolder {
   /** Copies this device made of a reader's own changes: local only, not to be reported again. */
   private localOnly = new Set<string>();
   private told = new Set<string>();
-  /** Files remembered in this session while something made here for them was still being stored. */
-  private unstoredNow = new Set<string>();
+  /** Files remembered in this session while something made here for them was still being stored: how to check. */
+  private unstoredNow = new Map<string, () => boolean>();
   private needsAdopt = false;
+  /** What was last synced is loaded: decisions can be made. */
   private started = false;
+  /** The first pass after starting is done: editors may be bound. */
+  private ready = false;
   private readOnlyNoticeAt = 0;
   private stopped = false;
 
@@ -172,10 +177,10 @@ export class RoomFolder {
     return undefined;
   }
 
-  /** The file id of a note at a vault path, for the editor binding (none while its local version is held back). */
+  /** The file id of a note at a vault path, for the editor binding (none before the first pass, or while its local version is held back or in doubt). */
   noteIdAt(vaultPath: string): string | null {
     const relative = this.relative(vaultPath);
-    if (relative === null) return null;
+    if (relative === null || !this.ready) return null;
     const id = this.idAt(relative) ?? [...this.o.replica.files()].find(([, entry]) => pathKey(entry.path) === pathKey(relative))?.[0];
     return id && this.o.replica.files().get(id)?.kind === "md" && !this.heldBack.has(id) && !this.doubtful(id) ? id : null;
   }
@@ -185,15 +190,18 @@ export class RoomFolder {
     return this.known.get(id)?.unstored === true && !this.unstoredNow.has(id);
   }
 
-  /** Hash of what was last synced for a file (for the editor binding), or null. */
-  syncedHash(fileId: string): string | null {
-    return this.known.get(fileId)?.hash ?? null;
+  /** Whether a file's content (by hash) came from the shared state: what was last synced, or what is being written now. */
+  fromShared(fileId: string, hash: string): boolean {
+    const known = this.known.get(fileId);
+    return known !== undefined && (known.hash === hash || this.expected.get(this.vaultPath(known.path)) === hash);
   }
 
   // ---- running ----
 
-  private run(task: () => Promise<void>): Promise<void> {
-    const next = this.queue.then(task, task).catch((error: Error) => this.o.log(`room folder: ${error.stack ?? error.message}`));
+  /** Tasks run one at a time. Once the room's replica is gone, nothing more is done here but the final save (`last`). */
+  private run(task: () => Promise<void>, last = false): Promise<void> {
+    const step = () => (this.o.replica.isDestroyed && !last ? Promise.resolve() : task());
+    const next = this.queue.then(step, step).catch((error: Error) => this.o.log(`room folder: ${error.stack ?? error.message}`));
     this.queue = next;
     return next;
   }
@@ -217,11 +225,20 @@ export class RoomFolder {
    */
   start(): Promise<void> {
     return this.run(async () => {
-      const saved = await this.o.loadState();
+      let saved: RoomFolderState | null;
+      try {
+        saved = await this.o.loadState();
+      } catch (error) {
+        // Without it every file would look new: better not to sync this folder at all than to guess.
+        this.o.notify(`"${this.o.folder}" isn't syncing: what was last synced there couldn't be read (${(error as Error).message}). Restart Obsidian to try again.`);
+        throw error;
+      }
       for (const [id, known] of Object.entries(saved?.known ?? {})) this.known.set(id, known);
       this.started = true;
       await this.adoptLocalFiles();
       await this.materializeNow();
+      this.ready = true;
+      this.o.passed?.();
     });
   }
 
@@ -230,10 +247,14 @@ export class RoomFolder {
     for (const timer of [this.materializeTimer, this.saveTimer, this.deleteTimer]) if (timer) clearTimeout(timer);
     this.materializeTimer = this.saveTimer = this.deleteTimer = null;
     return this.run(async () => {
-      // Deletions made just before stopping still count, unless the folder itself went (moved or deleted).
-      if (this.deletions.size > 0 && this.o.vault.folderExists(this.o.folder)) await this.flushDeletions();
+      // Never loaded: the saved state stays as it was.
+      if (!this.started) return;
+      // Deletions made just before stopping still count, unless the folder itself went (moved or deleted), or the room.
+      if (this.deletions.size > 0 && !this.o.replica.isDestroyed && this.o.vault.folderExists(this.o.folder)) await this.flushDeletions();
+      // What this computer made is stored before the state that counts on it is saved (a stuck disk isn't waited for long).
+      await Promise.race([this.o.replica.stored(), new Promise((resolve) => setTimeout(resolve, 2_000))]);
       await this.saveNow();
-    });
+    }, true);
   }
 
   /** Call when the room index or a note changed remotely, or a key arrived. */
@@ -279,21 +300,35 @@ export class RoomFolder {
   }
 
   private async saveNow(): Promise<void> {
+    // Stored meanwhile: no longer in doubt.
+    for (const [id, unstored] of this.unstoredNow) {
+      if (unstored()) continue;
+      this.unstoredNow.delete(id);
+      const known = this.known.get(id);
+      if (known) delete known.unstored;
+    }
     await this.o.saveState({ known: Object.fromEntries(this.known) });
   }
 
+  /**
+   * Remember a file as synced. What this computer made for it (index entries, the note's edits, its blob) counts only
+   * once stored: until then the file is marked (see Known.unstored), and the mark is checked again whenever state is saved.
+   */
   private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }): void {
+    const replica = this.o.replica;
     const stat = this.o.vault.stat(this.vaultPath(path));
-    const unstored = this.o.replica.hasUnstored(isMarkdownPath(path) ? id : undefined);
-    if (unstored) this.unstoredNow.add(id);
+    const ownBlob = blob && blob.by === replica.deviceId ? blob.id : undefined;
+    const docs = isMarkdownPath(path) ? [INDEX_DOC, id] : [INDEX_DOC];
+    const unstored = () => replica.hasUnstored(docs, ownBlob);
+    if (unstored()) this.unstoredNow.set(id, unstored);
     else this.unstoredNow.delete(id);
     this.known.set(id, {
       path,
       hash,
       size: stat?.size ?? -1,
       mtime: stat?.mtime ?? -1,
-      ...(blob ? { blob: blob.id, ...(blob.by === this.o.replica.deviceId ? { mine: true as const } : {}) } : {}),
-      ...(unstored ? { unstored: true as const } : {})
+      ...(blob ? { blob: blob.id, ...(ownBlob ? { mine: true as const } : {}) } : {}),
+      ...(this.unstoredNow.has(id) ? { unstored: true as const } : {})
     });
     if (this.heldBack.delete(id)) this.o.heldBackChanged?.();
     this.saveSoon();
@@ -410,7 +445,14 @@ export class RoomFolder {
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
     if (replica.isComplete(INDEX_DOC)) {
       const entries = replica.entries();
-      for (const [id, known] of [...this.known]) if (entries.get(id)?.deleted) await this.safely(known.path, () => this.applyRemoval(id, known));
+      for (const [id, known] of [...this.known]) {
+        if (entries.get(id)?.deleted) await this.safely(known.path, () => this.applyRemoval(id, known));
+        else if (!entries.has(id) && this.doubtful(id)) {
+          // Shared in a session that ended before its new entry was stored, so no one has it: shared again.
+          this.known.delete(id);
+          this.needsAdopt = true;
+        }
+      }
       await this.safely("renames", () => this.applyRenames(desired));
     }
     for (const [id, entry] of desired) await this.safely(entry.path, () => this.applyContent(id, entry));
@@ -419,6 +461,7 @@ export class RoomFolder {
       await this.adoptLocalFiles();
     }
     this.saveSoon();
+    if (this.ready) this.o.passed?.();
   }
 
   private async applyRenames(desired: Map<string, FileEntry>): Promise<void> {
@@ -479,15 +522,8 @@ export class RoomFolder {
     }
     if (remote === null) return; // the attachment hasn't arrived yet
     const remoteHash = sha(remote);
-    if (known?.unstored && this.unstoredNow.has(id)) {
-      // Made here in this session: wait until it is stored, then it is a plain synced file.
-      if (replica.hasUnstored(entry.kind === "md" ? id : undefined)) return;
-      delete known.unstored;
-      this.unstoredNow.delete(id);
-      this.saveSoon();
-    }
     // Left from a session that may have ended before what it made was stored: proven only by a matching shared copy.
-    const doubtful = known?.unstored === true;
+    const doubtful = this.doubtful(id);
     const stat = this.o.vault.stat(path);
     if (!stat) {
       const variant = this.untrackedCaseVariant(entry.path);
@@ -545,7 +581,8 @@ export class RoomFolder {
     const entry = this.o.replica.entries().get(id);
     this.known.delete(id);
     if (!stat) return;
-    const busy = entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS;
+    // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here.
+    const busy = known.unstored === true || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     const current = isMarkdownPath(known.path) ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(current) === known.hash);
     if (unchanged) return this.trash(known.path);
@@ -682,6 +719,8 @@ export class RoomFolder {
         if (this.o.replica.canWrite()) return this.createEntry(relative);
         return this.readOnlyNotice(`You can only read this room: "${relative}" stays on this computer and isn't shared.`);
       }
+      // In doubt whether the others ever had what was made here last time: a pass settles it with the shared copy.
+      if (this.doubtful(id)) return;
       const known = this.known.get(id)!;
       if (hash === known.hash) return this.remember(id, relative, hash, known.blob ? { id: known.blob, by: known.mine ? this.o.replica.deviceId : "" } : undefined);
       // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk.
