@@ -228,25 +228,30 @@ export function applyJoins(
  */
 /**
  * Whether the person a recorded join let in was taken back out later in the same branch: their device revoked or their
- * user removed, or a room they had when the join was recorded taken away or lowered by someone else, and still so when
- * the branch ends (a room deleted meanwhile aside). `recorded` is the state the recording version left, `after` the
- * versions that follow it. A join recorded in a branch that lost a race is waited on again unless it was taken back out.
+ * user removed, or (for a new user) a room they had when the join was recorded taken away or lowered by someone else,
+ * and still so in the room's last state before any deletion (deleting a room takes nothing from anyone). `recorded` is
+ * the state the recording version left, `after` the versions that follow it. A join recorded in a branch that lost a race
+ * is waited on again unless it was taken back out. For another device of an existing user, only the device counts: that
+ * user's room changes are made again on the winning branch like any other.
  */
 export function takenBackOut(recorded: WorkspaceState, after: SignedVersion[], join: JoinRecord): boolean {
   const deviceId = join.body.device.id;
   const user = recorded.devices[deviceId]?.user;
   const end = after.length > 0 ? after[after.length - 1]!.body.state : recorded;
   if (!user || !activeDevice(end, deviceId)) return true;
+  if (recorded.invites[join.body.invite]?.forUser !== undefined) return false;
+  const states = [recorded, ...after.map((version) => version.body.state)];
+  const lastLive = (roomId: string) => states.filter((state) => !state.rooms[roomId]?.deleted).pop() ?? recorded;
   let prev = recorded;
   for (const version of after) {
     const next = version.body.state;
     if (activeDevice(prev, version.body.by)?.user !== user) {
       for (const roomId of Object.keys(recorded.rooms)) {
         const given = roleIn(recorded, roomId, user);
-        if (given === undefined || end.rooms[roomId]?.deleted) continue;
+        if (given === undefined || next.rooms[roomId]?.deleted) continue;
         const was = roleIn(prev, roomId, user);
         const now = roleIn(next, roomId, user);
-        if (was !== undefined && !roleAtLeast(now, was) && !roleAtLeast(roleIn(end, roomId, user), given)) return true;
+        if (was !== undefined && !roleAtLeast(now, was) && !roleAtLeast(roleIn(lastLive(roomId), roomId, user), given)) return true;
       }
     }
     prev = next;
