@@ -293,6 +293,60 @@ describe("mesh", () => {
     expect(a.effective().devices[mal.id]).toBeUndefined();
   });
 
+  it("someone the losing branch took out of a room stays out, even if the room was deleted after", () => {
+    const { chain, ws, ana, ben, cy, roomId } = setup();
+    const { roomId: other } = createRoom(chain, ana, "Other", { [ben.userId]: "write" });
+    step(chain, ana, (state) => {
+      state.users[ben.userId]!.admin = true;
+      state.rooms[roomId]!.members[ben.userId] = "manage";
+      state.rooms[roomId]!.members[cy.userId] = "manage";
+    });
+    const { joiner: mal, join } = invite(chain, ben, { userName: "Mal", rooms: { [roomId]: "write" }, fold: false });
+    const c = nodeFor(chain, cy);
+    const parent = c.chain.head;
+    // Ben records Mal's join and takes him out of the room, then Cy deletes the room; Ana's change at the same moment wins.
+    c.offerVersions([nextVersion(ws, parent, ben.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    c.offerVersions([nextVersion(ws, c.chain.head, ben.sign, (state) => void delete state.rooms[roomId]!.members[mal.userId])]);
+    c.offerVersions([nextVersion(ws, c.chain.head, cy.sign, (state) => void (state.rooms[roomId]!.deleted = true))]);
+    expect(c.offerVersions([nextVersion(ws, parent, ana.sign, (state) => void delete state.rooms[other]!.members[ben.userId])]).status).toBe("replaced");
+    expect(c.pendingJoinRecords()).toEqual([]);
+    expect(c.effective().devices[mal.id]).toBeUndefined();
+  });
+
+  it("a join comes back when the losing branch only deleted a room it gave", () => {
+    const { chain, ws, ana, ben, cy, roomId } = setup();
+    const { roomId: other } = createRoom(chain, ana, "Other", { [ben.userId]: "write" });
+    step(chain, ana, (state) => {
+      state.users[ben.userId]!.admin = true;
+      state.rooms[roomId]!.members[ben.userId] = "manage";
+      state.rooms[roomId]!.members[cy.userId] = "manage";
+    });
+    const { join } = invite(chain, ben, { userName: "Mal", rooms: { [roomId]: "write" }, fold: false });
+    const c = nodeFor(chain, cy);
+    const parent = c.chain.head;
+    c.offerVersions([nextVersion(ws, parent, ben.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    c.offerVersions([nextVersion(ws, c.chain.head, cy.sign, (state) => void (state.rooms[roomId]!.deleted = true))]);
+    expect(c.offerVersions([nextVersion(ws, parent, ana.sign, (state) => void delete state.rooms[other]!.members[ben.userId])]).status).toBe("replaced");
+    expect(c.pendingJoinRecords()).toEqual([join]);
+  });
+
+  it("another computer of an existing user comes back when the losing branch only changed that user's rooms", () => {
+    const { chain, ws, ana, ben, cy, roomId } = setup();
+    const { roomId: other } = createRoom(chain, ana, "Other", { [ben.userId]: "write" });
+    step(chain, ana, (state) => {
+      state.users[ben.userId]!.admin = true;
+      state.rooms[roomId]!.members[ben.userId] = "manage";
+    });
+    const { join } = invite(chain, cy, { forUser: cy, fold: false });
+    const a = nodeFor(chain, ana);
+    const parent = a.chain.head;
+    // Cy records her new computer, and Ben lowers Cy in the room he manages; Ana's change at the same moment wins.
+    a.offerVersions([nextVersion(ws, parent, cy.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    a.offerVersions([nextVersion(ws, a.chain.head, ben.sign, (state) => void (state.rooms[roomId]!.members[cy.userId] = "read"))]);
+    expect(a.offerVersions([nextVersion(ws, parent, ana.sign, (state) => void delete state.rooms[other]!.members[ben.userId])]).status).toBe("replaced");
+    expect(a.pendingJoinRecords()).toEqual([join]);
+  });
+
   it("a join comes back when its person only left a room themselves in the losing branch", () => {
     const { chain, ws, ana, ben, roomId } = setup();
     const { roomId: other } = createRoom(chain, ana, "Other", { [ben.userId]: "write" });
