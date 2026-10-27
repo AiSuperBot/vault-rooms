@@ -18,9 +18,9 @@ interface DocEntry {
   /** The same on a snapshot's word alone, in rooms this device only relays; dropped if it joins the room. */
   claimed: VersionVector;
   /**
-   * Per author: the newest of their snapshots dropped here as contained in another kept one. An author's snapshot holds
-   * all its earlier ones did, so one up to here is never wanted again: remembering this keeps a dropped snapshot that is
-   * still going around the mesh from being taken in and passed on again, forever.
+   * Per author: the newest of their snapshots dropped here as checked to be contained in another kept one (see compact).
+   * An author's snapshot holds all its earlier ones did, so one up to here is never wanted again: remembering this keeps
+   * a dropped snapshot that is still going around the mesh from being taken in and passed on again, forever.
    */
   dropped: VersionVector;
 }
@@ -182,6 +182,9 @@ export class EnvelopeStore {
     const entry = this.docsByRoom.get(room)?.get(doc);
     if (!entry) return;
     for (const [author, clock] of Object.entries(marks)) entry.marks[author] = Math.max(entry.marks[author] ?? 0, clock);
+    // Each snapshot dropped was checked to be in a kept one: never wanted again (a drop on a mere claim, in a room this
+    // device only relays, is forgotten when it joins, like the claim).
+    for (const env of remove) if (env.k === "s") entry.dropped[env.author] = Math.max(entry.dropped[env.author] ?? 0, env.seq);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
   }
@@ -196,7 +199,6 @@ export class EnvelopeStore {
         if (byClock?.size === 0) entry.updates.delete(env.author);
       } else {
         entry.snapshots.delete(key);
-        entry.dropped[env.author] = Math.max(entry.dropped[env.author] ?? 0, env.seq);
       }
       this.signatures.delete(key);
       this.docBytes.set(room, (this.docBytes.get(room) ?? 0) - env.ct.length);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import * as Y from "yjs";
 import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
 import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
@@ -17,11 +18,11 @@ interface Pc {
   gone: string[];
 }
 
-function setup() {
+function setup(raeRole: "read" | "write" = "read") {
   const { chain, ws, admin: ana } = founder();
   const { joiner: cy } = invite(chain, ana, { userName: "Cy" });
   const { joiner: rae } = invite(chain, ana, { userName: "Rae" });
-  const { roomId, key } = createRoom(chain, ana, "Team", { [cy.userId]: "write", [rae.userId]: "read" });
+  const { roomId, key } = createRoom(chain, ana, "Team", { [cy.userId]: "write", [rae.userId]: raeRole });
   const net = new Network();
   const pcs = new Map<string, Pc>();
   /** A computer with this room's folder. `restart`: the same computer starting again (its stored envelopes kept). */
@@ -955,6 +956,111 @@ describe("room folder", () => {
     for (const line of dates) expect(line).toMatch(/^due: 2030-\d\d-\d\d$/);
     const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
     for (const date of ["2030-01-12", "2030-02-03"]) expect([note, ...copies].join()).toContain(date);
+    // The line it brings that wasn't there before counts like one in an update: one line stays, the other is a copy.
+    expect(dates).toHaveLength(1);
+    expect(new Set(copies)).toEqual(new Set([`---\ndue: ${dates[0] === "due: 2030-01-12" ? "2030-02-03" : "2030-01-12"}\n---\n`]));
+  });
+
+  it("doesn't take a line typed in front of a saved one long ago for a rival when a snapshot brings it", async () => {
+    // Ids are random, and what decides depends on them: tried many times.
+    for (let round = 0; round < 16; round++) {
+      const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-09\n---\n" });
+      const id = [...a.replica.files().keys()][0]!;
+      // A line added above "due" earlier, then Ana's computer starts the note afresh (another Yjs client from then on).
+      const text = a.replica.noteDoc(id).getText("content");
+      text.insert(text.toString().indexOf("due"), "x: 1\n");
+      await s.settle();
+      a.replica.reload(id);
+      link.cut();
+      await a.vault.writeText("Team/Task.md", "---\nx: 1\ndue: 2030-01-12\n---\n");
+      await a.folder.settled();
+      await c.vault.writeText("Team/Task.md", "---\nx: 1\ndue: 2030-02-03\n---\n");
+      await c.folder.settled();
+      expect(c.replica.snapshot(id, true)).not.toBeNull();
+      s.net.link(a.node, c.node);
+      await s.settle();
+      await s.settle();
+      const note = a.replica.noteText(id);
+      expect(c.replica.noteText(id)).toBe(note);
+      expect(note.split("\n").filter((line) => line.startsWith("due"))).toHaveLength(1);
+      expect(note).toContain("x: 1\n");
+    }
+  });
+
+  it("keeps one line of three computers that changed it at once, and nothing else is taken out", async () => {
+    const s = setup("write");
+    const pcs = [s.make(s.ana, "Team"), s.make(s.cy, "Team"), s.make(s.rae, "Team")];
+    await pcs[0]!.vault.writeText("Team/Task.md", "---\ndue: 2030-01-09\n---\nPlan\nNext line stays\n");
+    for (const pc of pcs) s.giveKey(pcs[0]!, pc.device);
+    const links = [s.net.link(pcs[0]!.node, pcs[1]!.node), s.net.link(pcs[1]!.node, pcs[2]!.node), s.net.link(pcs[0]!.node, pcs[2]!.node)];
+    for (const pc of pcs) {
+      pc.replica.refreshKeys();
+      await pc.folder.start();
+    }
+    await s.settle();
+    for (const link of links) link.cut();
+    const dates = ["2030-01-03", "2030-01-04", "2030-01-05"];
+    for (const [i, pc] of pcs.entries()) {
+      await pc.vault.writeText("Team/Task.md", `---\ndue: ${dates[i]}\n---\nPlan\nNext line stays\n`);
+      await pc.folder.settled();
+    }
+    s.net.link(pcs[0]!.node, pcs[1]!.node);
+    s.net.link(pcs[1]!.node, pcs[2]!.node);
+    s.net.link(pcs[0]!.node, pcs[2]!.node);
+    await s.settle();
+    await s.settle();
+    const id = [...pcs[0]!.replica.files().keys()][0]!;
+    const note = pcs[0]!.replica.noteText(id);
+    for (const pc of pcs) expect(pc.replica.noteText(id)).toBe(note);
+    const kept = /due: (.*)/.exec(note)?.[1];
+    expect(note).toBe(`---\ndue: ${kept}\n---\nPlan\nNext line stays\n`);
+    const copies = new Set(pcs.flatMap((pc) => [...pc.vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(pc.vault, path))));
+    expect(copies).toEqual(new Set(dates.filter((date) => date !== kept).map((date) => `---\ndue: ${date}\n---\nPlan\nNext line stays\n`)));
+  });
+
+  /** Ana's plugin writes `saved` while Cy types into the note (`typing`, on Cy's computer); then they meet. */
+  async function typedApart(base: string, saved: string, typing: (text: Y.Text) => void) {
+    const { s, a, c, link } = await pair({ "Team/Task.md": base });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    await a.vault.writeText("Team/Task.md", saved);
+    await a.folder.settled();
+    c.bound.add(id);
+    const doc = c.replica.noteDoc(id);
+    typing(doc.getText("content"));
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
+    return { notes: [a, c].map((pc) => pc.replica.noteText(id)), copies };
+  }
+
+  it("keeps a line added above a line a plugin rewrote at the same moment", async () => {
+    // Enter at the start of the "due" line, up, and type: a line of its own, not a change inside "due".
+    const { notes, copies } = await typedApart("---\ndue: 2030-01-01\n---\n", "---\ndue: 2030-02-02\n---\n", (text) => {
+      const at = text.toString().indexOf("due");
+      text.insert(at, "\n");
+      text.insert(at, "tags: x");
+    });
+    expect(notes[1]).toBe(notes[0]);
+    expect(["---\ntags: x\ndue: 2030-02-02\n---\n", "---\ndue: 2030-02-02\ntags: x\n---\n"]).toContain(notes[0]);
+    expect(copies.size).toBe(0);
+  });
+
+  it("takes a line split in two inside a line a plugin rewrote at the same moment out whole, and keeps it as a copy", async () => {
+    const { notes, copies } = await typedApart("---\ndue: 2030-01-01 note\n---\n", "---\ndue: 2030-02-02 note\n---\n", (text) => {
+      text.insert(text.toString().indexOf(" note"), "\n");
+    });
+    expect(notes).toEqual(["---\ndue: 2030-02-02 note\n---\n", "---\ndue: 2030-02-02 note\n---\n"]);
+    expect(copies).toEqual(new Set(["---\ndue: 2030-01-01\n note\n---\n"]));
+  });
+
+  it("leaves text typed at the end of a line alone when a save removes the last line after it", async () => {
+    const { notes, copies } = await typedApart("first\nsecond\nlast", "FIRST\nsecond", (text) => {
+      text.insert(text.toString().indexOf("\nlast"), " more");
+    });
+    expect(notes).toEqual(["FIRST\nsecond more", "FIRST\nsecond more"]);
+    expect(copies.size).toBe(0);
   });
 
   it("keeps both of two lines added at the same moment to a note without a final line break", async () => {

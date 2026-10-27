@@ -571,6 +571,61 @@ describe("devices and users", () => {
     expect(after.devices[e.id]!.revoked).toBeUndefined();
   });
 
+  /** B's laptop is stolen; A, an admin who manages room R with B, revokes it while the thief changes things on it. */
+  function stolen() {
+    const { chain, admin: b } = founder("Team", "B");
+    const { joiner: a } = invite(chain, b, { userName: "A" });
+    const { joiner: m } = invite(chain, b, { userName: "M" });
+    const { joiner: v } = invite(chain, b, { userName: "V" });
+    const { joiner: w } = invite(chain, b, { userName: "W" });
+    step(chain, b, (state) => (state.users[a.userId]!.admin = true));
+    const { roomId } = createRoom(chain, b, "R", { [a.userId]: "manage", [m.userId]: "read", [v.userId]: "read", [w.userId]: "read" });
+    return { chain, a, b, m, v, w, roomId };
+  }
+
+  /**
+   * The thief's branch (B's laptop removes V first, so that it wins; then `steps`, each by `by` or the laptop, with any
+   * join) against A's revocation of the laptop, as A's computer settles it.
+   */
+  function settleTheft(chain: WorkspaceChain, a: TestDevice, b: TestDevice, v: TestDevice, steps: Array<{ by?: TestDevice; join?: JoinRecord; change: (state: WorkspaceState) => void }>) {
+    const fork = chain.state;
+    const lost = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true));
+    const won = [nextVersion(chain.workspaceId, chain.head, b.sign, (state) => (state.users[v.userId]!.removed = true))];
+    for (const { by = b, join, change } of steps) won.push(nextVersion(chain.workspaceId, won[won.length - 1]!, by.sign, change, Date.now(), join ? [join] : []));
+    expect(chain.offer(won).status).toBe("appended");
+    chain.offer([nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true))]);
+    reduce(chain, a, fork, [lost], won);
+  }
+
+  it("takes back a role raised and then lowered again at the same moment", () => {
+    const { chain, a, b, m, v, roomId } = stolen();
+    settleTheft(chain, a, b, v, [{ change: (state) => void (state.rooms[roomId]!.members[m.userId] = "manage") }, { change: (state) => void (state.rooms[roomId]!.members[m.userId] = "write") }]);
+    expect(chain.state.rooms[roomId]!.members[m.userId]).toBe("read");
+  });
+
+  it("takes back a role raised in the same change that let someone in, but not the device or what their invite gave", () => {
+    const { chain, a, b, m, v, roomId } = stolen();
+    // M's own new device (M's invite) joins, recorded by the thief, who raises M; E joins through A's invite, and the
+    // thief adds E to the room.
+    const { joiner: m2, join: mJoin } = invite(chain, m, { forUser: m, fold: false });
+    const { joiner: e, join: eJoin } = invite(chain, a, { userName: "E", fold: false });
+    settleTheft(chain, a, b, v, [
+      { join: mJoin, change: (state) => (foldJoinInto(state, mJoin), void (state.rooms[roomId]!.members[m.userId] = "write")) },
+      { join: eJoin, change: (state) => (foldJoinInto(state, eJoin), void (state.rooms[roomId]!.members[e.userId] = "read")) }
+    ]);
+    expect(chain.state.rooms[roomId]!.members[m.userId]).toBe("read");
+    expect(chain.state.rooms[roomId]!.members[e.userId]).toBeUndefined();
+    expect(chain.state.devices[m2.id]!.revoked).toBeUndefined();
+    expect(chain.state.devices[e.id]!.revoked).toBeUndefined();
+  });
+
+  it("takes back what someone granted with a role the thief gave them", () => {
+    const { chain, a, b, m, v, w, roomId } = stolen();
+    settleTheft(chain, a, b, v, [{ change: (state) => void (state.rooms[roomId]!.members[m.userId] = "manage") }, { by: m, change: (state) => void (state.rooms[roomId]!.members[w.userId] = "write") }]);
+    expect(chain.state.rooms[roomId]!.members[m.userId]).toBe("read");
+    expect(chain.state.rooms[roomId]!.members[w.userId]).toBe("read");
+  });
+
   it("rejects a version whose signature doesn't match its signer", () => {
     const { chain, admin } = founder();
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
