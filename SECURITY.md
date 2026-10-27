@@ -15,7 +15,7 @@ Out of scope: someone controlling a member's computer while it is unlocked (they
 
 **Plugins that run code from notes.** If you use plugins that execute code written in notes (Dataview JavaScript queries, Templater user scripts and the like), anyone who can edit a room can run code on your computer through a note. Turn those features off for room folders, or don't use such plugins in a vault that shares rooms.
 
-**Revocations add up.** When admins change things at the same moment (computers cut off from each other, say), every revocation and removal among them still takes effect whichever change wins, unless it came from someone the winning change itself revoked, and what someone revoked at that moment granted then is taken back.
+**Revocations add up.** When admins change things at the same moment (computers cut off from each other, say), every revocation and removal among them still takes effect whichever change wins, unless it came from someone the winning change itself revoked, removed or demoted, and what someone revoked at that moment granted then (including people let in through their invites) is taken back.
 
 **Invite links are secrets.** Anyone holding a link can join until it is used, withdrawn or expired: if a link leaks, withdraw it in the panel. One case needs a look: if someone who got in with a leaked link is taken out again at the same moment as another admin's change (computers cut off from each other, say) and that change wins, the record keeps neither their joining nor their removal. The invite is then open again until a computer of an admin or of the invite's creator withdraws it, which happens on its own once one is online, and the link works meanwhile. After computers that were cut off reconnect, check the people list.
 
