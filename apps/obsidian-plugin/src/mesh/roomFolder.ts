@@ -48,10 +48,11 @@ interface Known extends FileStat {
   /** That blob was made on this computer (so another version made from an older one means a real clash). */
   mine?: true;
   /**
-   * Remembered while what this computer made for it wasn't safely stored yet. If Obsidian stopped before it was, the
-   * shared state may lack it: such a file isn't taken as "unchanged here" until the shared version matches it.
+   * Remembered while what this computer made for it wasn't safely stored yet ("entry": its new index entry, which no one
+   * else has then). If Obsidian stopped before it was, the shared state may lack it: such a file isn't taken as
+   * "unchanged here" until the shared version matches it, and a new entry that never got stored is made again.
    */
-  unstored?: true;
+  unstored?: true | "entry";
 }
 
 export interface RoomFolderState {
@@ -136,8 +137,8 @@ export class RoomFolder {
   /** Copies this device made of a reader's own changes: local only, not to be reported again. */
   private localOnly = new Set<string>();
   private told = new Set<string>();
-  /** Files remembered in this session while something made here for them was still being stored: how to check. */
-  private unstoredNow = new Map<string, () => boolean>();
+  /** Files remembered in this session while something made here for them was still being stored: what to check. */
+  private unstoredNow = new Map<string, { docs: Set<string>; keys: Set<string>; created: boolean }>();
   private needsAdopt = false;
   /** What was last synced is loaded: decisions can be made. */
   private started = false;
@@ -187,7 +188,7 @@ export class RoomFolder {
 
   /** Remembered in an earlier session before what was made here got stored: settled by the next pass, not by an editor. */
   private doubtful(id: string): boolean {
-    return this.known.get(id)?.unstored === true && !this.unstoredNow.has(id);
+    return this.known.get(id)?.unstored !== undefined && !this.unstoredNow.has(id);
   }
 
   /** Whether a file's content (by hash) came from the shared state: what was last synced, or what is being written now. */
@@ -301,8 +302,8 @@ export class RoomFolder {
 
   private async saveNow(): Promise<void> {
     // Stored meanwhile: no longer in doubt.
-    for (const [id, unstored] of this.unstoredNow) {
-      if (unstored()) continue;
+    for (const [id, made] of this.unstoredNow) {
+      if (this.o.replica.hasUnstored([...made.docs], [...made.keys])) continue;
       this.unstoredNow.delete(id);
       const known = this.known.get(id);
       if (known) delete known.unstored;
@@ -311,24 +312,27 @@ export class RoomFolder {
   }
 
   /**
-   * Remember a file as synced. What this computer made for it (index entries, the note's edits, its blob) counts only
-   * once stored: until then the file is marked (see Known.unstored), and the mark is checked again whenever state is saved.
+   * Remember a file as synced. What this computer made for it counts only once stored: edits of its note, and `made`,
+   * the envelopes (by key) it just made for the file's entry (`created`: a new entry). Until then the file is marked
+   * (see Known.unstored), and the mark is checked again whenever state is saved.
    */
-  private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }): void {
+  private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false): void {
     const replica = this.o.replica;
     const stat = this.o.vault.stat(this.vaultPath(path));
-    const ownBlob = blob && blob.by === replica.deviceId ? blob.id : undefined;
-    const docs = isMarkdownPath(path) ? [INDEX_DOC, id] : [INDEX_DOC];
-    const unstored = () => replica.hasUnstored(docs, ownBlob);
-    if (unstored()) this.unstoredNow.set(id, unstored);
+    const pending = this.unstoredNow.get(id) ?? { docs: new Set<string>(), keys: new Set<string>(), created: false };
+    if (isMarkdownPath(path)) pending.docs.add(id);
+    for (const key of made) if (key) pending.keys.add(key);
+    pending.created ||= created;
+    const unstored = replica.hasUnstored([...pending.docs], [...pending.keys]);
+    if (unstored) this.unstoredNow.set(id, pending);
     else this.unstoredNow.delete(id);
     this.known.set(id, {
       path,
       hash,
       size: stat?.size ?? -1,
       mtime: stat?.mtime ?? -1,
-      ...(blob ? { blob: blob.id, ...(ownBlob ? { mine: true as const } : {}) } : {}),
-      ...(this.unstoredNow.has(id) ? { unstored: true as const } : {})
+      ...(blob ? { blob: blob.id, ...(blob.by === replica.deviceId ? { mine: true as const } : {}) } : {}),
+      ...(unstored ? { unstored: pending.created ? ("entry" as const) : (true as const) } : {})
     });
     if (this.heldBack.delete(id)) this.o.heldBackChanged?.();
     this.saveSoon();
@@ -447,7 +451,7 @@ export class RoomFolder {
       const entries = replica.entries();
       for (const [id, known] of [...this.known]) {
         if (entries.get(id)?.deleted) await this.safely(known.path, () => this.applyRemoval(id, known));
-        else if (!entries.has(id) && this.doubtful(id)) {
+        else if (!entries.has(id) && this.doubtful(id) && known.unstored === "entry") {
           // Shared in a session that ended before its new entry was stored, so no one has it: shared again.
           this.known.delete(id);
           this.needsAdopt = true;
@@ -563,8 +567,9 @@ export class RoomFolder {
   /** Write the shared version; a text file is written only if it is still what the decision was based on. */
   private async write(id: string, entry: FileEntry, remote: string | Uint8Array, remoteHash: string, basedOn?: string): Promise<void> {
     if (typeof remote === "string") {
-      const wrote = await this.writeText(entry.path, remote, basedOn === undefined ? undefined : (current) => sha(normalizeNote(current)) === basedOn);
-      if (!wrote) return; // changed meanwhile: looked at again next time
+      // Checked as it is written: changed meanwhile, or an editor bound meanwhile (which owns the note now), it waits.
+      const wrote = await this.writeText(entry.path, remote, (current) => !this.o.isBound(id) && (basedOn === undefined || sha(normalizeNote(current)) === basedOn));
+      if (!wrote) return; // looked at again next time
     } else {
       await this.writeBytes(entry.path, remote);
     }
@@ -579,10 +584,10 @@ export class RoomFolder {
     const path = this.vaultPath(known.path);
     const stat = this.o.vault.stat(path);
     const entry = this.o.replica.entries().get(id);
+    // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here.
+    const busy = this.doubtful(id) || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     this.known.delete(id);
     if (!stat) return;
-    // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here.
-    const busy = known.unstored === true || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     const current = isMarkdownPath(known.path) ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(current) === known.hash);
     if (unchanged) return this.trash(known.path);
@@ -620,13 +625,14 @@ export class RoomFolder {
       if (Buffer.byteLength(text, "utf8") > MAX_NOTE_BYTES) return this.notShared(relative, "size");
       const added = replica.editIndex((files) => files.set(id, { path: relative, kind: "md" }));
       if (added === "refused") return;
+      const entryKey = replica.ownUpdateKey(INDEX_DOC);
       const filled = text ? replica.edit(id, (doc) => doc.getText("content").insert(0, text)) : "published";
       if (filled === "refused") {
         replica.editIndex((files) => files.set(id, { path: relative, kind: "md", deleted: true }));
         return this.notShared(relative, "size");
       }
       // Remembered only once actually shared (a missing key leaves it to the next pass).
-      if (added === "published" && filled === "published") this.remember(id, relative, sha(text));
+      if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true);
       return;
     }
     const bytes = await this.o.vault.readBytes(path);
@@ -640,7 +646,9 @@ export class RoomFolder {
       else this.o.log(`share ${relative}: ${code(error)}`);
       return;
     }
-    if (replica.editIndex((files) => files.set(id, { path: relative, kind: "bin", blob })) === "published") this.remember(id, relative, sha(bytes), blob);
+    if (replica.editIndex((files) => files.set(id, { path: relative, kind: "bin", blob })) === "published") {
+      this.remember(id, relative, sha(bytes), blob, [replica.ownUpdateKey(INDEX_DOC), replica.ownBlobKey(blob.id)], true);
+    }
   }
 
   /** Content changed here: put it into the shared state, or put the shared version back in a read-only room. */
@@ -682,7 +690,16 @@ export class RoomFolder {
       return;
     }
     const result = replica.editIndex((files) => files.set(id, { ...entry, blob, ...(entry.blob ? { base: entry.blob.id } : {}) }));
-    if (result === "published") this.remember(id, entry.path, localHash, blob);
+    if (result === "published") this.remember(id, entry.path, localHash, blob, [replica.ownUpdateKey(INDEX_DOC), replica.ownBlobKey(blob.id)]);
+  }
+
+  /** Whether the shared version of a file differs from what was last synced here (our own unsent edits aside). */
+  private async sharedMovedOn(id: string, entry: FileEntry, known: Known): Promise<boolean> {
+    const replica = this.o.replica;
+    if (entry.kind === "md") return !replica.hasUnsent(id) && (!replica.isComplete(id) || sha(normalizeNote(replica.noteText(id))) !== known.hash);
+    if (!entry.blob || entry.blob.id === known.blob) return false;
+    const remote = await replica.readBlob(entry.blob);
+    return remote === null || sha(remote) !== known.hash;
   }
 
   /** A local version that can't be shared: kept as it is, never overwritten, and the user told once. */
@@ -725,6 +742,9 @@ export class RoomFolder {
       if (hash === known.hash) return this.remember(id, relative, hash, known.blob ? { id: known.blob, by: known.mine ? this.o.replica.deviceId : "" } : undefined);
       // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk.
       if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) return this.remember(id, relative, hash);
+      // The shared version moved on since the last sync and isn't here yet: taking this change in now would undo it, so
+      // the next pass settles it like any change made on both sides (keeping a copy).
+      if (this.o.replica.canWrite() && (await this.sharedMovedOn(id, entry, known))) return this.remoteChanged();
       await this.localChanged(id, entry, content, hash);
     });
   }

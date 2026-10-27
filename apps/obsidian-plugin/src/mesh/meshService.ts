@@ -228,7 +228,9 @@ export class MeshService {
 
   // ---- running ----
 
+  /** Go online: listen, find peers, run the automation. Does nothing once stopped (even if stopped meanwhile). */
   async start(): Promise<void> {
+    if (this.stopped) return;
     const config: TransportConfig = { workspaceId: this.settings.id, deviceId: this.settings.deviceId, deviceKey: this.secrets.sign, tls: this.secrets.tls, membership: () => this.node.effective() };
     this.manager = new PeerManager(this.node, config, () => this.settings.peers.map(parseAddress).filter((a): a is { host: string; port: number } => a !== null), {
       connected: () => this.emit(),
@@ -237,6 +239,10 @@ export class MeshService {
     });
     this.server = new PeerServer(config, (link) => this.manager?.accept(link), (reason, address) => this.deps.log(`refused ${address}: ${reason}`));
     this.port = await this.listen(this.settings.port || DEFAULT_PORT);
+    if (this.stopped) {
+      await this.server?.close();
+      return;
+    }
     if (this.port !== this.settings.port) {
       this.settings.port = this.port;
       await this.deps.save();
@@ -255,6 +261,11 @@ export class MeshService {
       onPeer: (device, host, port) => this.manager?.candidate(device, host, port)
     });
     await this.discovery.start();
+    if (this.stopped) {
+      this.discovery.stop();
+      this.manager.stop();
+      return;
+    }
     const timer = setInterval(() => this.automateSoon(), 30_000);
     this.timers.push(timer);
     this.automateSoon();
@@ -379,8 +390,9 @@ export class MeshService {
   }
 
   /**
-   * Our versions that lost a race to someone else's are made again on top of the winner, change by change. Joins and
-   * key rotations are left to the automation, which redoes them if they are still needed.
+   * Our versions that lost a race to someone else's are made again on top of the winner, change by change. A version
+   * that started a new room key (with a removal, say) starts one again, with a fresh key, in the same change, so the
+   * removal takes effect at once. Joins are left to the automation, which redoes them if they are still needed.
    */
   private async reapply(lost: SignedVersion[]): Promise<void> {
     const failed: string[] = [];
@@ -389,8 +401,26 @@ export class MeshService {
       if (version.body.by !== this.settings.deviceId || version.body.joins) continue;
       const base = i === 0 ? this.node.chain.versionAt(version.body.v - 1)?.body.state : lost[i - 1]!.body.state;
       if (!base) continue;
+      const keys = new Map(
+        Object.entries(version.body.state.rooms)
+          .filter(([roomId, room]) => base.rooms[roomId] !== undefined && room.epochs.length > base.rooms[roomId]!.epochs.length)
+          .map(([roomId]) => [roomId, newRoomKey()] as const)
+      );
       try {
-        await this.commit((state) => Object.assign(state, rebaseChange(base, version.body.state, state)));
+        await this.commit((state) => {
+          Object.assign(state, rebaseChange(base, version.body.state, state));
+          for (const [roomId, key] of keys) {
+            const room = state.rooms[roomId];
+            if (!room || room.deleted) continue;
+            const n = room.epochs.length + 1;
+            room.epochs.push({ n, commit: keyCommitment(this.settings.id, roomId, n, key) });
+          }
+        });
+        for (const [roomId, key] of keys) {
+          const epochs = this.node.chain.state.rooms[roomId]?.epochs ?? [];
+          const epoch = epochs[epochs.length - 1];
+          if (epoch && epoch.commit === keyCommitment(this.settings.id, roomId, epoch.n, key)) await this.keepKey(roomId, epoch.n, key);
+        }
       } catch {
         failed.push(String(version.body.v));
         for (const roomId of Object.keys(version.body.state.rooms)) if (!base.rooms[roomId] && !this.node.chain.state.rooms[roomId]) for (const listener of this.lostRoomListeners) listener(roomId);
@@ -748,7 +778,8 @@ export class MeshService {
       const room = state.rooms[roomId];
       if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
       const n = room.epochs.length;
-      const stale = this.node.allWraps().some((w) => w.body.room === roomId && w.body.n === n && !this.entitled(state, roomId, w.body.to));
+      const commit = room.epochs[n - 1]!.commit;
+      const stale = this.node.savedWraps().some((w) => w.body.room === roomId && w.body.n === n && w.body.commit === commit && !this.entitled(state, roomId, w.body.to));
       if (!stale || !replica.keyFor(n)) continue;
       const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
       const writers = Object.entries(state.devices)
