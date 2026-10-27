@@ -591,8 +591,9 @@ export function nextVersion(
 /**
  * What a version lost in a fork changed (`lost` against its parent `base`), applied again on top of the version that
  * replaced it (`onto`), field by field, so whatever others changed meanwhile stays. Left out on purpose: key epochs
- * (a rotation is redone with a fresh key), and users and devices that only joins bring (joins are recorded again
- * automatically). The caller signs the result as a new version, which is checked like any other.
+ * (a rotation is redone with a fresh key), users and devices that only joins bring (joins are recorded again
+ * automatically), and a room role the winner took away or lowered (a removal stays a removal). The caller signs the
+ * result as a new version, which is checked like any other.
  */
 export function rebaseChange(base: WorkspaceState, lost: WorkspaceState, onto: WorkspaceState): WorkspaceState {
   const out = structuredClone(onto);
@@ -630,8 +631,13 @@ export function rebaseChange(base: WorkspaceState, lost: WorkspaceState, onto: W
     if (after.deleted && !before.deleted) target.deleted = true;
     if (!sameJson(after.name, before.name)) target.name = structuredClone(after.name);
     for (const userId of keysOf(before.members, after.members)) {
+      const was = before.members[userId];
       const role = after.members[userId];
-      if (before.members[userId] === role) continue;
+      if (was === role) continue;
+      // Standing the winning branch took away from this member isn't given back: only taking away more still applies.
+      const kept = target.members[userId];
+      const reduced = was !== undefined && (kept === undefined || !roleAtLeast(kept, was));
+      if (reduced && role !== undefined && (kept === undefined || roleAtLeast(role, kept))) continue;
       if (role === undefined) delete target.members[userId];
       else target.members[userId] = role;
     }

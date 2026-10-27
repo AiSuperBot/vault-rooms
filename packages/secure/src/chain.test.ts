@@ -167,6 +167,20 @@ describe("workspace chain", () => {
     expect(anaChain.state.rooms[roomId]!.epochs).toHaveLength(2);
   });
 
+  it("taking standing away and giving it back in the same branch wins nothing", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    const { joiner: cy } = invite(anaChain, ana, { userName: "Cy" });
+    const { roomId } = createRoom(anaChain, ana, "Docs", { [ben.userId]: "manage", [cy.userId]: "write" });
+    const fork = WorkspaceChain.load(anaChain.all());
+    // Ben, who manages the room, lowers Cy and puts her back; at the same moment Ana, senior to him, renames.
+    const lowered = step(fork, ben, (state) => (state.rooms[roomId]!.members[cy.userId] = "read"));
+    const back = step(fork, ben, (state) => (state.rooms[roomId]!.members[cy.userId] = "write"));
+    step(anaChain, ana, (state) => (state.name = "Ana's"));
+    expect(anaChain.offer([lowered, back]).status).toBe("rejected");
+    expect(anaChain.state.name).toBe("Ana's");
+  });
+
   it("a writer's key rotation can't push aside the changes of someone who ranks higher", () => {
     const { chain: anaChain, admin: ana } = founder();
     const { joiner: wen } = invite(anaChain, ana, { userName: "Wen" });

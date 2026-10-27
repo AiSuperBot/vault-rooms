@@ -75,15 +75,26 @@ export class Discovery {
 
   constructor(private readonly options: DiscoveryOptions) {}
 
+  /** Resolves once discovery runs, or has given up because its port can't be used (it is best-effort). */
   start(): Promise<void> {
     return new Promise((resolve) => {
       const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
       this.socket = socket;
+      let bound = false;
       socket.on("error", () => {
-        // Discovery is best-effort: peers can still be reached by address.
+        // Discovery is best-effort: peers can still be reached by address. A port that can't be bound ends it here.
+        if (bound) return;
+        if (this.socket === socket) this.socket = null;
+        try {
+          socket.close();
+        } catch {
+          // already closed
+        }
+        resolve();
       });
       socket.on("message", (packet, rinfo) => this.onPacket(packet, rinfo.address));
       socket.bind(this.options.discoveryPort ?? DISCOVERY_PORT, () => {
+        bound = true;
         try {
           socket.setBroadcast(true);
           socket.setMulticastTTL(1);
