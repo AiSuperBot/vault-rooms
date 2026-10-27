@@ -50,6 +50,8 @@ export interface MeshEvents {
   chain?(result: OfferResult): void;
   /** A new room envelope was stored (from a peer or published here). */
   envelope?(env: StoredEnvelope): void;
+  /** An envelope made here is now safely stored (and on its way to peers). */
+  stored?(env: StoredEnvelope): void;
   presence?(env: PresenceEnvelope): void;
   wraps?(): void;
   /** The effective membership changed (record or joins). */
@@ -184,13 +186,22 @@ export class MeshNode {
       }
     }
     this.effectiveCache = null;
+    // Wraps of a key the record no longer has (a rotation that lost a race) stop counting, receipts included, so the
+    // right key can take their place.
+    let wrapsChanged = false;
+    for (const [slot, wrap] of this.wraps) {
+      if (this.effective().rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit === wrap.body.commit) continue;
+      this.wraps.delete(slot);
+      wrapsChanged = true;
+    }
     for (const [hash, wrap] of this.pendingWraps) {
       if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) continue;
       this.pendingWraps.delete(hash);
       const slot = wrapSlot(wrap);
       if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
-      this.events.wraps?.();
+      wrapsChanged = true;
     }
+    if (wrapsChanged) this.events.wraps?.();
     // Rooms this device just joined: what it took on snapshots' word while it only relayed them is checked now.
     const rooms = this.currentMemberRooms();
     for (const room of rooms) if (!this.memberRooms.has(room)) this.store.distrustClaims(room);
@@ -232,6 +243,7 @@ export class MeshNode {
   offerVersions(versions: SignedVersion[], from?: PeerSession): OfferResult {
     const result = this.chain.offer(versions, this.now());
     if (result.status === "appended" || result.status === "replaced") {
+      this.effectiveCache = null;
       this.events.chain?.(result);
       // Pass on only what is new here.
       this.broadcast({ t: "versions", versions: this.chain.since(this.chain.length - result.count) }, from);
@@ -296,7 +308,9 @@ export class MeshNode {
       this.persist!(env).then(
         () => {
           this.unpersisted.delete(key);
-          if (!this.stopped) this.broadcast({ t: "push", env });
+          if (this.stopped) return;
+          this.broadcast({ t: "push", env });
+          this.events.stored?.(env);
         },
         (error: unknown) => {
           // Not stored yet (a full disk, say): it isn't sent, and storing it is tried again later.
@@ -318,6 +332,14 @@ export class MeshNode {
   /** @internal Whether an envelope made here is still waiting to be stored (and so mustn't be sent yet). */
   isUnpersisted(env: StoredEnvelope): boolean {
     return this.unpersisted.size > 0 && this.unpersisted.has(envelopeKey(env));
+  }
+
+  /** Whether something made here for a room (or one of its documents) is still waiting to be stored. */
+  hasUnpersisted(room: string, doc?: string): boolean {
+    if (this.unpersisted.size === 0) return false;
+    const prefix = doc === undefined ? `${room}/` : `${room}/${doc}/`;
+    for (const key of this.unpersisted) if (key.startsWith(prefix)) return true;
+    return false;
   }
 
   /** Presence: only fresh messages, at a bounded rate per author, each passed on once. */

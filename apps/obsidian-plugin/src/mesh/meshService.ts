@@ -140,6 +140,7 @@ export class MeshService {
     events.presence = (env) => {
       for (const listener of this.presenceListeners) listener(env);
     };
+    events.stored = (env) => this.roomActivity(env.room);
     events.sessions = () => this.emit();
     events.rejected = (reason, from) => {
       this.deps.log(`refused from ${from}: ${reason}`);

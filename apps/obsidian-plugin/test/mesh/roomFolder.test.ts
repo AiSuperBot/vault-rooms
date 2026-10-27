@@ -396,6 +396,109 @@ describe("room folder", () => {
     expect(a.replica.noteText(id!)).toBe("one\ntwo\nthree\n");
   });
 
+  it("brings someone else's edit into a note with Windows line endings", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Win.md", "one\r\ntwo\r\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    await c.vault.writeText("Team/Win.md", "one\ntwo\nthree from Cy\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Win.md")).toBe("one\ntwo\nthree from Cy\n");
+  });
+
+  it("keeps an edit that may not have been stored before Obsidian stopped", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    link.cut();
+    // Ana edits, but her disk never manages to store the change before Obsidian stops.
+    a.node.persist = () => new Promise<void>(() => {});
+    await a.vault.writeText("Team/Plan.md", "base\nAna's last words\n");
+    await s.settle();
+    await a.folder.stop();
+    // Ana starts again: her store lacks the edit (Cy has the version before it), her file has it.
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    const files = [...again.vault.files.keys()];
+    const copy = files.find((path) => path.includes("(conflict"));
+    expect(copy && text(again.vault, copy)).toBe("base\nAna's last words\n");
+  });
+
+  it("doesn't call a newer version of someone else's attachment a clash", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([1]));
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    link.cut();
+    // Ana saves the image twice while Cy is away; Cy then gets only the newest.
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([2]));
+    await s.settle();
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([3]));
+    await s.settle();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    expect([...c.vault.files.get("Team/img.png")!]).toEqual([3]);
+    expect([...c.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+  });
+
+  it("shares a deletion made just before stopping, and an attachment added back after its blob was cleaned up", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Gone.md", "bye\n");
+    await a.vault.writeBytes("Team/report.pdf", new Uint8Array([5, 5]));
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    await a.vault.trash("Team/Gone.md");
+    await a.folder.stop();
+    expect([...a.replica.files().values()].map((entry) => entry.path)).toEqual(["report.pdf"]);
+    // The PDF is deleted and its blob cleaned up; the same file is added back later.
+    const again = s.make(s.ana, "Team", a.vault, a);
+    await again.folder.start();
+    await a.vault.trash("Team/report.pdf");
+    await s.settle();
+    const [meta] = again.node.store.blobsOf(s.roomId);
+    again.node.store.dropBlobs(s.roomId, [`${meta!.author}/${meta!.id}`]);
+    await a.vault.writeBytes("Team/report.pdf", new Uint8Array([5, 5]));
+    await s.settle();
+    expect([...again.replica.files().values()].map((entry) => entry.path)).toEqual(["report.pdf"]);
+    expect(again.node.store.blobKeys(s.roomId)).toHaveLength(1);
+  });
+
   it("leaves notes open in an editor to the editor", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

@@ -71,6 +71,7 @@ export class RoomsSettingTab extends PluginSettingTab {
           }
           this.plugin.settings.mountRoot = value;
           await this.plugin.saveSettings();
+          this.plugin.retryUnplaced();
         });
       });
 
