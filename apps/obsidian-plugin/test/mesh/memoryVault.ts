@@ -46,9 +46,18 @@ export class MemoryVault implements VaultLike {
     return true;
   }
 
-  async writeBytes(path: string, bytes: Uint8Array): Promise<void> {
+  /** Called just before a guarded write checks the file (tests use it to change the file at that very moment). */
+  beforeGuardedWrite?: (path: string) => void;
+
+  async writeBytes(path: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
+    const current = this.files.get(path);
+    if (current && expected) {
+      this.beforeGuardedWrite?.(path);
+      if (!expected(new Uint8Array(this.files.get(path)!))) return false;
+    }
     this.put(path, new Uint8Array(bytes));
     this.listener.write?.(path);
+    return true;
   }
 
   async rename(from: string, to: string): Promise<void> {

@@ -56,12 +56,22 @@ export class ObsidianVault implements VaultLike {
     return true;
   }
 
-  async writeBytes(path: string, bytes: Uint8Array): Promise<void> {
+  async writeBytes(path: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
     const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
     const file = this.file(path);
-    if (file) return this.app.vault.modifyBinary(file, data);
+    if (file) {
+      if (expected) {
+        // Replaced only if the file is still what the decision was based on, and didn't change while it was read.
+        const { mtime, size } = file.stat;
+        const current = new Uint8Array(await this.app.vault.readBinary(file));
+        if (!expected(current) || file.stat.mtime !== mtime || file.stat.size !== size) return false;
+      }
+      await this.app.vault.modifyBinary(file, data);
+      return true;
+    }
     await this.ensureParent(path);
     await this.app.vault.createBinary(normalizePath(path), data);
+    return true;
   }
 
   /** A plain move: link updates in other notes made by the person who renamed it arrive as their own edits. */

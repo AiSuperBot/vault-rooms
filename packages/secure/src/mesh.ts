@@ -685,37 +685,38 @@ export class PeerSession {
 
   /** Blobs are read from storage one at a time and sent in their own batches. */
   private async sendBlobs(room: string, blobs: Array<{ author: string; id: string }>): Promise<void> {
-    let batch: StoredEnvelope[] = [];
-    let bytes = 0;
+    const out = this.batches();
     for (const { author, id } of blobs) {
       if (this.closed) return;
       const env = await this.node.store.loadBlob(room, author, id);
-      if (!env || this.node.isUnpersisted(env)) continue;
-      batch.push(env);
-      bytes += env.ct.length;
-      if (bytes > MAX_BATCH_BYTES) {
-        this.send({ t: "envelopes", items: batch });
-        batch = [];
-        bytes = 0;
-      }
+      if (env && !this.node.isUnpersisted(env)) out.add(env);
     }
-    if (batch.length > 0) this.send({ t: "envelopes", items: batch });
+    out.flush();
   }
 
-  /** Keep messages a reasonable size. */
   private sendBatched(envs: StoredEnvelope[]): void {
+    const out = this.batches();
+    for (const env of envs) out.add(env);
+    out.flush();
+  }
+
+  /** Envelopes go out in messages the other side takes: at most MAX_ITEMS items and about MAX_BATCH_BYTES bytes each. */
+  private batches(): { add(env: StoredEnvelope): void; flush(): void } {
     let batch: StoredEnvelope[] = [];
     let bytes = 0;
-    for (const env of envs) {
-      batch.push(env);
-      bytes += env.ct.length;
-      if (batch.length >= MAX_ITEMS || bytes > MAX_BATCH_BYTES) {
-        this.send({ t: "envelopes", items: batch });
-        batch = [];
-        bytes = 0;
-      }
-    }
-    if (batch.length > 0) this.send({ t: "envelopes", items: batch });
+    const flush = () => {
+      if (batch.length > 0) this.send({ t: "envelopes", items: batch });
+      batch = [];
+      bytes = 0;
+    };
+    return {
+      add: (env) => {
+        batch.push(env);
+        bytes += env.ct.length;
+        if (batch.length >= MAX_ITEMS || bytes > MAX_BATCH_BYTES) flush();
+      },
+      flush
+    };
   }
 }
 

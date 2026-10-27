@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { fromUtf8, utf8 } from "./bytes.js";
 import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
 import { randomBytes } from "./crypto.js";
-import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
+import { INDEX_DOC, openEnvelope, sealBlob, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
 import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
@@ -495,6 +495,17 @@ describe("mesh", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("passes on more small file versions than fit in one message", async () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const net = new Network();
+    const a = nodeFor(chain, ana);
+    for (let i = 0; i < 501; i++) a.publish(sealBlob({ ws, room: roomId, n: 1, key, author: ana.sign }, utf8(`file ${i}`)));
+    const c = nodeFor(chain, cy);
+    net.link(a, c);
+    await net.settle();
+    expect(c.store.blobKeys(roomId)).toHaveLength(501);
   });
 
   it("refuses presence that isn't fresh", () => {

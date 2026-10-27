@@ -224,6 +224,30 @@ describe("workspace chain", () => {
     expect(anaChain.state.name).toBe("Ana's");
   });
 
+  it("three admins revoking one another at once end on the same branch, whatever order the branches arrive in", () => {
+    const { chain, admin: a } = founder();
+    const { joiner: b } = invite(chain, a, { userName: "B" });
+    const { joiner: c } = invite(chain, a, { userName: "C" });
+    step(chain, a, (state) => {
+      state.users[b.userId]!.admin = true;
+      state.users[c.userId]!.admin = true;
+    });
+    const branches = [
+      [nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true))],
+      [nextVersion(chain.workspaceId, chain.head, b.sign, (state) => (state.devices[c.id]!.revoked = true))],
+      [nextVersion(chain.workspaceId, chain.head, c.sign, (state) => (state.devices[a.id]!.revoked = true))]
+    ];
+    const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    const heads = orders.map((order) => {
+      const peer = WorkspaceChain.load(chain.all());
+      for (const i of order) peer.offer(branches[i]!);
+      // Offering them all again (a replay) changes nothing any more.
+      for (const branch of branches) expect(["rejected", "duplicate"]).toContain(peer.offer(branch).status);
+      return peer.headHash;
+    });
+    expect(new Set(heads).size).toBe(1);
+  });
+
   it("settles a deeper fork the same way", () => {
     const { chain: anaChain, admin: ana } = founder();
     const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
