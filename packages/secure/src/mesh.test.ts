@@ -276,6 +276,23 @@ describe("mesh", () => {
     expect(restarted.allWraps()).toEqual([receipt]);
   });
 
+  it("a join the losing branch took back out doesn't come back", () => {
+    const { chain, ws, ana, ben, roomId } = setup();
+    step(chain, ana, (state) => {
+      state.users[ben.userId]!.admin = true;
+      state.rooms[roomId]!.members[ben.userId] = "write";
+    });
+    const { joiner: mal, join } = invite(chain, ben, { userName: "Mal", fold: false });
+    const a = nodeFor(chain, ana);
+    const parent = a.chain.head;
+    // Ben records Mal's join, then revokes Mal's device; Ana, at the same moment, lowers Ben in a room: hers wins.
+    a.offerVersions([nextVersion(ws, parent, ben.sign, (state) => foldJoinInto(state, join), Date.now(), [join])]);
+    a.offerVersions([nextVersion(ws, a.chain.head, ben.sign, (state) => (state.devices[mal.id]!.revoked = true))]);
+    expect(a.offerVersions([nextVersion(ws, parent, ana.sign, (state) => (state.rooms[roomId]!.members[ben.userId] = "read"))]).status).toBe("replaced");
+    expect(a.pendingJoinRecords()).toEqual([]);
+    expect(a.effective().devices[mal.id]).toBeUndefined();
+  });
+
   it("a join whose recording lost a race waits to be recorded again", () => {
     const { chain, ws, ana, ben, cy, roomId } = setup();
     step(chain, ana, (state) => (state.rooms[roomId]!.members[ben.userId] = "manage"));

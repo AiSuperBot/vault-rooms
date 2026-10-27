@@ -131,7 +131,8 @@ export const MAX_FORK_DEPTH = 64;
 /**
  * Whether a branch takes standing away from someone (of `only`, if given): revokes one of their devices, removes them,
  * demotes them as an admin, or lowers or ends their role in a room (deleting the room included). Only what someone else
- * does to them counts, so a user can't win a race by giving something of theirs up; and only what is still taken away
+ * does to them counts, so a user can't win a race by giving something of theirs up. A revocation or removal counts as it
+ * is (it is final, even for someone who joined within the branch); a demotion or a lowered role only if it still holds
  * when the branch ends, compared with where it started, so taking something away and giving it back wins nothing.
  */
 function takesStanding(forkState: WorkspaceState, branch: SignedVersion[], only?: { users: Set<string>; devices: Set<string> }): boolean {
@@ -144,7 +145,7 @@ function takesStanding(forkState: WorkspaceState, branch: SignedVersion[], only?
     const counts = (userId: string) => userId !== actor && (!only || only.users.has(userId));
     for (const [deviceId, device] of Object.entries(prev.devices)) {
       if (!counts(device.user) || (only && !only.devices.has(deviceId))) continue;
-      if (activeDevice(prev, deviceId) && !activeDevice(next, deviceId) && activeDevice(forkState, deviceId) && !activeDevice(end, deviceId)) return true;
+      if (activeDevice(prev, deviceId) && !activeDevice(next, deviceId)) return true;
     }
     for (const [userId, user] of Object.entries(prev.users)) {
       if (counts(userId) && user.admin && !next.users[userId]?.admin && forkState.users[userId]?.admin && !end.users[userId]?.admin) return true;

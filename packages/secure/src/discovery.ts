@@ -72,12 +72,14 @@ export class Discovery {
   private windowStart = 0;
   private windowCount = 0;
   private perSource = new Map<string, number>();
+  private settleStart: (() => void) | null = null;
 
   constructor(private readonly options: DiscoveryOptions) {}
 
   /** Resolves once discovery runs, or has given up because its port can't be used (it is best-effort). */
   start(): Promise<void> {
     return new Promise((resolve) => {
+      this.settleStart = resolve;
       const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
       this.socket = socket;
       let bound = false;
@@ -132,6 +134,8 @@ export class Discovery {
   }
 
   stop(): void {
+    this.settleStart?.();
+    this.settleStart = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.socket?.close();

@@ -389,6 +389,21 @@ describe("devices and users", () => {
     step(chain, admin, (state) => Object.assign(state, merged));
   });
 
+  it("never makes someone an admin again, when re-applying, after the winner demoted them", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    step(chain, admin, (state) => (state.users[ben.userId]!.admin = true));
+    const fork = chain.state;
+    // The lost branch demoted Ben and made him an admin again; the winner demoted him.
+    const demoted = structuredClone(fork);
+    demoted.users[ben.userId]!.admin = false;
+    const promoted = structuredClone(demoted);
+    promoted.users[ben.userId]!.admin = true;
+    expect(rebaseChange(demoted, promoted, structuredClone(demoted), fork).users[ben.userId]!.admin).toBe(false);
+    // Where Ben wasn't an admin when the branches split, his promotion is made again as usual.
+    expect(rebaseChange(demoted, promoted, structuredClone(demoted), demoted).users[ben.userId]!.admin).toBe(true);
+  });
+
   it("never gives back, when re-applying, room standing the winner took away", () => {
     const { chain, admin } = founder();
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });

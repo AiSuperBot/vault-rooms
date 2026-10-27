@@ -4,7 +4,7 @@ import { hashTagged, hkdf, randomBytes, sign, signingKeyPairFromSeed, verify, ty
 import { fail } from "./errors.js";
 import { deviceIdFor, isHash, isId, randomId } from "./ids.js";
 import * as v from "./validate.js";
-import { grantedRooms, inviteCreatorStands, parseAgreementKey, parseSigningKey, type DeviceRecord, type InviteRecord, type Role, type WorkspaceState } from "./workspace.js";
+import { activeDevice, grantedRooms, inviteCreatorStands, parseAgreementKey, parseSigningKey, roleAtLeast, roleIn, type DeviceRecord, type InviteRecord, type Role, type WorkspaceState } from "./workspace.js";
 
 /**
  * Invites. The link carries a random 32-byte secret. From it both sides derive an Ed25519 "invite key": the admin
@@ -226,6 +226,17 @@ export function applyJoins(
  * Records a join in a state: the user (unless joining as another device), the device, the invite as used, and its
  * room grants (those its creator still manages).
  */
+/**
+ * Whether the person a recorded join brought in still stands in `state`: their device active, and every room the invite
+ * gave them still theirs at that role or above. Used for a join recorded in a branch that lost a race: it is waited on
+ * again only then, and one the branch itself took back out stays out.
+ */
+export function joinerStands(state: WorkspaceState, join: JoinRecord): boolean {
+  const device = activeDevice(state, join.body.device.id);
+  const invite = state.invites[join.body.invite];
+  return device !== null && invite !== undefined && Object.entries(invite.rooms).every(([roomId, role]) => roleAtLeast(roleIn(state, roomId, device.user), role));
+}
+
 export function foldJoinInto(state: WorkspaceState, join: JoinRecord): void {
   const invite = state.invites[join.body.invite];
   if (!invite || invite.used !== undefined) fail("join_used");
