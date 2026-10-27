@@ -65,7 +65,7 @@ export function invite(
   options: { rooms?: Record<string, Role>; userName?: string; fold?: boolean; forUser?: TestDevice; expires?: number; tls?: string } = {}
 ): { joiner: TestDevice; join: JoinRecord; inviteId: string; secret: Uint8Array } {
   const forUser = options.forUser;
-  const fresh = newInvite(admin.userId, options.rooms ?? {}, options.expires ?? Date.now() + 86_400_000, forUser?.userId);
+  const fresh = newInvite({ user: admin.userId, device: admin.id }, options.rooms ?? {}, options.expires ?? Date.now() + 86_400_000, forUser?.userId);
   step(chain, admin, (state) => {
     state.invites[fresh.inviteId] = fresh.record;
   });
@@ -124,6 +124,16 @@ export class Network {
     }
     if (this.queue.length > 0) throw new Error("network did not settle");
     return delivered;
+  }
+
+  /** Pump until quiet, letting asynchronous sends (blobs read from storage) run in between. */
+  async settle(rounds = 50): Promise<void> {
+    for (let i = 0; i < rounds; i++) {
+      this.pump();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (this.queue.length === 0) return;
+    }
+    throw new Error("network did not settle");
   }
 
   enqueue(fn: () => void): void {

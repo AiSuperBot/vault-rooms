@@ -73,7 +73,9 @@ export type Envelope = UpdateEnvelope | SnapshotEnvelope | BlobEnvelope | Presen
 export type StoredEnvelope = UpdateEnvelope | SnapshotEnvelope | BlobEnvelope;
 
 /** Ciphertext limits (bytes of plaintext + 16-byte tag). */
-export const MAX_BYTES = { u: 1 << 20, s: 8 << 20, b: 32 << 20, p: 8 << 10 } as const;
+export const MAX_BYTES = { u: 8 << 20, s: 16 << 20, b: 32 << 20, p: 8 << 10 } as const;
+/** The largest note (UTF-8 bytes) shared as a live document: its first update and its snapshots stay within the limits. */
+export const MAX_NOTE_BYTES = 6 << 20;
 const MAX_AUTHORS_IN_COVERS = 2000;
 
 const SIG = "envelope";
@@ -186,7 +188,10 @@ export function openEnvelope(env: Envelope, key: Uint8Array): Uint8Array {
   return plaintext;
 }
 
-/** A stable identity for storage and de-duplication. Two different envelopes with one id are an author equivocating. */
+/**
+ * A stable identity for storage and de-duplication. Two different envelopes with one id are an author equivocating.
+ * Blobs are kept per author, so nobody can take the place of another member's blob by sending something first.
+ */
 export function envelopeKey(env: StoredEnvelope): string {
   switch (env.k) {
     case "u":
@@ -194,6 +199,17 @@ export function envelopeKey(env: StoredEnvelope): string {
     case "s":
       return `${env.room}/${env.doc}/s/${env.author}/${env.seq}`;
     case "b":
-      return `${env.room}/b/${env.id}`;
+      return `${env.room}/b/${blobKeyOf(env.author, env.id)}`;
   }
+}
+
+/** How a blob is named within its room: author and id. */
+export function blobKeyOf(author: string, id: string): string {
+  return `${author}/${id}`;
+}
+
+export function isBlobKey(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const at = value.indexOf("/");
+  return at > 0 && isId(value.slice(0, at), "d") && /^[A-Za-z0-9_-]{43}$/.test(value.slice(at + 1));
 }

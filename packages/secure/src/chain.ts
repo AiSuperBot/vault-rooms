@@ -1,5 +1,5 @@
 import { fail, SecureError } from "./errors.js";
-import { activeDevice, verifyGenesis, verifyNext, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, MAX_CLOCK_SKEW_MS, roleAtLeast, roleIn, verifyGenesis, verifyNext, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 export type OfferResult =
   | { status: "appended"; count: number }
@@ -25,11 +25,11 @@ export class WorkspaceChain {
     this.hashes = [this.workspaceId];
   }
 
-  /** Rebuild from stored versions (each is verified again). */
-  static load(versions: SignedVersion[]): WorkspaceChain {
+  /** Rebuild from versions (each is verified again). With `now`, versions dated too far ahead of it are refused. */
+  static load(versions: SignedVersion[], now?: number): WorkspaceChain {
     if (versions.length === 0) fail("empty_chain");
     const chain = new WorkspaceChain(versions[0]!);
-    const result = chain.offer(versions.slice(1));
+    const result = chain.offer(versions.slice(1), now);
     if (versions.length > 1 && result.status !== "appended") fail("bad_chain", result.status === "rejected" ? result.reason : result.status);
     return chain;
   }
@@ -69,40 +69,39 @@ export class WorkspaceChain {
 
   /**
    * Offer consecutive versions from a peer. They must start right after a version we have (`branch[0].body.prev`
-   * is the hash of our version `branch[0].body.v - 1`).
+   * is the hash of our version `branch[0].body.v - 1`). With `now` (this peer's clock), a version dated more than
+   * MAX_CLOCK_SKEW_MS after it is refused for now, so no one can push the record's time far into the future.
    */
-  offer(branch: SignedVersion[]): OfferResult {
+  offer(branch: SignedVersion[], now?: number): OfferResult {
     if (branch.length === 0) return { status: "duplicate" };
     const start = branch[0]!.body.v;
     if (start < 1) return { status: "rejected", reason: "genesis" };
     if (start > this.versions.length) return { status: "rejected", reason: "gap" };
-    const forkHash = this.hashes[start - 1]!;
-    if (branch[0]!.body.prev !== forkHash) return { status: "rejected", reason: "unknown_parent" };
+    if (branch[0]!.body.prev !== this.hashes[start - 1]) return { status: "rejected", reason: "unknown_parent" };
 
-    // Verify the whole branch on top of our version start-1.
-    const hashes: string[] = [];
-    let parent = this.versions[start - 1]!;
-    let parentHash = forkHash;
+    // Skip the prefix we already have (by hash, before any costly check), then verify only the rest.
+    const hashes = branch.map(versionHash);
+    let same = 0;
+    while (same < branch.length && this.hashes[start + same] === hashes[same]) same++;
+    if (same === branch.length) return { status: "duplicate" };
+    const divergeAt = start + same;
+    const theirs = branch.slice(same);
+    const theirHashes = hashes.slice(same);
+    let parent = this.versions[divergeAt - 1]!;
+    let parentHash = this.hashes[divergeAt - 1]!;
     try {
-      for (const version of branch) {
+      for (let i = 0; i < theirs.length; i++) {
+        const version = theirs[i]!;
+        if (now !== undefined && version.body.at > now + MAX_CLOCK_SKEW_MS) fail("forbidden", "future");
         verifyNext(this.workspaceId, parent, parentHash, version);
         parent = version;
-        parentHash = versionHash(version);
-        hashes.push(parentHash);
+        parentHash = theirHashes[i]!;
       }
     } catch (error) {
       return { status: "rejected", reason: error instanceof SecureError ? `${error.code}:${error.message}` : "invalid" };
     }
 
-    // Skip the prefix we already have.
-    let same = 0;
-    while (same < branch.length && this.hashes[start + same] === hashes[same]) same++;
-    if (same === branch.length) return { status: "duplicate" };
-    const divergeAt = start + same;
     const ours = this.versions.slice(divergeAt);
-    const theirs = branch.slice(same);
-    const theirHashes = hashes.slice(same);
-
     if (ours.length === 0) {
       this.versions.push(...theirs);
       this.hashes.push(...theirHashes);
@@ -130,33 +129,62 @@ export class WorkspaceChain {
 export const MAX_FORK_DEPTH = 64;
 
 /**
- * Whether branch `a` takes away authority that a version in `b` relied on: it revokes that version's signing
- * device, removes its user, or demotes an admin signer.
+ * Whether branch `a` takes away standing that a version of branch `b` relied on: it revokes a device that signed in
+ * `b`, removes that device's user, demotes them as an admin, or lowers or ends their role in a room (deleting the room
+ * included). Only what someone else does to them counts: a user can't win a race by giving something of theirs up.
  */
-function removesAuthorityOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
-  const finalState = a[a.length - 1]!.body.state;
-  return b.some((version) => {
-    const signer = activeDevice(forkState, version.body.by);
-    if (!signer) return false;
-    if (activeDevice(finalState, version.body.by) === null) return true;
-    return forkState.users[signer.user]!.admin && !finalState.users[signer.user]?.admin;
+function reducesSignersOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
+  const signers = new Map<string, string>();
+  for (const version of b) {
+    const device = activeDevice(forkState, version.body.by);
+    if (device) signers.set(version.body.by, device.user);
+  }
+  const users = new Set(signers.values());
+  let prev = forkState;
+  for (const version of a) {
+    const next = version.body.state;
+    const actor = activeDevice(prev, version.body.by)?.user;
+    for (const [deviceId, userId] of signers) if (userId !== actor && activeDevice(prev, deviceId) && !activeDevice(next, deviceId)) return true;
+    for (const userId of users) {
+      if (userId === actor) continue;
+      if (prev.users[userId]?.admin && !next.users[userId]?.admin) return true;
+      for (const roomId of Object.keys(prev.rooms)) {
+        const was = roleIn(prev, roomId, userId);
+        if (was === undefined) continue;
+        const now = roleIn(next, roomId, userId);
+        if (now === undefined || !roleAtLeast(now, was)) return true;
+      }
+    }
+    prev = next;
+  }
+  return false;
+}
+
+/** Whether a branch starts a new key epoch for some room (a rotation, usually after someone lost access). */
+function rotatesKey(forkState: WorkspaceState, branch: SignedVersion[]): boolean {
+  const final = branch[branch.length - 1]!.body.state;
+  return Object.entries(final.rooms).some(([roomId, room]) => {
+    const before = forkState.rooms[roomId];
+    return before !== undefined && room.epochs.length > before.epochs.length;
   });
 }
 
-/** Ordering of a branch's first signer: admins first, then the user listed earliest, then the device id. */
-function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: SignedVersion): [number, number, string] {
+/** Ordering of a branch's first signer: admins first, then the user listed earliest. */
+function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: SignedVersion): { user: string; order: [number, number] } {
   const device = activeDevice(forkState, first.body.by)!;
-  return [forkState.users[device.user]!.admin ? 0 : 1, seniority.get(device.user) ?? Number.MAX_SAFE_INTEGER, first.body.by];
+  return { user: device.user, order: [forkState.users[device.user]!.admin ? 0 : 1, seniority.get(device.user) ?? Number.MAX_SAFE_INTEGER] };
 }
 
 /**
  * True if branch `a` should replace branch `b` (both start right after the same version, which has `forkState`).
  *
- * 1. A branch that takes away authority a version of the other relied on wins, so a device or admin being removed
- *    can't race a branch of its own past the removal.
- * 2. If both or neither do, the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the
- *    signer, unlike a hash, which a signer can grind by re-signing with small changes.
- * 3. Only two versions from the same device (which has no one to outrank) fall back to the lower hash.
+ * 1. A branch that takes away standing a version of the other relied on wins (`reducesSignersOf`), so nobody can race
+ *    a branch of their own past their removal from the workspace, as an admin, or from a room.
+ * 2. Otherwise a branch that starts a new room key wins, so a rotation can't be pushed aside by an unrelated change.
+ * 3. Otherwise the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the signer, unlike a
+ *    hash, which a signer can grind by re-signing with small changes.
+ * 4. Two branches started by the same user (on two of their devices): the one carrying more versions by other people
+ *    wins, so one user can't throw away others' changes; then the lower device id, then the lower hash.
  */
 export function preferBranch(
   forkState: WorkspaceState,
@@ -166,11 +194,21 @@ export function preferBranch(
   b: SignedVersion[],
   bFirstHash: string
 ): boolean {
-  const aRemovesB = removesAuthorityOf(forkState, a, b);
-  const bRemovesA = removesAuthorityOf(forkState, b, a);
-  if (aRemovesB !== bRemovesA) return aRemovesB;
+  const aReduces = reducesSignersOf(forkState, a, b);
+  const bReduces = reducesSignersOf(forkState, b, a);
+  if (aReduces !== bReduces) return aReduces;
+  const aRotates = rotatesKey(forkState, a);
+  const bRotates = rotatesKey(forkState, b);
+  if (aRotates !== bRotates) return aRotates;
   const ra = rank(forkState, seniority, a[0]!);
   const rb = rank(forkState, seniority, b[0]!);
-  for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i]! < rb[i]!;
+  for (let i = 0; i < ra.order.length; i++) if (ra.order[i] !== rb.order[i]) return ra.order[i]! < rb.order[i]!;
+  if (ra.user === rb.user) {
+    const others = (branch: SignedVersion[]) => branch.filter((version) => activeDevice(forkState, version.body.by)?.user !== ra.user).length;
+    const oa = others(a);
+    const ob = others(b);
+    if (oa !== ob) return oa > ob;
+  }
+  if (a[0]!.body.by !== b[0]!.body.by) return a[0]!.body.by < b[0]!.body.by;
   return aFirstHash < bFirstHash;
 }

@@ -58,7 +58,7 @@ describe("envelopes", () => {
   it("are only accepted from current writers (any member for presence)", () => {
     const { chain, ws, admin, writer, reader, roomId, ctx } = setup();
     expect(verifyEnvelope(chain.state, ws, sealUpdate(ctx(reader), INDEX_DOC, 1, utf8("x")))).toBe(false);
-    expect(verifyEnvelope(chain.state, ws, sealPresence(ctx(reader), 1, utf8("x")))).toBe(true);
+    expect(verifyEnvelope(chain.state, ws, sealPresence(ctx(reader), Date.now(), utf8("x")))).toBe(true);
     const fromWriter = sealUpdate(ctx(writer), INDEX_DOC, 1, utf8("x"));
     step(chain, admin, (state) => (state.rooms[roomId]!.members[writer.userId] = "read"));
     expect(verifyEnvelope(chain.state, ws, fromWriter)).toBe(false);
@@ -99,24 +99,61 @@ describe("envelope store", () => {
     expect(store.missingFor(roomId, doc, { [writer.id]: 1 }).map((e) => (e.k === "u" ? e.clock : -1))).toEqual([2, 3]);
   });
 
-  it("lets a snapshot replace the updates it covers", () => {
+  it("in a room it only relays, lets a snapshot replace the updates it holds and the snapshot claims", () => {
     const { ctx, writer, admin, roomId } = setup();
-    const removed: string[] = [];
-    const store = new EnvelopeStore({ removed: (env) => removed.push(env.k) });
+    const changed: string[] = [];
+    const store = new EnvelopeStore({ docChanged: (_room, doc) => changed.push(doc) });
+    store.isMember = () => false;
     const doc = randomId("f");
     for (let clock = 1; clock <= 3; clock++) store.add(sealUpdate(ctx(writer), doc, clock, utf8(`w${clock}`)));
     store.add(sealUpdate(ctx(admin), doc, 1, utf8("a1")));
     store.add(sealSnapshot(ctx(writer), doc, 1, { [writer.id]: 2, [admin.id]: 1 }, utf8("state")));
-    expect(removed).toEqual(["u", "u", "u"]);
+    expect(changed).toEqual([doc]);
+    expect(store.envelopesOf(roomId, doc).updates.map((u) => u.clock)).toEqual([3]);
     expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 3, [admin.id]: 1 });
     // A newer snapshot drops the older one; an older one arriving later is ignored.
     expect(store.add(sealSnapshot(ctx(admin), doc, 1, { [writer.id]: 3, [admin.id]: 1 }, utf8("state2")))).toBe("added");
     expect(store.envelopesOf(roomId, doc).snapshots).toHaveLength(1);
     expect(store.add(sealSnapshot(ctx(writer), doc, 2, { [writer.id]: 1 }, utf8("old")))).toBe("duplicate");
-    // A peer that has nothing gets the snapshot; one that has everything gets nothing.
-    expect(store.missingFor(roomId, doc, {}).map((e) => e.k)).toEqual(["s"]);
-    expect(store.missingFor(roomId, doc, store.vv(roomId, doc))).toEqual([]);
+    // A claim beyond what is held raises nothing: no counter can be pushed up from outside.
+    store.add(sealSnapshot(ctx(admin), doc, 2, { [writer.id]: Number.MAX_SAFE_INTEGER, [admin.id]: 1 }, utf8("liar")));
+    expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 3, [admin.id]: 1 });
+    expect(store.maxClock(roomId, doc, writer.id)).toBe(3);
+    expect(store.add(sealUpdate(ctx(writer), doc, 4, utf8("w4")))).toBe("added");
+    expect(store.missingFor(roomId, doc, { [writer.id]: 3 }).map((u) => u.clock)).toEqual([4]);
     expect(vvDominates({ a: 2 }, { a: 1 })).toBe(true);
+  });
+
+  it("in a room it is in, drops nothing on a snapshot's word", () => {
+    const { ctx, writer, admin, roomId } = setup();
+    const store = new EnvelopeStore();
+    const doc = randomId("f");
+    for (let clock = 1; clock <= 3; clock++) store.add(sealUpdate(ctx(writer), doc, clock, utf8(`w${clock}`)));
+    store.add(sealSnapshot(ctx(admin), doc, 1, { [writer.id]: Number.MAX_SAFE_INTEGER }, utf8("empty")));
+    expect(store.envelopesOf(roomId, doc).updates).toHaveLength(3);
+    expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 3 });
+    expect(store.maxClock(roomId, doc, writer.id)).toBe(3);
+    expect(store.add(sealUpdate(ctx(writer), doc, 4, utf8("w4")))).toBe("added");
+    // What a member checked (compact) is dropped and counted as had.
+    const [first] = store.envelopesOf(roomId, doc).updates;
+    store.compact(roomId, doc, [first!], { [writer.id]: 1 });
+    expect(store.envelopesOf(roomId, doc).updates.map((u) => u.clock)).toEqual([2, 3, 4]);
+    expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 4 });
+    expect(store.add(first!)).toBe("duplicate");
+  });
+
+  it("keeps blobs per author, outside memory, and over quota drops the oldest of a relayed room", async () => {
+    const { ctx, writer, admin, roomId } = setup();
+    const store = new EnvelopeStore();
+    const mine = sealBlob(ctx(writer), utf8("same bytes"));
+    const theirs = sealBlob(ctx(admin), utf8("same bytes"));
+    expect(store.add(mine)).toBe("added");
+    expect(store.add(theirs)).toBe("added");
+    expect(store.blobKeys(roomId)).toHaveLength(2);
+    expect((await store.loadBlob(roomId, writer.id, mine.id))?.sig).toBe(mine.sig);
+    store.dropBlobs(roomId, [`${writer.id}/${mine.id}`]);
+    expect(store.add(mine)).toBe("duplicate");
+    expect(store.gone(roomId).map(([key]) => key)).toEqual([`${writer.id}/${mine.id}`]);
   });
 
   it("gives equal digests for equal contents, whatever the order", () => {

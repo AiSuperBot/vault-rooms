@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
+import { keyCommitment, newRoomKey } from "./keys.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { nextVersion, versionHash } from "./workspace.js";
 
@@ -117,6 +118,58 @@ describe("workspace chain", () => {
     // The other way round it is an ordinary conflict, which Ana's branch wins.
     expect(benChain.offer(anaChain.since(benVersion.body.v)).status).toBe("replaced");
     expect(benChain.headHash).toBe(anaChain.headHash);
+  });
+
+  it("giving up one of your own devices can't undo your removal from a room", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    const { joiner: laptop } = invite(anaChain, ben, { forUser: ben });
+    const { roomId } = createRoom(anaChain, ana, "Docs", { [ben.userId]: "write" });
+    const fork = WorkspaceChain.load(anaChain.all());
+    // Ben renames himself from his laptop; then Ana, the room's manager, takes him out of the room.
+    step(anaChain, laptop, (state) => (state.users[ben.userId]!.name = "Ben L"));
+    step(anaChain, ana, (state) => delete state.rooms[roomId]!.members[ben.userId]);
+    // From his other computer, Ben answers with a sibling that revokes his own laptop (which signed in Ana's branch).
+    const sibling = nextVersion(fork.workspaceId, fork.head, ben.sign, (state) => (state.devices[laptop.id]!.revoked = true));
+    expect(anaChain.offer([sibling]).status).toBe("rejected");
+    expect(anaChain.state.rooms[roomId]!.members[ben.userId]).toBeUndefined();
+  });
+
+  it("an admin a manager took out of a room can't undo it with a change of their own", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    const { roomId } = createRoom(anaChain, ana, "Docs", { [ben.userId]: "manage" });
+    const fork = WorkspaceChain.load(anaChain.all());
+    // Ben (a manager, junior to Ana) takes Ana out of the room; at the same moment Ana renames the workspace.
+    const removal = nextVersion(fork.workspaceId, fork.head, ben.sign, (state) => delete state.rooms[roomId]!.members[ana.userId]);
+    const rename = step(anaChain, ana, (state) => (state.name = "Ana's"));
+    expect(anaChain.offer([removal]).status).toBe("replaced");
+    expect(anaChain.state.rooms[roomId]!.members[ana.userId]).toBeUndefined();
+    expect(fork.offer([removal]).status).toBe("appended");
+    expect(fork.offer([rename]).status).toBe("rejected");
+  });
+
+  it("a key rotation isn't pushed aside by an unrelated change of a higher-ranked signer", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: wen } = invite(anaChain, ana, { userName: "Wen" });
+    const { roomId } = createRoom(anaChain, ana, "Docs", { [wen.userId]: "write" });
+    const fork = WorkspaceChain.load(anaChain.all());
+    const rotation = nextVersion(fork.workspaceId, fork.head, wen.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(fork.workspaceId, roomId, 2, newRoomKey()) }));
+    step(anaChain, ana, (state) => (state.name = "Ana's"));
+    expect(anaChain.offer([rotation]).status).toBe("replaced");
+    expect(anaChain.state.rooms[roomId]!.epochs).toHaveLength(2);
+  });
+
+  it("one user signing on two computers can't throw away other people's changes", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    const { joiner: laptop } = invite(anaChain, ben, { forUser: ben });
+    const fork = WorkspaceChain.load(anaChain.all());
+    step(anaChain, ben, (state) => (state.users[ben.userId]!.name = "Ben D"));
+    step(anaChain, ana, (state) => (state.name = "Ana's"));
+    const sibling = nextVersion(fork.workspaceId, fork.head, laptop.sign, (state) => (state.users[ben.userId]!.name = "Ben L"));
+    expect(anaChain.offer([sibling]).status).toBe("rejected");
+    expect(anaChain.state.name).toBe("Ana's");
   });
 
   it("settles a deeper fork the same way", () => {

@@ -33,16 +33,28 @@ export function str(value: unknown, field: string, maxLength: number): string {
   return value;
 }
 
-/** C0/C1 controls and the Unicode line/paragraph separators, compared by code point. */
+/**
+ * C0/C1 controls, the Unicode line/paragraph separators, and invisible characters that can make one name look like
+ * another (zero-width characters, bidirectional marks, embeddings, overrides and isolates), compared by code point.
+ */
 function hasControl(text: string): boolean {
   for (const ch of text) {
     const c = ch.codePointAt(0)!;
     if (c <= 0x1f || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029) return true;
+    if (c === 0x061c || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff) return true;
   }
   return false;
 }
 
-/** A display name: 1–80 characters, no control characters, no leading or trailing whitespace. */
+/** Removes the invisible characters `name` refuses, for cleaning up what someone typed. */
+export function cleanName(text: string): string {
+  return Array.from(text)
+    .filter((ch) => !hasControl(ch))
+    .join("")
+    .trim();
+}
+
+/** A display name: 1–80 characters, no control or invisible characters, no leading or trailing whitespace. */
 export function name(value: unknown, field: string): string {
   const text = str(value, field, 80);
   if (text.length === 0 || text !== text.trim() || hasControl(text)) bad(field);
