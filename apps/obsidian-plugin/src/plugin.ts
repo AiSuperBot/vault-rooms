@@ -6,7 +6,7 @@ import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
 import { adapterFiles, ObsidianVault } from "./mesh/obsidianVault.js";
 import { RoomPresence } from "./mesh/presence.js";
-import { RoomFolder, type RoomFolderState } from "./mesh/roomFolder.js";
+import { normalizeNote, RoomFolder, type RoomFolderState } from "./mesh/roomFolder.js";
 import { isScope, obsidianSecrets } from "./mesh/secrets.js";
 import { JoinModal } from "./ui/modals.js";
 import { ROOMS_VIEW, RoomsView } from "./ui/roomsView.js";
@@ -527,7 +527,7 @@ export default class VaultRoomsPlugin extends Plugin {
       const cm = (view.editor as unknown as { cm?: EditorView }).cm;
       if (!cm) continue;
       let disk: string | null = null;
-      if (this.editors.needsBinding(cm) && this.folderFor(view.file.path)) disk = await this.app.vault.cachedRead(view.file).catch(() => null);
+      if (this.editors.needsBinding(cm) && this.folderFor(view.file.path)) disk = await this.app.vault.cachedRead(view.file).then(normalizeNote, () => null);
       open.push({ path: view.file.path, view: cm, disk });
     }
     return open;

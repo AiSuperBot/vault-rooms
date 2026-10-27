@@ -93,6 +93,11 @@ const DELETED = "\u0000deleted";
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
 const RECENT_EDIT_MS = 10 * 60_000;
 
+/** Notes are compared and shared with "\n" line endings, as Obsidian's editor holds them (and saves them, once edited). */
+export function normalizeNote(text: string): string {
+  return text.includes("\r") ? text.replace(/\r\n?/g, "\n") : text;
+}
+
 function sha(bytes: Uint8Array | string): string {
   return createHash("sha256").update(typeof bytes === "string" ? Buffer.from(bytes, "utf8") : bytes).digest("base64url");
 }
@@ -176,6 +181,10 @@ export class RoomFolder {
     const next = this.queue.then(task, task).catch((error: Error) => this.o.log(`room folder: ${error.stack ?? error.message}`));
     this.queue = next;
     return next;
+  }
+
+  private async readNote(path: string): Promise<string> {
+    return normalizeNote(await this.o.vault.readText(path));
   }
 
   /** One file's trouble (locked, a folder in the way, ...) mustn't stop the others. */
@@ -430,7 +439,7 @@ export class RoomFolder {
     if (entry.kind === "md") {
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
       if (!replica.isComplete(id) || replica.hasUnsent(id)) return;
-      remote = replica.noteText(id);
+      remote = normalizeNote(replica.noteText(id));
     } else {
       remote = entry.blob ? await replica.readBlob(entry.blob) : null;
     }
@@ -452,7 +461,7 @@ export class RoomFolder {
       if (entry.kind === "bin" && known.blob && entry.blob && entry.blob.id !== known.blob && entry.base !== known.blob) await this.keepAside(entry.path, await this.o.vault.readBytes(path));
       return this.write(id, entry, remote, remoteHash, known.hash);
     }
-    const local = entry.kind === "md" ? await this.o.vault.readText(path) : await this.o.vault.readBytes(path);
+    const local = entry.kind === "md" ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob?.id);
     if (!known || localHash === known.hash) {
@@ -493,7 +502,8 @@ export class RoomFolder {
     this.known.delete(id);
     if (!stat) return;
     const busy = entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS;
-    const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(await this.o.vault.readBytes(path)) === known.hash);
+    const current = isMarkdownPath(known.path) ? await this.readNote(path) : await this.o.vault.readBytes(path);
+    const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(current) === known.hash);
     if (unchanged) return this.trash(known.path);
     // Changed here after someone else removed it, or being worked on here: keep it, and share it again as a new file.
     if (!this.o.replica.canWrite()) return;
@@ -525,7 +535,7 @@ export class RoomFolder {
     const path = this.vaultPath(relative);
     const id = randomId("f");
     if (isMarkdownPath(relative)) {
-      const text = await this.o.vault.readText(path);
+      const text = await this.readNote(path);
       if (Buffer.byteLength(text, "utf8") > MAX_NOTE_BYTES) return this.notShared(relative, "size");
       const added = replica.editIndex((files) => files.set(id, { path: relative, kind: "md" }));
       if (added === "refused") return;
@@ -556,7 +566,7 @@ export class RoomFolder {
   private async localChanged(id: string, entry: FileEntry, local: string | Uint8Array, localHash: string): Promise<void> {
     const replica = this.o.replica;
     if (!replica.canWrite()) {
-      const remote = entry.kind === "md" ? replica.noteText(id) : entry.blob ? await replica.readBlob(entry.blob) : null;
+      const remote = entry.kind === "md" ? normalizeNote(replica.noteText(id)) : entry.blob ? await replica.readBlob(entry.blob) : null;
       if (remote === null) return;
       const remoteHash = sha(remote);
       if (remoteHash !== localHash) {
@@ -620,7 +630,7 @@ export class RoomFolder {
       if (!this.o.vault.stat(vaultPath)) return;
       const id = this.idAt(relative);
       const entry = id ? this.o.replica.files().get(id) : undefined;
-      const content = isMarkdownPath(relative) ? await this.o.vault.readText(vaultPath) : await this.o.vault.readBytes(vaultPath);
+      const content = isMarkdownPath(relative) ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
       const hash = sha(content);
       if (this.isEcho(vaultPath, hash)) return;
       if (!id || !entry) {
