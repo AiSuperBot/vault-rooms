@@ -1,5 +1,5 @@
 import { App, Modal, Notice, Setting, TFolder } from "obsidian";
-import { ROLES, roleIn, type Role } from "@vault-rooms/secure";
+import { cleanName, ROLES, roleIn, type Role } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
 
 const ROLE_LABEL: Record<Role, string> = { read: "Can read", write: "Can edit", manage: "Manages" };
@@ -15,7 +15,7 @@ export function confirmAction(app: App, title: string, body: string, action: str
     const modal = new Modal(app);
     let answered = false;
     modal.titleEl.setText(title);
-    modal.contentEl.createEl("p", { text: body });
+    for (const paragraph of body.split("\n\n")) modal.contentEl.createEl("p", { text: paragraph });
     new Setting(modal.contentEl)
       .addButton((button) => button.setButtonText("Cancel").onClick(() => modal.close()))
       .addButton((button) =>
@@ -44,9 +44,9 @@ export class CreateWorkspaceModal extends Modal {
     this.titleEl.setText("Create a workspace");
     const values = { workspaceName: "Team", userName: "", deviceName: this.plugin.defaultDeviceName() };
     this.contentEl.createEl("p", { text: "A workspace is the group of people you share rooms (folders) with on this network. You'll be its first admin." });
-    new Setting(this.contentEl).setName("Workspace name").addText((text) => text.setValue(values.workspaceName).onChange((v) => (values.workspaceName = v.trim())));
-    new Setting(this.contentEl).setName("Your name").setDesc("How others see you.").addText((text) => text.onChange((v) => (values.userName = v.trim())));
-    new Setting(this.contentEl).setName("This computer").addText((text) => text.setValue(values.deviceName).onChange((v) => (values.deviceName = v.trim())));
+    new Setting(this.contentEl).setName("Workspace name").addText((text) => text.setValue(values.workspaceName).onChange((v) => (values.workspaceName = cleanName(v))));
+    new Setting(this.contentEl).setName("Your name").setDesc("How others see you.").addText((text) => text.onChange((v) => (values.userName = cleanName(v))));
+    new Setting(this.contentEl).setName("This computer").addText((text) => text.setValue(values.deviceName).onChange((v) => (values.deviceName = cleanName(v))));
     new Setting(this.contentEl).addButton((button) =>
       button
         .setButtonText("Create")
@@ -88,8 +88,8 @@ export class JoinModal extends Modal {
       text.inputEl.rows = 3;
       text.inputEl.style.width = "100%";
     });
-    new Setting(this.contentEl).setName("Your name").setDesc("How others see you. For another computer of yours, use your usual name.").addText((text) => text.onChange((v) => (values.userName = v.trim())));
-    new Setting(this.contentEl).setName("This computer").addText((text) => text.setValue(values.deviceName).onChange((v) => (values.deviceName = v.trim())));
+    new Setting(this.contentEl).setName("Your name").setDesc("How others see you. For another computer of yours, use your usual name.").addText((text) => text.onChange((v) => (values.userName = cleanName(v))));
+    new Setting(this.contentEl).setName("This computer").addText((text) => text.setValue(values.deviceName).onChange((v) => (values.deviceName = cleanName(v))));
     new Setting(this.contentEl)
       .setName("Computer address (optional)")
       .setDesc("Only if joining fails: the address of a computer in the workspace, e.g. 192.168.1.20:47880 (shown in its Vault Rooms panel).")
@@ -222,7 +222,7 @@ export class NewRoomModal extends Modal {
     });
     new Setting(this.contentEl).setName("Room name").addText((text) => {
       nameField = text;
-      text.setValue(values.name).onChange((value) => (values.name = value.trim()));
+      text.setValue(values.name).onChange((value) => (values.name = cleanName(value)));
     });
     new Setting(this.contentEl).addButton((button) =>
       button

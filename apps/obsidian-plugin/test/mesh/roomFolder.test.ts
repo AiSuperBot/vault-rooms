@@ -13,6 +13,7 @@ interface Pc {
   notices: string[];
   saved: { state: RoomFolderState | null };
   bound: Set<string>;
+  gone: string[];
 }
 
 function setup() {
@@ -22,11 +23,14 @@ function setup() {
   const { roomId, key } = createRoom(chain, ana, "Team", { [cy.userId]: "write", [rae.userId]: "read" });
   const net = new Network();
   const pcs = new Map<string, Pc>();
-  const make = (device: TestDevice, folderPath: string, vault = new MemoryVault()): Pc => {
+  /** A computer with this room's folder. `restart`: the same computer starting again (its stored envelopes kept). */
+  const make = (device: TestDevice, folderPath: string, vault = new MemoryVault(), restart?: Pc): Pc => {
     const notices: string[] = [];
-    const saved: { state: RoomFolderState | null } = { state: null };
+    const saved: { state: RoomFolderState | null } = { state: restart?.saved.state ?? null };
     const bound = new Set<string>();
-    const node = new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
+    const gone: string[] = [];
+    restart?.replica.destroy();
+    const node = restart?.node ?? new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
       envelope: (env) => {
         const pc = pcs.get(device.id);
         pc?.replica.receive(env);
@@ -41,6 +45,7 @@ function setup() {
       vault,
       deviceName: device.name,
       isBound: (id) => bound.has(id),
+      folderGone: () => void gone.push(folderPath),
       loadState: async () => saved.state,
       saveState: async (state) => {
         saved.state = structuredClone(state);
@@ -54,7 +59,7 @@ function setup() {
       delete: (path) => void folder.onLocalDelete(path),
       rename: (from, to) => void folder.onLocalRename(from, to)
     };
-    const pc = { device, node, replica, vault, folder, notices, saved, bound };
+    const pc = { device, node, replica, vault, folder, notices, saved, bound, gone };
     pcs.set(device.id, pc);
     return pc;
   };
@@ -153,8 +158,7 @@ describe("room folder", () => {
     await s.settle();
     await a.folder.stop();
     a.vault.silently("Team/Todo.md", "one\ntwo\n");
-    const a2 = s.make(s.ana, "Team", a.vault);
-    a2.saved.state = a.saved.state;
+    const a2 = s.make(s.ana, "Team", a.vault, a);
     a2.replica.refreshKeys();
     await a2.folder.start();
     await s.settle();
@@ -211,7 +215,11 @@ describe("room folder", () => {
     await s.settle();
     expect(text(r.vault, "Team/Rules.md")).toBe("be nice\n");
     expect(text(a.vault, "Team/Rules.md")).toBe("be nice\n");
-    expect(r.notices).toEqual(["You can only read this room. Your change was put back."]);
+    // Nothing of the reader's is lost: their version stays next to it, on this computer only.
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("(your copy"))!;
+    expect(text(r.vault, copy)).toBe("anything goes\n");
+    expect(r.notices[0]).toContain("was put back");
+    expect([...a.vault.files.keys()].some((path) => path.includes("(your copy"))).toBe(false);
     await r.vault.trash("Team/Rules.md");
     await s.settle();
     expect(text(r.vault, "Team/Rules.md")).toBe("be nice\n");
@@ -251,6 +259,125 @@ describe("room folder", () => {
     await s.settle();
     expect([...a.vault.files.keys()].filter((path) => !path.startsWith("Team/"))).toEqual([]);
     expect([...a.vault.files.keys()]).toEqual([]);
+  });
+
+  it("never takes something missing from the index for a deletion", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "keep me\n");
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([9, 9]));
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    await a.folder.stop();
+    // The device's store is lost (or its key hasn't arrived): it starts from an empty index, remembering the files.
+    const fresh = s.make(s.ana, "Team", a.vault);
+    fresh.saved.state = a.saved.state;
+    await fresh.folder.start();
+    await s.settle();
+    expect(text(fresh.vault, "Team/Plan.md")).toBe("keep me\n");
+    expect(fresh.vault.files.has("Team/img.png")).toBe(true);
+    expect(fresh.vault.trashed).toEqual([]);
+  });
+
+  it("keeps an attachment version made at the same time as someone else's", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([1]));
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    link.cut();
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([2]));
+    await c.vault.writeBytes("Team/img.png", new Uint8Array([3]));
+    await s.settle();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    // Both end up with the same file, and the version that lost is kept as a copy, on both sides.
+    expect([...a.vault.files.get("Team/img.png")!]).toEqual([...c.vault.files.get("Team/img.png")!]);
+    const copies = (pc: typeof a) => [...pc.vault.files.keys()].filter((path) => path.includes("(conflict"));
+    expect(copies(a)).toHaveLength(1);
+    expect(copies(c)).toHaveLength(1);
+    const kept = [...a.vault.files.get(copies(a)[0]!)!];
+    expect([[2], [3]]).toContainEqual(kept);
+    expect(kept).not.toEqual([...a.vault.files.get("Team/img.png")!]);
+  });
+
+  it("doesn't share or write files that could run something", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/tool.ps1", new Uint8Array([1]));
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    expect(a.replica.files().size).toBe(0);
+    expect(a.notices.some((n) => n.includes("tool.ps1"))).toBe(true);
+    const blob = a.replica.putBlob(new Uint8Array([7]));
+    a.replica.editIndex((files) => files.set(randomId("f"), { path: "run.exe", kind: "bin", blob }));
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(a.vault.files.has("Team/run.exe")).toBe(false);
+  });
+
+  it("deleting the room's folder here deletes nothing for anyone else", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/One.md", "1\n");
+    await a.vault.writeText("Team/Two.md", "2\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    c.vault.removeFolder("Team");
+    await s.settle();
+    expect(c.gone).toEqual(["Team"]);
+    expect([...a.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["One.md", "Two.md"]);
+    expect(text(a.vault, "Team/One.md")).toBe("1\n");
+  });
+
+  it("keeps a note too large to share on this computer, and doesn't overwrite it", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    const big = "x".repeat(7 << 20);
+    await a.vault.writeText("Team/Big.md", big);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    expect(a.replica.files().size).toBe(0);
+    expect(text(a.vault, "Team/Big.md")?.length).toBe(big.length);
+    expect(a.notices.some((n) => n.includes("Big.md") && n.includes("too large"))).toBe(true);
+  });
+
+  it("puts a file back under its name when renamed to one that can't be shared", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "plan\n");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    await a.vault.rename("Team/Plan.md", `Team/${"x".repeat(130)}.md`);
+    await s.settle();
+    expect(text(a.vault, "Team/Plan.md")).toBe("plan\n");
+    expect([...a.replica.files().values()].map((entry) => entry.path)).toEqual(["Plan.md"]);
+    expect(a.notices.some((n) => n.includes("keeps its old name"))).toBe(true);
   });
 
   it("leaves notes open in an editor to the editor", async () => {

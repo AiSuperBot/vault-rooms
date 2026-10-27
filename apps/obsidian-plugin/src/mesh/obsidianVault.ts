@@ -36,11 +36,24 @@ export class ObsidianVault implements VaultLike {
     });
   }
 
-  async writeText(path: string, text: string): Promise<void> {
+  async writeText(path: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
     const file = this.file(path);
-    if (file) return this.app.vault.modify(file, text);
+    if (file) {
+      if (!expected) {
+        await this.app.vault.modify(file, text);
+        return true;
+      }
+      // Replaced only if the file is still what the decision was based on (it may have changed since it was read).
+      let replaced = false;
+      await this.app.vault.process(file, (current) => {
+        replaced = expected(current);
+        return replaced ? text : current;
+      });
+      return replaced;
+    }
     await this.ensureParent(path);
     await this.app.vault.create(normalizePath(path), text);
+    return true;
   }
 
   async writeBytes(path: string, bytes: Uint8Array): Promise<void> {
@@ -59,10 +72,13 @@ export class ObsidianVault implements VaultLike {
     await this.app.vault.rename(file, normalizePath(to));
   }
 
-  /** Follows the user's "deleted files" setting (system trash, Obsidian trash, or delete). */
+  /**
+   * To the system trash, or Obsidian's .trash folder where that isn't possible: a deletion that came from someone
+   * else never deletes outright, whatever the "deleted files" setting says.
+   */
   async trash(path: string): Promise<void> {
     const file = this.file(path);
-    if (file) await this.app.fileManager.trashFile(file);
+    if (file) await this.app.vault.trash(file, true);
   }
 
   listFiles(folder: string): string[] {
@@ -71,6 +87,10 @@ export class ObsidianVault implements VaultLike {
       .getFiles()
       .filter((file) => file.path.startsWith(prefix))
       .map((file) => file.path);
+  }
+
+  folderExists(path: string): boolean {
+    return this.app.vault.getAbstractFileByPath(normalizePath(path)) instanceof TFolder;
   }
 }
 
@@ -85,6 +105,10 @@ export function adapterFiles(adapter: DataAdapter): Files {
     rename: (from, to) => adapter.rename(from, to),
     mkdir: (path) => adapter.mkdir(path),
     list: (path) => adapter.list(path),
-    rmdir: (path, recursive) => adapter.rmdir(path, recursive)
+    rmdir: (path, recursive) => adapter.rmdir(path, recursive),
+    stat: async (path) => {
+      const stat = await adapter.stat(path);
+      return stat ? { size: stat.size, mtime: stat.mtime } : null;
+    }
   };
 }

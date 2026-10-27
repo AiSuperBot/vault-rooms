@@ -1,6 +1,16 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import { cleanName } from "@vault-rooms/secure";
+import type { MeshService } from "../mesh/meshService.js";
 import type VaultRoomsPlugin from "../plugin.js";
 import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
+
+/** What leaving means, with a warning when this is the only computer of the only admin. */
+export function leaveWarning(svc: MeshService | null): string {
+  const base = "Leave on this computer? Others keep working; this computer stops syncing, and its workspace data and keys are deleted. Your files stay.";
+  return svc?.isLastAdminDevice()
+    ? `${base}\n\nYou are the workspace's only admin, and this is your only computer in it: after you leave, nobody can invite people, remove anyone or change the workspace's settings. Make someone else an admin first.`
+    : base;
+}
 
 export class RoomsSettingTab extends PluginSettingTab {
   constructor(
@@ -29,7 +39,10 @@ export class RoomsSettingTab extends PluginSettingTab {
     if (svc && svc.isMember()) {
       new Setting(containerEl).setName("Your name").addText((text) => {
         text.setValue(state!.users[ws.userId]?.name ?? "");
-        text.inputEl.addEventListener("change", () => void this.apply(() => svc.renameUser(ws.userId, text.getValue().trim())));
+        text.inputEl.addEventListener("change", () => {
+          const name = cleanName(text.getValue());
+          if (name) void this.apply(() => svc.renameUser(ws.userId, name));
+        });
       });
       if (svc.isAdmin()) {
         new Setting(containerEl)
@@ -46,12 +59,20 @@ export class RoomsSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Folder for rooms shared with you")
       .setDesc("New rooms you're added to appear here, each in its own folder. You can move a room's folder later.")
-      .addText((text) =>
-        text.setValue(this.plugin.settings.mountRoot).onChange(async (value) => {
-          this.plugin.settings.mountRoot = value.trim() || "Rooms";
+      .addText((text) => {
+        text.setValue(this.plugin.settings.mountRoot);
+        text.inputEl.addEventListener("change", async () => {
+          const value = text.getValue().trim() || "Rooms";
+          const problem = this.plugin.mountRootProblem(value);
+          if (problem) {
+            new Notice(problem, 8000);
+            text.setValue(this.plugin.settings.mountRoot);
+            return;
+          }
+          this.plugin.settings.mountRoot = value;
           await this.plugin.saveSettings();
-        })
-      );
+        });
+      });
 
     new Setting(containerEl)
       .setName("Port")
@@ -86,7 +107,7 @@ export class RoomsSettingTab extends PluginSettingTab {
           .setButtonText("Leave")
           .setWarning()
           .onClick(async () => {
-            if (!(await confirmAction(this.app, "Leave the workspace", "Leave on this computer? Others keep working; this computer stops syncing.", "Leave"))) return;
+            if (!(await confirmAction(this.app, "Leave the workspace", leaveWarning(svc), "Leave"))) return;
             await this.plugin.leaveWorkspace();
             this.display();
           })
