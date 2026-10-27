@@ -67,6 +67,7 @@ const MAX_BATCH_BYTES = 8 << 20;
 const PRESENCE_MEMORY = 2000;
 const PRESENCE_WINDOW_MS = 60_000;
 const MAX_PENDING = 2000;
+const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
 
@@ -109,10 +110,12 @@ export class MeshNode {
   private wraps = new Map<string, KeyWrap>();
   /** Joins and wraps that didn't verify yet (our record may be behind); retried when membership changes. */
   private pendingJoins = new Map<string, { join: JoinRecord; firstSeen: number }>();
-  private pendingWraps = new Map<string, KeyWrap>();
+  /** Kept per device that sent them, so no one can push out what others sent. */
+  private pendingWraps = new Map<string, Map<string, KeyWrap>>();
   /**
-   * Wraps that counted once, of a key the record no longer has (it lost a race). Kept, and saved, because the record
-   * can name that key again: a room whose creation lost a race is made again with the same key.
+   * Saved wraps that don't count now. Kept (and saved again) while they may: one of a key the record no longer has (it
+   * lost a race) counts again if the record names that key again, as when a room whose creation lost a race is made
+   * again; one of the room's newest key shows who holds it, so the key is replaced if they lost access.
    */
   private staleWraps = new Map<string, KeyWrap>();
   private sessions = new Set<PeerSession>();
@@ -200,19 +203,23 @@ export class MeshNode {
     for (const [slot, wrap] of this.wraps) {
       if (this.effective().rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit === wrap.body.commit) continue;
       this.wraps.delete(slot);
-      this.staleWraps.set(hashOf("wrap-hash", wrap), wrap);
-      if (this.staleWraps.size > MAX_STALE) this.staleWraps.delete(this.staleWraps.keys().next().value!);
+      this.keepAside(wrap);
       wrapsChanged = true;
     }
-    for (const waiting of [this.staleWraps, this.pendingWraps]) {
+    for (const waiting of [this.staleWraps, ...this.pendingWraps.values()]) {
       for (const [hash, wrap] of waiting) {
-        if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) continue;
-        waiting.delete(hash);
-        const slot = wrapSlot(wrap);
-        if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
-        wrapsChanged = true;
+        if (verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
+          waiting.delete(hash);
+          const slot = wrapSlot(wrap);
+          if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
+          wrapsChanged = true;
+        } else if (waiting === this.staleWraps && !this.worthKeeping(wrap)) {
+          waiting.delete(hash);
+          wrapsChanged = true;
+        }
       }
     }
+    for (const [sender, waiting] of this.pendingWraps) if (waiting.size === 0) this.pendingWraps.delete(sender);
     if (wrapsChanged) this.events.wraps?.();
     // Rooms this device just joined: what it took on snapshots' word while it only relayed them is checked now.
     const rooms = this.currentMemberRooms();
@@ -242,8 +249,31 @@ export class MeshNode {
   /** Reload saved joins and wraps (see savedWraps) without passing them on (peers get them at the next sync). */
   restore(joins: Array<{ join: JoinRecord; firstSeen: number }>, wraps: KeyWrap[]): void {
     for (const entry of joins) this.pendingJoins.set(joinHash(entry.join), entry);
-    for (const wrap of wraps) this.staleWraps.set(hashOf("wrap-hash", wrap), wrap);
     this.membershipChanged();
+    for (const wrap of wraps) {
+      if (verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
+        const slot = wrapSlot(wrap);
+        if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
+      } else if (this.worthKeeping(wrap)) this.keepAside(wrap);
+    }
+    this.events.wraps?.();
+  }
+
+  private keepAside(wrap: KeyWrap): void {
+    this.staleWraps.set(hashOf("wrap-hash", wrap), wrap);
+    if (this.staleWraps.size > MAX_STALE) this.staleWraps.delete(this.staleWraps.keys().next().value!);
+  }
+
+  /**
+   * Whether a wrap that doesn't count is worth keeping: its key isn't the record's (the record may name it again), or
+   * it is of a room's newest key (it shows who holds that key, see staleWraps). Otherwise it doesn't count because of
+   * who gave or got it, or the room was deleted: should they get access again, the key is simply wrapped for them anew.
+   */
+  private worthKeeping(wrap: KeyWrap): boolean {
+    const room = this.effective().rooms[wrap.body.room];
+    if (!room) return true;
+    if (room.deleted) return false;
+    return room.epochs[wrap.body.n - 1]?.commit !== wrap.body.commit || wrap.body.n === room.epochs.length;
   }
 
   /** The wraps that count: of a key the record has, from a device that may give it. */
@@ -296,12 +326,16 @@ export class MeshNode {
     if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
       // Our record may be behind (a device, room or epoch it doesn't know yet): keep the wrap for later. Kept by its
       // contents, so a wrap that never verifies can't take the place of a genuine one, and not kept at all when its
-      // wrapper is known and the signature simply doesn't hold. When too many wait, the oldest goes (peers send their
-      // wraps again whenever they connect).
+      // wrapper is known and the signature simply doesn't hold. Kept apart per sender: when too many from one sender
+      // wait, its oldest goes, so no one can push out wraps others sent.
+      if (wrapSignatureValid(this.effective(), wrap) === false) return false;
+      const sender = from?.remoteDevice ?? this.deviceId;
+      let waiting = this.pendingWraps.get(sender);
+      if (!waiting) this.pendingWraps.set(sender, (waiting = new Map()));
       const hash = hashOf("wrap-hash", wrap);
-      if (wrapSignatureValid(this.effective(), wrap) === false || this.pendingWraps.has(hash)) return false;
-      if (this.pendingWraps.size >= MAX_PENDING) this.pendingWraps.delete(this.pendingWraps.keys().next().value!);
-      this.pendingWraps.set(hash, wrap);
+      if (waiting.has(hash)) return false;
+      if (waiting.size >= MAX_PENDING_WRAPS) waiting.delete(waiting.keys().next().value!);
+      waiting.set(hash, wrap);
       return false;
     }
     this.wraps.set(slot, wrap);
@@ -342,7 +376,7 @@ export class MeshNode {
           const timer = setTimeout(() => attempt(Math.min(retryIn * 2, 300_000)), retryIn);
           (timer as { unref?: () => void }).unref?.();
         }
-      );
+      ).catch((error: unknown) => this.events.rejected?.(`stored:${errorText(error)}`, this.deviceId));
       this.storing.add(done);
       void done.then(() => this.storing.delete(done));
     };
@@ -360,9 +394,9 @@ export class MeshNode {
     this.stopped = true;
   }
 
-  /** @internal Whether an envelope made here is still waiting to be stored (and so mustn't be sent yet). */
-  isUnpersisted(env: StoredEnvelope): boolean {
-    return this.unpersisted.size > 0 && this.unpersisted.has(envelopeKey(env));
+  /** Whether an envelope made here (or the one with this key, see envelopeKey) is still waiting to be stored, so isn't sent yet. */
+  isUnpersisted(env: StoredEnvelope | string): boolean {
+    return this.unpersisted.size > 0 && this.unpersisted.has(typeof env === "string" ? env : envelopeKey(env));
   }
 
   /** Whether an envelope made here whose key starts with `prefix` (see envelopeKey) is still waiting to be stored. */

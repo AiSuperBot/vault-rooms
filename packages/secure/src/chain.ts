@@ -129,26 +129,23 @@ export class WorkspaceChain {
 export const MAX_FORK_DEPTH = 64;
 
 /**
- * Whether branch `a` takes away standing that a version of branch `b` relied on: it revokes a device that signed in
- * `b`, removes that device's user, demotes them as an admin, or lowers or ends their role in a room (deleting the room
- * included). Only what someone else does to them counts: a user can't win a race by giving something of theirs up.
+ * Whether a branch takes standing away from someone (of `only`, if given): revokes one of their devices, removes them,
+ * demotes them as an admin, or lowers or ends their role in a room (deleting the room included). Only what someone else
+ * does to them counts: a user can't win a race by giving something of theirs up.
  */
-function reducesSignersOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
-  const signers = new Map<string, string>();
-  for (const version of b) {
-    const device = activeDevice(forkState, version.body.by);
-    if (device) signers.set(version.body.by, device.user);
-  }
-  const users = new Set(signers.values());
+function takesStanding(forkState: WorkspaceState, branch: SignedVersion[], only?: { users: Set<string>; devices: Set<string> }): boolean {
   let prev = forkState;
-  for (const version of a) {
+  for (const version of branch) {
     const next = version.body.state;
     const actor = activeDevice(prev, version.body.by)?.user;
-    for (const [deviceId, userId] of signers) if (userId !== actor && activeDevice(prev, deviceId) && !activeDevice(next, deviceId)) return true;
-    for (const userId of users) {
-      if (userId === actor) continue;
-      if (prev.users[userId]?.admin && !next.users[userId]?.admin) return true;
-      for (const roomId of Object.keys(prev.rooms)) {
+    const counts = (userId: string) => userId !== actor && (!only || only.users.has(userId));
+    for (const [deviceId, device] of Object.entries(prev.devices)) {
+      if (counts(device.user) && (!only || only.devices.has(deviceId)) && activeDevice(prev, deviceId) && !activeDevice(next, deviceId)) return true;
+    }
+    for (const [userId, user] of Object.entries(prev.users)) if (counts(userId) && user.admin && !next.users[userId]?.admin) return true;
+    for (const [roomId, room] of Object.entries(prev.rooms)) {
+      for (const userId of Object.keys(room.members)) {
+        if (!counts(userId)) continue;
         const was = roleIn(prev, roomId, userId);
         if (was === undefined) continue;
         const now = roleIn(next, roomId, userId);
@@ -158,6 +155,18 @@ function reducesSignersOf(forkState: WorkspaceState, a: SignedVersion[], b: Sign
     prev = next;
   }
   return false;
+}
+
+/** Whether branch `a` takes away standing that a version of branch `b` relied on (its signers' devices and users). */
+function reducesSignersOf(forkState: WorkspaceState, a: SignedVersion[], b: SignedVersion[]): boolean {
+  const only = { users: new Set<string>(), devices: new Set<string>() };
+  for (const version of b) {
+    const device = activeDevice(forkState, version.body.by);
+    if (!device) continue;
+    only.devices.add(version.body.by);
+    only.users.add(device.user);
+  }
+  return takesStanding(forkState, a, only);
 }
 
 /** Ordering of a branch's first signer: admins first, then the user listed earliest. */
@@ -171,10 +180,12 @@ function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: 
  *
  * 1. A branch that takes away standing a version of the other relied on wins (`reducesSignersOf`), so nobody can race
  *    a branch of their own past their removal from the workspace, as an admin, or from a room.
- * 2. Otherwise the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the signer, unlike a
- *    hash, which a signer can grind by re-signing with small changes. (A key rotation that loses is simply made again
- *    by the automation, which still sees that it is needed.)
- * 3. Two branches started by the same user (on two of their devices): the one carrying more versions by other people
+ * 2. Otherwise a branch that takes standing away from anyone wins (`takesStanding`), so an unrelated change made at the
+ *    same moment can't undo a removal, a revocation or a demotion, even for a while.
+ * 3. Otherwise the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the signer, unlike a
+ *    hash, which a signer can grind by re-signing with small changes. A key rotation gets no precedence: one that loses
+ *    is made again (with the removal it went with, if any).
+ * 4. Two branches started by the same user (on two of their devices): the one carrying more versions by other people
  *    wins, so one user can't throw away others' changes; then the lower device id, then the lower hash.
  */
 export function preferBranch(
@@ -188,6 +199,9 @@ export function preferBranch(
   const aReduces = reducesSignersOf(forkState, a, b);
   const bReduces = reducesSignersOf(forkState, b, a);
   if (aReduces !== bReduces) return aReduces;
+  const aTakes = takesStanding(forkState, a);
+  const bTakes = takesStanding(forkState, b);
+  if (aTakes !== bTakes) return aTakes;
   const ra = rank(forkState, seniority, a[0]!);
   const rb = rank(forkState, seniority, b[0]!);
   for (let i = 0; i < ra.order.length; i++) if (ra.order[i] !== rb.order[i]) return ra.order[i]! < rb.order[i]!;

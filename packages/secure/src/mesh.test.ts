@@ -276,6 +276,43 @@ describe("mesh", () => {
     expect(restarted.allWraps()).toEqual([receipt]);
   });
 
+  it("after a restart, still knows who held a room's newest key, until that key is replaced", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const toCy = wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign);
+    // Cy leaves the room; the key is to be replaced, and Ana's device restarts before it is.
+    step(chain, cy, (state) => void delete state.rooms[roomId]!.members[cy.userId]);
+    const a = nodeFor(chain, ana);
+    a.restore([], [toCy]);
+    expect(a.allWraps()).toEqual([]);
+    expect(a.savedWraps()).toEqual([toCy]);
+    a.offerVersions([nextVersion(ws, a.chain.head, ana.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(ws, roomId, 2, newRoomKey()) }))]);
+    expect(a.savedWraps()).toEqual([]);
+  });
+
+  it("one peer's flood of wraps that never verify can't push out a wrap another peer sent", () => {
+    const { chain, ws, ana, ben, cy, roomId } = setup();
+    const a = nodeFor(chain, ana);
+    // Cy's wrap of a key Ana's record doesn't know yet arrives, then a flood of junk from Ben's device.
+    const k2 = newRoomKey();
+    const early = wrapRoomKey(ws, roomId, 2, k2, { id: cy.id, agree: cy.agree.publicKey }, cy.sign);
+    a.addWrap(early, { remoteDevice: cy.id } as PeerSession);
+    for (let i = 0; i < 2100; i++) a.addWrap({ ...early, body: { ...early.body, by: randomId("d") } }, { remoteDevice: ben.id } as PeerSession);
+    a.offerVersions([nextVersion(ws, a.chain.head, cy.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(ws, roomId, 2, k2) }))]);
+    expect(a.allWraps()).toContainEqual(early);
+  });
+
+  it("waits for what is being stored even when a listener fails", async () => {
+    const { chain, ana, seal } = setup();
+    const a = new MeshNode(WorkspaceChain.load(chain.all()), ana.id, {
+      stored: () => {
+        throw new Error("listener");
+      }
+    });
+    a.persist = () => Promise.resolve();
+    a.publish(seal(ana, 1, "stored"));
+    await expect(a.stored()).resolves.toBeUndefined();
+  });
+
   it("stops storing, and trying again, once stopped", async () => {
     vi.useFakeTimers();
     try {
