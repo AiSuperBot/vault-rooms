@@ -256,9 +256,20 @@ export class RoomReplica {
     return this.unsent.has(docId);
   }
 
-  /** Whether something this device made (for one document, or anywhere in the room) isn't safely stored yet. */
-  hasUnstored(docId?: DocId): boolean {
-    return this.node.hasUnpersisted(this.roomId, docId);
+  /** Whether something this device made isn't safely stored yet: edits of these documents, or its blob with this id. */
+  hasUnstored(docs: DocId[], blobId?: string): boolean {
+    if (docs.some((doc) => this.node.hasUnpersisted(`${this.roomId}/${doc}/`))) return true;
+    return blobId !== undefined && this.node.hasUnpersisted(`${this.roomId}/b/${blobKeyOf(this.node.deviceId, blobId)}`);
+  }
+
+  /** Resolves once what this device is storing right now is stored (or failed to be, this time). */
+  stored(): Promise<void> {
+    return this.node.stored();
+  }
+
+  /** Destroyed (the owner let go of the room): nothing can be read or changed through it any more. */
+  get isDestroyed(): boolean {
+    return this.destroyed;
   }
 
   /** This device. */
@@ -330,6 +341,7 @@ export class RoomReplica {
    * the room's storage limit), and the document was rebuilt without it.
    */
   edit(docId: DocId, change: (doc: Y.Doc) => void): EditResult {
+    if (this.destroyed) fail("destroyed");
     const state = this.loadDoc(docId);
     this.refusal = null;
     this.editing = true;
@@ -528,12 +540,14 @@ export class RoomReplica {
 
   /** Change the index (create, rename, delete) as one local transaction. */
   editIndex(change: (files: Y.Map<FileEntry>) => void): EditResult {
+    if (this.destroyed) fail("destroyed");
     if (!this.canWrite()) fail("read_only");
     return this.edit(INDEX_DOC, (doc) => change(doc.getMap<FileEntry>("files")));
   }
 
   /** Encrypt and publish a file version; returns the reference to put in the index. Throws "no_room_key" without the newest key. */
   putBlob(bytes: Uint8Array): BlobRef {
+    if (this.destroyed) fail("destroyed");
     if (!this.canWrite()) fail("read_only");
     const ctx = this.sealContext();
     const env = sealBlob(ctx, bytes);
