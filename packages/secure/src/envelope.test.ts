@@ -99,7 +99,7 @@ describe("envelope store", () => {
     expect(store.missingFor(roomId, doc, { [writer.id]: 1 }).map((e) => (e.k === "u" ? e.clock : -1))).toEqual([2, 3]);
   });
 
-  it("in a room it only relays, lets a snapshot replace the updates it holds and the snapshot claims", () => {
+  it("in a room it only relays, lets a snapshot replace its own author's updates it holds and claims", () => {
     const { ctx, writer, admin, roomId } = setup();
     const changed: string[] = [];
     const store = new EnvelopeStore({ docChanged: (_room, doc) => changed.push(doc) });
@@ -109,18 +109,20 @@ describe("envelope store", () => {
     store.add(sealUpdate(ctx(admin), doc, 1, utf8("a1")));
     store.add(sealSnapshot(ctx(writer), doc, 1, { [writer.id]: 2, [admin.id]: 1 }, utf8("state")));
     expect(changed).toEqual([doc]);
-    expect(store.envelopesOf(roomId, doc).updates.map((u) => u.clock)).toEqual([3]);
+    // Only the writer's own updates go: what the snapshot says of the admin's isn't taken on its word.
+    expect(store.envelopesOf(roomId, doc).updates.map((u) => `${u.author === writer.id ? "w" : "a"}${u.clock}`).sort()).toEqual(["a1", "w3"]);
     expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 3, [admin.id]: 1 });
-    // A newer snapshot drops the older one; an older one arriving later is ignored.
-    expect(store.add(sealSnapshot(ctx(admin), doc, 1, { [writer.id]: 3, [admin.id]: 1 }, utf8("state2")))).toBe("added");
+    // A newer snapshot drops the same author's older one; an older one arriving later is ignored.
+    expect(store.add(sealSnapshot(ctx(writer), doc, 2, { [writer.id]: 3, [admin.id]: 1 }, utf8("state2")))).toBe("added");
     expect(store.envelopesOf(roomId, doc).snapshots).toHaveLength(1);
-    expect(store.add(sealSnapshot(ctx(writer), doc, 2, { [writer.id]: 1 }, utf8("old")))).toBe("duplicate");
-    // A claim beyond what is held raises nothing: no counter can be pushed up from outside.
-    store.add(sealSnapshot(ctx(admin), doc, 2, { [writer.id]: Number.MAX_SAFE_INTEGER, [admin.id]: 1 }, utf8("liar")));
+    expect(store.add(sealSnapshot(ctx(writer), doc, 3, { [writer.id]: 1 }, utf8("old")))).toBe("duplicate");
+    // A lying snapshot can't remove another author's updates or snapshots, nor push any counter up.
+    store.add(sealSnapshot(ctx(admin), doc, 1, { [writer.id]: Number.MAX_SAFE_INTEGER, [admin.id]: 1 }, utf8("liar")));
+    expect(store.envelopesOf(roomId, doc).snapshots.some((s) => s.author === writer.id)).toBe(true);
     expect(store.vv(roomId, doc)).toEqual({ [writer.id]: 3, [admin.id]: 1 });
     expect(store.maxClock(roomId, doc, writer.id)).toBe(3);
     expect(store.add(sealUpdate(ctx(writer), doc, 4, utf8("w4")))).toBe("added");
-    expect(store.missingFor(roomId, doc, { [writer.id]: 3 }).map((u) => u.clock)).toEqual([4]);
+    expect(store.missingFor(roomId, doc, { [writer.id]: 3, [admin.id]: 1 }).map((u) => u.clock)).toEqual([4]);
     expect(vvDominates({ a: 2 }, { a: 1 })).toBe(true);
   });
 

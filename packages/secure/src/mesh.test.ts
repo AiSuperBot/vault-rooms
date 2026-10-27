@@ -1,8 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { randomBytes } from "./crypto.js";
-import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope } from "./envelope.js";
+import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
 import { randomId } from "./ids.js";
 import { createJoinRecord, joinHash } from "./invite.js";
 import { unwrapRoomKey, wrapRoomKey } from "./keys.js";
@@ -238,6 +238,43 @@ describe("mesh", () => {
     expect(a.pendingJoinRecords()).toHaveLength(1);
     const lowest = joins.map((j) => joinHash(j)).sort()[0];
     expect(joinHash(a.pendingJoinRecords()[0]!)).toBe(lowest);
+  });
+
+  it("a wrap that doesn't verify can't take the place of the genuine one", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    const genuine = wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign);
+    // Someone sends a wrap in Ana's name (same room, epoch and recipient) with a signature that doesn't hold.
+    const forged = structuredClone(genuine);
+    forged.sig = genuine.sig.startsWith("A") ? `B${genuine.sig.slice(1)}` : `A${genuine.sig.slice(1)}`;
+    expect(a.addWrap(forged)).toBe(false);
+    expect(a.addWrap(genuine)).toBe(true);
+    expect(a.allWraps()).toEqual([genuine]);
+  });
+
+  it("stores before sending, and keeps trying when storing fails", async () => {
+    vi.useFakeTimers();
+    try {
+      const { chain, ana, cy, roomId, key, seal } = setup();
+      const net = new Network();
+      const a = nodeFor(chain, ana);
+      const c = nodeFor(chain, cy);
+      let failures = 1;
+      a.persist = () => (failures-- > 0 ? Promise.reject(new Error("disk full")) : Promise.resolve());
+      net.link(a, c);
+      net.pump();
+      const env = seal(ana, 1, "kept back");
+      a.publish(env);
+      await vi.advanceTimersByTimeAsync(0);
+      net.pump();
+      expect(texts(c, roomId, key)).toEqual([]);
+      expect(a.isUnpersisted(env as StoredEnvelope)).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      net.pump();
+      expect(texts(c, roomId, key)).toEqual(["kept back"]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refuses presence that isn't fresh", () => {

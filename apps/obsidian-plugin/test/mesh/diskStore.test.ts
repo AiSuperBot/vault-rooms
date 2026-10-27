@@ -124,6 +124,19 @@ describe("disk store", () => {
     expect(await files.exists(docFile("m", w.roomId, env.doc))).toBe(true);
   });
 
+  it("writes an envelope again when asked after its first write failed", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const env = sealUpdate(w.ctx, randomId("f"), 1, utf8("mine"));
+    files.failNextWriteTo = ".jsonl";
+    store.add(env);
+    await expect(disk.persisted(env)).rejects.toThrow("disk full");
+    await disk.persisted(env);
+    expect(lines(await files.read(docFile("m", w.roomId, env.doc)))).toHaveLength(1);
+  });
+
   it("keeps the old record if writing the new one fails", async () => {
     const w = world();
     const files = new MemoryFiles();

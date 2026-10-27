@@ -26,6 +26,10 @@ export class MemoryFiles implements Files {
   }
 
   async append(path: string, data: string): Promise<void> {
+    if (this.failNextWriteTo && path.endsWith(this.failNextWriteTo)) {
+      this.failNextWriteTo = null;
+      throw new Error("disk full");
+    }
     this.data.set(path, (this.data.get(path) ?? "") + data);
   }
 

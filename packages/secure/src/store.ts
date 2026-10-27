@@ -83,8 +83,9 @@ export const STORE_LIMITS = {
  *
  * Snapshots compact a document, but what a snapshot says it covers is only its author's claim. In a room this device
  * is in, nothing is dropped on a claim: the replica checks that a snapshot really contains an envelope before it
- * asks to drop it (`compact`). In a room it only relays (it can't decrypt), it takes the claim, but only for updates
- * it holds: a lying snapshot can cost the relayed copy, never a member's own history, and can't push any counter up.
+ * asks to drop it (`compact`). In a room it only relays (it can't decrypt), it takes the claim, but only for the
+ * snapshot's own author and only for updates it holds: a lying snapshot can cost the relayed copy of its author's own
+ * content, never another member's, never a member's own history, and can't push any counter up.
  */
 export class EnvelopeStore {
   private docsByRoom = new Map<string, Map<DocId, DocEntry>>();
@@ -128,7 +129,7 @@ export class EnvelopeStore {
     if (env.k === "u") {
       if (env.clock <= this.markOf(entry, env.author)) return "duplicate";
     } else if (!member) {
-      for (const kept of entry.snapshots.values()) if (vvDominates(kept.covers, env.covers)) return "duplicate";
+      for (const kept of entry.snapshots.values()) if (kept.author === env.author && vvDominates(kept.covers, env.covers)) return "duplicate";
     }
     const bytes = this.docBytes.get(env.room) ?? 0;
     if (bytes + env.ct.length > STORE_LIMITS.roomDocBytes) return "quota";
@@ -146,17 +147,22 @@ export class EnvelopeStore {
     return "added";
   }
 
-  /** A relayed room: a snapshot replaces the updates and snapshots it claims to cover, as far as they are held here. */
+  /**
+   * A relayed room: a snapshot replaces what it claims to cover, but only of its own author (that author's updates
+   * held here, and that author's older snapshots). So a lying snapshot can cost a relay at most its author's own
+   * content, never another member's.
+   */
   private compactOnClaim(room: string, doc: DocId, entry: DocEntry, snapshot: SnapshotEnvelope): void {
-    const held = this.vvOf(entry);
+    const author = snapshot.author;
+    const limit = Math.min(snapshot.covers[author] ?? 0, this.vvOf(entry)[author] ?? 0);
     const remove: StoredEnvelope[] = [];
-    for (const [author, upTo] of Object.entries(snapshot.covers)) {
-      const limit = Math.min(upTo, held[author] ?? 0);
-      if (limit <= 0) continue;
+    const raised = limit > (entry.claimed[author] ?? 0);
+    if (raised) {
       for (const [clock, update] of entry.updates.get(author) ?? []) if (clock <= limit) remove.push(update);
-      entry.claimed[author] = Math.max(entry.claimed[author] ?? 0, limit);
+      entry.claimed[author] = limit;
     }
-    for (const kept of entry.snapshots.values()) if (kept !== snapshot && vvDominates(snapshot.covers, kept.covers)) remove.push(kept);
+    for (const kept of entry.snapshots.values()) if (kept !== snapshot && kept.author === author && vvDominates(snapshot.covers, kept.covers)) remove.push(kept);
+    if (!raised && remove.length === 0) return;
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
   }

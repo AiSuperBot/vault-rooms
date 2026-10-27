@@ -115,6 +115,12 @@ export function verifyKeyWrap(state: WorkspaceState, workspaceId: string, wrap: 
   return verify(wrapper.sign, WRAP_SIG, utf8(canonicalJson(body)), wrap.sig);
 }
 
+/** Whether a wrap's signature holds, when its wrapper is an active device of `state` (null when the wrapper isn't known there). */
+export function wrapSignatureValid(state: WorkspaceState, wrap: KeyWrap): boolean | null {
+  const wrapper = activeDevice(state, wrap.body.by);
+  return wrapper ? verify(wrapper.sign, WRAP_SIG, utf8(canonicalJson(wrap.body)), wrap.sig) : null;
+}
+
 /** Opens a wrap addressed to this device and checks the key against the epoch's commitment. */
 export function unwrapRoomKey(state: WorkspaceState, workspaceId: string, wrap: KeyWrap, me: KeyPair): Uint8Array {
   const room = liveRoom(state, wrap.body.room);

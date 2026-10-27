@@ -418,9 +418,10 @@ export function authorize(prev: WorkspaceState, next: WorkspaceState, signer: Si
     if (before && after && sameJson(before, after)) continue;
     changed = true;
     if (!after) {
-      // Withdrawn: by an admin, its creator, or a manager of a room it grants.
-      const managesARoom = Object.keys(before!.rooms).some((roomId) => roleIn(prev, roomId, signerUserId) === "manage");
-      if (!(admin || before!.by === signerUserId || managesARoom)) deny(`invite_withdraw:${inviteId}`);
+      // Withdrawn: by an admin, its creator, or someone who manages every room it grants.
+      const granted = Object.keys(before!.rooms);
+      const managesThemAll = granted.length > 0 && granted.every((roomId) => roleIn(prev, roomId, signerUserId) === "manage");
+      if (!(admin || before!.by === signerUserId || managesThemAll)) deny(`invite_withdraw:${inviteId}`);
       continue;
     }
     if (!before) {

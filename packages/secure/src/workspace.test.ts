@@ -302,6 +302,10 @@ describe("devices and users", () => {
     const { inviteId } = invite(chain, admin, { rooms: { [kept]: "read" }, fold: false });
     expect(forbidden(chain, cy, (state) => delete state.invites[inviteId])).toBe(`forbidden:invite_withdraw:${inviteId}`);
     step(chain, admin, (state) => (state.rooms[kept]!.members[cy.userId] = "manage"));
+    // Managing one of an invite's rooms isn't enough to cancel what it grants in another.
+    const { roomId: third } = createRoom(chain, admin, "Third");
+    const both = invite(chain, admin, { rooms: { [kept]: "read", [third]: "read" }, fold: false });
+    expect(forbidden(chain, cy, (state) => delete state.invites[both.inviteId])).toBe(`forbidden:invite_withdraw:${both.inviteId}`);
     step(chain, cy, (state) => delete state.invites[inviteId]);
   });
 

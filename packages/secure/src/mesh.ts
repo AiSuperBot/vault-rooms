@@ -5,7 +5,7 @@ import { hashTagged } from "./crypto.js";
 import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
 import { applyJoins, joinHash, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
-import { parseKeyWrap, verifyKeyWrap, type KeyWrap } from "./keys.js";
+import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
 import { activeDevice, parseSignedVersion, roleIn, type SignedVersion, type WorkspaceState } from "./workspace.js";
@@ -120,6 +120,7 @@ export class MeshNode {
    * never lose an envelope a peer already has, and the counter it used is never handed out twice.
    */
   persist: ((env: StoredEnvelope) => Promise<void>) | null = null;
+  private stopped = false;
 
   constructor(
     chain: WorkspaceChain,
@@ -183,9 +184,10 @@ export class MeshNode {
       }
     }
     this.effectiveCache = null;
-    for (const [slot, wrap] of this.pendingWraps) {
+    for (const [hash, wrap] of this.pendingWraps) {
       if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) continue;
-      this.pendingWraps.delete(slot);
+      this.pendingWraps.delete(hash);
+      const slot = wrapSlot(wrap);
       if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
       this.events.wraps?.();
     }
@@ -217,7 +219,7 @@ export class MeshNode {
   /** Reload saved joins and wraps without passing them on (peers get them at the next sync). */
   restore(joins: Array<{ join: JoinRecord; firstSeen: number }>, wraps: KeyWrap[]): void {
     for (const entry of joins) this.pendingJoins.set(joinHash(entry.join), entry);
-    for (const wrap of wraps) this.pendingWraps.set(wrapSlot(wrap), wrap);
+    for (const wrap of wraps) this.pendingWraps.set(hashOf("wrap-hash", wrap), wrap);
     this.membershipChanged();
   }
 
@@ -260,9 +262,13 @@ export class MeshNode {
 
   addWrap(wrap: KeyWrap, from?: PeerSession): boolean {
     const slot = wrapSlot(wrap);
-    if (this.wraps.has(slot) || this.pendingWraps.has(slot)) return false;
+    if (this.wraps.has(slot)) return false;
     if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
-      if (this.pendingWraps.size < MAX_PENDING) this.pendingWraps.set(slot, wrap);
+      // Our record may be behind (a device, room or epoch it doesn't know yet): keep the wrap for later. Kept by its
+      // contents, so a wrap that never verifies can't take the place of a genuine one, and not kept at all when its
+      // wrapper is known and the signature simply doesn't hold.
+      const hash = hashOf("wrap-hash", wrap);
+      if (wrapSignatureValid(this.effective(), wrap) !== false && !this.pendingWraps.has(hash) && this.pendingWraps.size < MAX_PENDING) this.pendingWraps.set(hash, wrap);
       return false;
     }
     this.wraps.set(slot, wrap);
@@ -286,17 +292,27 @@ export class MeshNode {
     }
     const key = envelopeKey(env);
     this.unpersisted.add(key);
-    this.persist(env).then(
-      () => {
-        this.unpersisted.delete(key);
-        this.broadcast({ t: "push", env });
-      },
-      (error: unknown) => {
-        // Not stored: it stays on this device (the file on disk still has the change, to be shared again later).
-        this.events.rejected?.(`not_stored:${errorText(error)}`, this.deviceId);
-      }
-    );
+    const attempt = (retryIn: number) =>
+      this.persist!(env).then(
+        () => {
+          this.unpersisted.delete(key);
+          if (!this.stopped) this.broadcast({ t: "push", env });
+        },
+        (error: unknown) => {
+          // Not stored yet (a full disk, say): it isn't sent, and storing it is tried again later.
+          this.events.rejected?.(`not_stored:${errorText(error)}`, this.deviceId);
+          if (this.stopped) return;
+          const timer = setTimeout(() => void attempt(Math.min(retryIn * 2, 300_000)), retryIn);
+          (timer as { unref?: () => void }).unref?.();
+        }
+      );
+    void attempt(5_000);
     return true;
+  }
+
+  /** Stop: nothing more is sent or retried (the owner closes the connections). */
+  stop(): void {
+    this.stopped = true;
   }
 
   /** @internal Whether an envelope made here is still waiting to be stored (and so mustn't be sent yet). */

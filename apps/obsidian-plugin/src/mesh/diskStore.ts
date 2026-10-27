@@ -66,6 +66,8 @@ export class DiskStore implements BlobStorage {
   /** The append that will carry each document's pending lines. */
   private batches = new Map<string, Promise<void>>();
   private pendingWrites = new Map<string, Promise<void>>();
+  /** Envelopes made here whose write failed: written again when asked (`persisted`). */
+  private failedWrites = new Set<string>();
   private rewrites = new Set<string>();
   private goneWrites = new Set<string>();
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
@@ -293,15 +295,34 @@ export class DiskStore implements BlobStorage {
 
   /** Resolves once an envelope this device made is on disk (see MeshNode.persist). */
   persisted(env: StoredEnvelope): Promise<void> {
-    return this.pendingWrites.get(envelopeKey(env)) ?? Promise.resolve();
+    const key = envelopeKey(env);
+    const pending = this.pendingWrites.get(key);
+    if (pending) return pending;
+    if (!this.failedWrites.has(key)) return Promise.resolve();
+    // A write that failed (a full disk, say) is made again.
+    const path = env.k === "b" ? this.blobPath(env) : this.docPath(env.room, env.doc);
+    const written =
+      env.k === "b"
+        ? this.queue(path, () => this.swapIn(path, JSON.stringify(env)))
+        : this.queue(path, async () => {
+            await this.ensureFolder(path);
+            await this.files.append(path, `\n${JSON.stringify(env)}`);
+          });
+    this.track(env, written);
+    return written;
   }
 
   private track(env: StoredEnvelope, written: Promise<void>): void {
     const key = envelopeKey(env);
     this.pendingWrites.set(key, written);
+    const settle = (failed: boolean) => {
+      if (this.pendingWrites.get(key) === written) this.pendingWrites.delete(key);
+      if (failed) this.failedWrites.add(key);
+      else this.failedWrites.delete(key);
+    };
     void written.then(
-      () => this.pendingWrites.delete(key),
-      () => this.pendingWrites.delete(key)
+      () => settle(false),
+      () => settle(true)
     );
   }
 
