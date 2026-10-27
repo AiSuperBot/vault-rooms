@@ -1083,6 +1083,75 @@ describe("room folder", () => {
     expect(copies).toContain(`---\n${due}\n---\nstatus: ${other}\n`);
   });
 
+  /** Ana, Cy and Rae, all writers, each with the room's folder, all linked; `links()` cuts them all. */
+  async function trio(base: string) {
+    const s = setup("write");
+    const [a, c, r] = [s.make(s.ana, "Team"), s.make(s.cy, "Team"), s.make(s.rae, "Team")];
+    await a.vault.writeText("Team/Task.md", base);
+    for (const pc of [a, c, r]) s.giveKey(a, pc.device);
+    const links = [s.net.link(a.node, c.node), s.net.link(a.node, r.node), s.net.link(c.node, r.node)];
+    for (const pc of [a, c, r]) {
+      pc.replica.refreshKeys();
+      await pc.folder.start();
+    }
+    await s.settle();
+    for (const link of links) link.cut();
+    return { s, a, c, r, id: [...a.replica.files().keys()][0]! };
+  }
+
+  it("keeps a line put above a losing line by someone else, even once that line changed again", async () => {
+    for (let round = 0; round < 4; round++) {
+      const { s, a, c, r, id } = await trio("---\nmodified: 9\n---\n");
+      await a.vault.writeText("Team/Task.md", "---\nmodified: Ana\n---\n");
+      await a.folder.settled();
+      await c.vault.writeText("Team/Task.md", "---\nmodified: Cy 1\n---\n");
+      await c.folder.settled();
+      // Rae, with Cy, adds a line above Cy's; then Cy's plugin rewrites its line again.
+      let link = s.net.link(c.node, r.node);
+      await s.settle();
+      r.bound.add(id);
+      const text = r.replica.noteDoc(id).getText("content");
+      text.insert(text.toString().indexOf("modified"), "tags: x\n");
+      await s.settle();
+      await c.vault.writeText("Team/Task.md", "---\ntags: x\nmodified: Cy 2\n---\n");
+      await c.folder.settled();
+      await s.settle();
+      link.cut();
+      for (const [x, y] of [[a, c], [a, r], [c, r]] as const) s.net.link(x.node, y.node);
+      await s.settle();
+      await s.settle();
+      const note = a.replica.noteText(id);
+      for (const pc of [c, r]) expect(pc.replica.noteText(id)).toBe(note);
+      expect(note).toContain("tags: x\n");
+      expect(note.split("\n").filter((line) => line.startsWith("modified"))).toHaveLength(1);
+      link = link;
+    }
+  });
+
+  it("doesn't let a line typed above a saved one, seen only in a snapshot holding the save, push the saved line out", async () => {
+    // Whether the typed line would win depends on random ids: tried many times.
+    for (let round = 0; round < 10; round++) {
+      const { s, a, c, r, id } = await trio("---\ndue: 1\n---\n");
+      // Ana's plugin rewrites the line while Cy, in an editor, types a new line above it.
+      await a.vault.writeText("Team/Task.md", "---\ndue: 2\n---\n");
+      await a.folder.settled();
+      c.bound.add(id);
+      const text = c.replica.noteDoc(id).getText("content");
+      text.insert(text.toString().indexOf("due"), "tags: x\n");
+      // Rae gets both, and keeps them only in a snapshot of her own; Ana then gets Cy's line only in it.
+      for (const pc of [a, c]) {
+        const link = s.net.link(pc.node, r.node);
+        await s.settle();
+        link.cut();
+      }
+      expect(r.replica.snapshot(id, true)).not.toBeNull();
+      s.net.link(a.node, r.node);
+      await s.settle();
+      // Both lines stay (in either order: they were put in front of the same line at once).
+      expect(["---\ntags: x\ndue: 2\n---\n", "---\ndue: 2\ntags: x\n---\n"]).toContain(a.replica.noteText(id));
+    }
+  });
+
   it("keeps one line of three computers that changed it at once, and nothing else is taken out", async () => {
     const s = setup("write");
     const pcs = [s.make(s.ana, "Team"), s.make(s.cy, "Team"), s.make(s.rae, "Team")];
