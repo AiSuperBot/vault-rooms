@@ -380,6 +380,22 @@ describe("room folder", () => {
     expect(a.notices.some((n) => n.includes("keeps its old name"))).toBe(true);
   });
 
+  it("shares notes with Windows line endings as the editor sees them, without rewriting the file", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Win.md", "one\r\ntwo\r\n");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    const [id] = [...a.replica.files().keys()];
+    expect(a.replica.noteText(id!)).toBe("one\ntwo\n");
+    expect(text(a.vault, "Team/Win.md")).toBe("one\r\ntwo\r\n");
+    await a.vault.writeText("Team/Win.md", "one\r\ntwo\r\nthree\r\n");
+    await s.settle();
+    expect(a.replica.noteText(id!)).toBe("one\ntwo\nthree\n");
+  });
+
   it("leaves notes open in an editor to the editor", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

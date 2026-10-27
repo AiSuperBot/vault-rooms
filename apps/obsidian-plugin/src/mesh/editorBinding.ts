@@ -164,6 +164,11 @@ export class EditorBinding {
    */
   private bind(view: EditorView, target: BindTarget, disk: string | null): boolean {
     const editorText = view.state.doc.toString();
+    // An editor holds "\n" line endings only; the shared text has to match it character for character.
+    if (target.ytext.toString().includes("\r")) {
+      if (target.readOnly) return true; // left unbound: a reader can't fix the shared text
+      reconcileYTextWithDiskText(target.ytext, target.ytext.toString().replace(/\r\n?/g, "\n"), "editor");
+    }
     const sharedText = target.ytext.toString();
     if (editorText !== sharedText) {
       if (disk === null || editorText !== disk) return false;
