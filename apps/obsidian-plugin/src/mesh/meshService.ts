@@ -239,13 +239,11 @@ export class MeshService {
     });
     this.server = new PeerServer(config, (link) => this.manager?.accept(link), (reason, address) => this.deps.log(`refused ${address}: ${reason}`));
     this.port = await this.listen(this.settings.port || DEFAULT_PORT);
-    if (this.stopped) {
-      await this.server?.close();
-      return;
-    }
+    if (this.stopped) return this.abandonStart();
     if (this.port !== this.settings.port) {
       this.settings.port = this.port;
       await this.deps.save();
+      if (this.stopped) return this.abandonStart();
     }
     this.manager.start();
     if (this.adoptFirstLink) {
@@ -261,15 +259,18 @@ export class MeshService {
       onPeer: (device, host, port) => this.manager?.candidate(device, host, port)
     });
     await this.discovery.start();
-    if (this.stopped) {
-      this.discovery.stop();
-      this.manager.stop();
-      return;
-    }
+    if (this.stopped) return this.abandonStart();
     const timer = setInterval(() => this.automateSoon(), 30_000);
     this.timers.push(timer);
     this.automateSoon();
     this.emit();
+  }
+
+  /** Stopped while starting: close what was opened (stop() closed what existed when it ran). */
+  private async abandonStart(): Promise<void> {
+    this.discovery?.stop();
+    this.manager?.stop();
+    await this.server?.close();
   }
 
   private async listen(preferred: number): Promise<number> {
@@ -411,15 +412,14 @@ export class MeshService {
           Object.assign(state, rebaseChange(base, version.body.state, state));
           for (const [roomId, key] of keys) {
             const room = state.rooms[roomId];
-            if (!room || room.deleted) continue;
+            if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
             const n = room.epochs.length + 1;
             room.epochs.push({ n, commit: keyCommitment(this.settings.id, roomId, n, key) });
           }
         });
         for (const [roomId, key] of keys) {
-          const epochs = this.node.chain.state.rooms[roomId]?.epochs ?? [];
-          const epoch = epochs[epochs.length - 1];
-          if (epoch && epoch.commit === keyCommitment(this.settings.id, roomId, epoch.n, key)) await this.keepKey(roomId, epoch.n, key);
+          const epoch = this.node.chain.state.rooms[roomId]?.epochs.find((e) => e.commit === keyCommitment(this.settings.id, roomId, e.n, key));
+          if (epoch) await this.keepKey(roomId, epoch.n, key);
         }
       } catch {
         failed.push(String(version.body.v));

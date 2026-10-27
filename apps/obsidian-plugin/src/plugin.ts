@@ -22,6 +22,18 @@ export interface PluginSettings {
 const STOPPING = Symbol.for("vault-rooms.stopping");
 const shared = globalThis as unknown as Record<symbol, Promise<void> | undefined>;
 
+/** Resolves once `promise` settles, or after `ms` at most. */
+function within(promise: Promise<unknown> | undefined, ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(resolve, ms);
+    const done = () => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    void Promise.resolve(promise).then(done, done);
+  });
+}
+
 function randomScope(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => (b % 36).toString(36)).join("");
 }
@@ -50,10 +62,15 @@ export default class VaultRoomsPlugin extends Plugin {
   private pendingMounts = new Set<string>();
 
   async onload(): Promise<void> {
+    // An instance of the plugin still stopping (updated, or turned off and on) finishes writing before this one reads
+    // anything (a while at most: one that hangs doesn't keep this one from starting).
+    await within(shared[STOPPING], 15_000);
+    if (this.unloaded) return;
     await this.loadSettings();
     this.editors = new EditorBinding(
       (path) => this.bindTarget(path),
-      (delayMs) => this.syncEditorsSoon(delayMs)
+      (delayMs) => this.syncEditorsSoon(delayMs),
+      (roomId, fileId, text) => this.folders.get(roomId)?.editorLeft(fileId, text)
     );
     this.registerEditorExtension(this.editors.extension());
     this.registerView(ROOMS_VIEW, (leaf) => new RoomsView(leaf, this));
@@ -73,8 +90,9 @@ export default class VaultRoomsPlugin extends Plugin {
     // Editors: bind every open note of a room, whichever pane it is in.
     for (const event of ["active-leaf-change", "file-open", "layout-change"] as const) this.registerEvent(this.app.workspace.on(event as "layout-change", () => this.syncEditors()));
 
-    // An instance of the plugin still stopping (updated, or turned off and on) finishes writing before this one reads.
-    this.app.workspace.onLayoutReady(() => void Promise.resolve(shared[STOPPING]).then(() => (this.unloaded ? undefined : this.startService())));
+    this.app.workspace.onLayoutReady(() => {
+      if (!this.unloaded) void this.startService();
+    });
   }
 
   private unloaded = false;
@@ -85,7 +103,7 @@ export default class VaultRoomsPlugin extends Plugin {
     // Obsidian doesn't wait for this: the next instance waits for it instead (see onload). A start under way gives up
     // first, so nothing of this instance goes (or stays) online after it.
     this.unloaded = true;
-    const done = Promise.all([shared[STOPPING], this.starting.then(() => this.stopService())]).then(
+    const done = Promise.all([shared[STOPPING], within(this.starting, 10_000).then(() => this.stopService())]).then(
       () => {},
       (error: Error) => console.debug(`Vault Rooms: stopping: ${error.message}`)
     );
@@ -196,7 +214,7 @@ export default class VaultRoomsPlugin extends Plugin {
 
   private async stopFolders(): Promise<void> {
     for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
-    this.editors.unbindAll();
+    this.editors?.unbindAll();
     await Promise.all([...this.folders.values()].map((folder) => folder.stop()));
     this.folders.clear();
     // Folders let go of earlier (a room re-made, a folder moved) finish too.
