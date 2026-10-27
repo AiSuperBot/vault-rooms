@@ -18,8 +18,10 @@ export interface BindTarget {
   ytext: Y.Text;
   presence: RoomPresence;
   readOnly: boolean;
-  /** Hash of the content last synced to disk, to tell unsaved local text from an outdated copy. */
-  syncedHash: string | null;
+  /** Whether a text (by hash) came from the shared note: last synced to the note's file, or being written to it. */
+  fromShared(hash: string): boolean;
+  /** Everything held for the note is readable: only then is an editor bound to it (one already bound stays). */
+  complete: boolean;
 }
 
 interface Bound {
@@ -94,6 +96,16 @@ function sha(text: string): string {
   return createHash("sha256").update(Buffer.from(text, "utf8")).digest("base64url");
 }
 
+/**
+ * Whether binding an editor, which replaces what it shows with the shared text, can't lose anything: it shows the
+ * shared text already, or its file's text (`disk`) and that text came from the shared note. Anything else is a note
+ * still loading, typing not saved yet, or a change made while not co-edited, which the room folder shares (or keeps
+ * as a copy) first.
+ */
+export function safeToBind(editor: string, shared: string, disk: string | null, fromShared: (hash: string) => boolean): boolean {
+  return editor === shared || (disk !== null && editor === disk && fromShared(sha(disk)));
+}
+
 export class EditorBinding {
   readonly compartment = new Compartment();
   private bound = new Map<EditorView, Bound>();
@@ -134,9 +146,9 @@ export class EditorBinding {
    * Bring the bindings in line with the editors that are open now. Safe to call often. `disk` is the note's text as
    * the file holds it, for editors not bound yet (null if unknown).
    */
-  sync(open: Array<{ path: string; view: EditorView; disk: string | null; synced?: string | null }>): void {
-    const targets = new Map<EditorView, { target: BindTarget | null; disk: string | null; synced?: string | null }>();
-    for (const { path, view, disk, synced } of open) targets.set(view, { target: this.resolve(path), disk, synced });
+  sync(open: Array<{ path: string; view: EditorView; disk: string | null }>): void {
+    const targets = new Map<EditorView, { target: BindTarget | null; disk: string | null }>();
+    for (const { path, view, disk } of open) targets.set(view, { target: this.resolve(path), disk });
     for (const [view, bound] of [...this.bound]) {
       const target = targets.get(view)?.target;
       // The editor's state was replaced (a file was loaded into it): the binding is gone, make it again.
@@ -147,32 +159,25 @@ export class EditorBinding {
       if (!targets.has(view) || !target || target.ytext !== bound.ytext || target.readOnly !== bound.readOnly) this.unbind(view);
     }
     let waiting = false;
-    for (const [view, { target, disk, synced }] of targets) {
-      if (!target || this.bound.has(view)) continue;
-      if (!this.bind(view, target, disk, synced === undefined ? target.syncedHash : synced)) waiting = true;
+    for (const [view, { target, disk }] of targets) {
+      if (!target || !target.complete || this.bound.has(view)) continue;
+      if (!this.bind(view, target, disk)) waiting = true;
     }
     if (waiting) this.requestSync(500);
   }
 
   /**
-   * Binding shows the shared text in the editor. What the editor held first is only folded into the shared text when
-   * it is exactly the file's text and that text was never shared (changed while not co-edited). An editor holding
-   * anything else is still loading the file, or has typing not saved yet: it is left alone and bound a moment later,
-   * once it matches its file (Obsidian saves typing within seconds), so neither half-loaded nor stale text can ever
-   * take anything away from the shared note.
+   * Binding shows the shared text in the editor, only once that can't lose anything the editor holds (safeToBind);
+   * until then the editor is left alone and tried again a moment later. Nothing an editor holds is ever taken into the
+   * shared text here, so neither half-loaded nor stale text can take anything away from the shared note.
    */
-  private bind(view: EditorView, target: BindTarget, disk: string | null, synced: string | null): boolean {
-    const editorText = view.state.doc.toString();
+  private bind(view: EditorView, target: BindTarget, disk: string | null): boolean {
     // An editor holds "\n" line endings only; the shared text has to match it character for character.
     if (target.ytext.toString().includes("\r")) {
       if (target.readOnly) return true; // left unbound: a reader can't fix the shared text
       reconcileYTextWithDiskText(target.ytext, target.ytext.toString().replace(/\r\n?/g, "\n"), "editor");
     }
-    const sharedText = target.ytext.toString();
-    if (editorText !== sharedText) {
-      if (disk === null || editorText !== disk) return false;
-      if (!target.readOnly && synced !== null && sha(disk) !== synced) reconcileYTextWithDiskText(target.ytext, editorText, "editor");
-    }
+    if (!safeToBind(view.state.doc.toString(), target.ytext.toString(), disk, target.fromShared)) return false;
     const undo = new Y.UndoManager(target.ytext);
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
     const now = view.state.doc.toString();
