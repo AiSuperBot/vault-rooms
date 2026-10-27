@@ -1,10 +1,13 @@
 import { networkInterfaces } from "node:os";
 import {
   activeDevice,
+  canonicalJson,
   createGenesis,
+  deviceIdFor,
   Discovery,
   foldJoinInto,
   formatInviteLink,
+  INDEX_DOC,
   JOIN_EXPIRY_SLACK_MS,
   joinWorkspace,
   keyCommitment,
@@ -17,6 +20,7 @@ import {
   PeerManager,
   PeerServer,
   randomId,
+  rebaseChange,
   roleAtLeast,
   roleIn,
   RoomReplica,
@@ -45,8 +49,8 @@ export interface WorkspaceSettings {
   port: number;
   /** Peers given by address ("host:port"), for networks where discovery doesn't reach. */
   peers: string[];
-  /** Rooms shown in this vault, and the folder each lives in. */
-  rooms: Record<string, { folder: string }>;
+  /** Rooms of this vault and the folder each lives in ("hidden": its folder was deleted here, so it isn't shown). */
+  rooms: Record<string, { folder: string; hidden?: true }>;
 }
 
 export interface MeshSettings {
@@ -67,6 +71,10 @@ export interface MeshDeps {
 }
 
 export const DEFAULT_PORT = 47880;
+/** Blobs no file uses any more are dropped after this long. */
+const BLOB_GRACE_MS = 7 * 86_400_000;
+/** How long a device may go without confirming a key before every holder sends it one. */
+const STEP_IN_MS = 60_000;
 
 export interface RoomInfo {
   id: string;
@@ -85,7 +93,8 @@ export class MeshService {
   private replicas = new Map<string, RoomReplica>();
   private replicaListeners = new Set<(roomId: string, replica: RoomReplica | null) => void>();
   private activityListeners = new Set<(roomId: string) => void>();
-  private refusedListeners = new Set<(roomId: string, docId: string) => void>();
+  private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
+  private lostRoomListeners = new Set<(roomId: string) => void>();
   private server: PeerServer | null = null;
   private manager: PeerManager | null = null;
   private discovery: Discovery | null = null;
@@ -96,6 +105,9 @@ export class MeshService {
   private automating = false;
   /** Keys of rooms this device just created, handed to the replica before anyone hears of it. */
   private ownKeys = new Map<string, { n: number; key: Uint8Array }>();
+  private quotaNoticeAt = new Map<string, number>();
+  /** Since when each (room, epoch, device) has been seen without a receipt for the key. */
+  private missingSince = new Map<string, number>();
   private stopped = false;
 
   private constructor(
@@ -115,7 +127,7 @@ export class MeshService {
     };
     events.wraps = () => {
       this.saveSoon("wraps", () => this.disk.saveWraps(this.node.allWraps()));
-      for (const [roomId, replica] of this.replicas) if (replica.refreshKeys()) this.roomActivity(roomId);
+      this.refreshKeys();
       this.automateSoon();
       this.emit();
     };
@@ -129,7 +141,11 @@ export class MeshService {
       for (const listener of this.presenceListeners) listener(env);
     };
     events.sessions = () => this.emit();
-    events.rejected = (reason, from) => this.deps.log(`refused from ${from}: ${reason}`);
+    events.rejected = (reason, from) => {
+      this.deps.log(`refused from ${from}: ${reason}`);
+      if (reason.startsWith("quota:")) this.quotaNotice(reason.slice(6));
+    };
+    node.persist = (env) => this.disk.persisted(env);
   }
 
   // ---- creating, joining, opening ----
@@ -140,7 +156,7 @@ export class MeshService {
 
   static async create(deps: MeshDeps, input: { workspaceName: string; userName: string; deviceName: string }): Promise<MeshService> {
     if (deps.settings.workspace) throw new MeshServiceError("This vault already belongs to a workspace.");
-    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope, input.deviceName);
+    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope);
     const { genesis, workspaceId, userId, deviceId } = createGenesis({
       workspaceName: input.workspaceName,
       userName: input.userName,
@@ -158,7 +174,7 @@ export class MeshService {
   static async join(deps: MeshDeps, input: { link: string; userName: string; deviceName: string; peers?: string[] }): Promise<MeshService> {
     if (deps.settings.workspace) throw new MeshServiceError("This vault already belongs to a workspace.");
     const invite = parseInviteLink(input.link);
-    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope, input.deviceName);
+    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope);
     const extraPeers = (input.peers ?? []).map(parseAddress).filter((a): a is { host: string; port: number } => a !== null);
     let joined: Awaited<ReturnType<typeof joinWorkspace>>;
     try {
@@ -185,6 +201,7 @@ export class MeshService {
     if (!settings) return null;
     const secrets = loadDeviceSecrets(deps.secrets, deps.settings.scope, settings.certPem);
     if (!secrets) throw new MeshServiceError("This device's keys are missing (was the vault copied from another computer?). Leave the workspace and join again from this computer.");
+    if (deviceIdFor(secrets.sign.publicKey) !== settings.deviceId) throw new MeshServiceError("This device's keys don't belong to this vault's workspace. Leave the workspace and join again from this computer.");
     const disk = MeshService.diskFor(deps, settings.id);
     const versions = await disk.loadChain();
     if (!versions) throw new MeshServiceError("The workspace record is missing from this vault.");
@@ -197,6 +214,15 @@ export class MeshService {
     node.restore(await disk.loadJoins(), await disk.loadWraps());
     service.syncReplicas();
     return service;
+  }
+
+  /** Leave when the workspace can't even be opened: delete its data and this device's keys, and forget it. */
+  static async forgetUnopened(deps: MeshDeps): Promise<void> {
+    const settings = deps.settings.workspace;
+    if (settings) await MeshService.diskFor(deps, settings.id).wipe();
+    forgetDeviceSecrets(deps.secrets, deps.settings.scope);
+    deps.settings.workspace = null;
+    await deps.save();
   }
 
   // ---- running ----
@@ -296,10 +322,16 @@ export class MeshService {
     return () => this.activityListeners.delete(listener);
   }
 
-  /** A local edit was refused (this user may only read): rebuild the document from the shared history. */
-  onLocalRefused(listener: (roomId: string, docId: string) => void): () => void {
+  /** An editor's change couldn't be shared ("read_only", "too_large", "publish_refused", ...). */
+  onLocalRefused(listener: (roomId: string, docId: string, code: string) => void): () => void {
     this.refusedListeners.add(listener);
     return () => this.refusedListeners.delete(listener);
+  }
+
+  /** A room this device created didn't survive a conflict and couldn't be made again. */
+  onLostRoom(listener: (roomId: string) => void): () => void {
+    this.lostRoomListeners.add(listener);
+    return () => this.lostRoomListeners.delete(listener);
   }
 
   private roomActivity(roomId: string): void {
@@ -308,6 +340,14 @@ export class MeshService {
 
   private emit(): void {
     for (const listener of this.listeners) listener();
+  }
+
+  private quotaNotice(roomId: string): void {
+    const last = this.quotaNoticeAt.get(roomId) ?? 0;
+    if (Date.now() - last < 3_600_000 || !this.replicas.has(roomId)) return;
+    this.quotaNoticeAt.set(roomId, Date.now());
+    const name = this.rooms().find((room) => room.id === roomId)?.name ?? "a room";
+    this.deps.notify(`"${name}" has reached its storage limit on this computer; new changes to it aren't stored or shared.`);
   }
 
   private saveSoon(key: string, save: () => Promise<void>): void {
@@ -323,13 +363,38 @@ export class MeshService {
 
   private onChain(result: OfferResult): void {
     this.saveSoon("chain", () => this.disk.saveChain(this.node.chain.all()));
-    if (result.status === "replaced") {
-      const mine = result.lost.filter((version) => version.body.by === this.settings.deviceId);
-      if (mine.length > 0) this.deps.notify("A change you made to the workspace happened at the same time as another admin's, and theirs was kept. Please check it and make your change again.");
-    }
+    this.refreshKeys();
+    // After the node has finished taking in the winning branch.
+    if (result.status === "replaced") void Promise.resolve().then(() => this.reapply(result.lost));
     this.syncReplicas();
     this.automateSoon();
     this.emit();
+  }
+
+  /** Keys are checked against the record whenever it changes: one it no longer backs is dropped (see RoomReplica). */
+  private refreshKeys(): void {
+    for (const [roomId, replica] of this.replicas) if (replica.refreshKeys()) this.roomActivity(roomId);
+  }
+
+  /**
+   * Our versions that lost a race to someone else's are made again on top of the winner, change by change. Joins and
+   * key rotations are left to the automation, which redoes them if they are still needed.
+   */
+  private async reapply(lost: SignedVersion[]): Promise<void> {
+    const failed: string[] = [];
+    for (let i = 0; i < lost.length; i++) {
+      const version = lost[i]!;
+      if (version.body.by !== this.settings.deviceId || version.body.joins) continue;
+      const base = i === 0 ? this.node.chain.versionAt(version.body.v - 1)?.body.state : lost[i - 1]!.body.state;
+      if (!base) continue;
+      try {
+        await this.commit((state) => Object.assign(state, rebaseChange(base, version.body.state, state)));
+      } catch {
+        failed.push(String(version.body.v));
+        for (const roomId of Object.keys(version.body.state.rooms)) if (!base.rooms[roomId] && !this.node.chain.state.rooms[roomId]) for (const listener of this.lostRoomListeners) listener(roomId);
+      }
+    }
+    if (failed.length > 0) this.deps.notify("A change you made to the workspace clashed with someone else's at the same moment and couldn't be made again. Please check it and make it again if it's still needed.");
   }
 
   // ---- state for the UI ----
@@ -352,6 +417,14 @@ export class MeshService {
 
   isAdmin(): boolean {
     return this.isMember() && this.state.users[this.settings.userId]?.admin === true;
+  }
+
+  /** Whether this is the only active device of the only admin (leaving would leave the workspace without one). */
+  isLastAdminDevice(): boolean {
+    const state = this.state;
+    if (!this.isAdmin()) return false;
+    const adminDevices = Object.entries(state.devices).filter(([deviceId, device]) => activeDevice(state, deviceId) && state.users[device.user]?.admin);
+    return adminDevices.length === 1;
   }
 
   connectedDevices(): string[] {
@@ -392,48 +465,65 @@ export class MeshService {
 
   // ---- changes to the workspace record ----
 
-  private async commit(change: (state: WorkspaceState) => void, joins: JoinRecord[] = []): Promise<SignedVersion> {
-    const version = nextVersion(this.settings.id, this.node.chain.head, this.secrets.sign, change, Date.now(), joins);
+  /** Sign and apply a change, and store the record before returning. A change that changes nothing isn't made. */
+  private async commit(change: (state: WorkspaceState) => void, joins: JoinRecord[] = []): Promise<SignedVersion | null> {
+    const head = this.node.chain.head;
+    const draft = structuredClone(head.body.state);
+    change(draft);
+    if (joins.length === 0 && canonicalJson(draft) === canonicalJson(head.body.state)) return null;
+    const version = nextVersion(this.settings.id, head, this.secrets.sign, change, Date.now(), joins);
     const result = this.node.offerVersions([version]);
     if (result.status !== "appended") throw new MeshServiceError(`The change wasn't applied (${result.status === "rejected" ? result.reason : result.status}).`);
+    await this.disk.saveChain(this.node.chain.all());
     return version;
+  }
+
+  /**
+   * A key this device made: give it to the replica, and wrap it to this device itself, stored before this returns, so
+   * a crash right after can't lose the only copy.
+   */
+  private async keepKey(roomId: string, n: number, key: Uint8Array): Promise<void> {
+    this.replicas.get(roomId)?.addOwnKey(n, key);
+    this.node.addWrap(wrapRoomKey(this.settings.id, roomId, n, key, { id: this.settings.deviceId, agree: this.secrets.agree.publicKey }, this.secrets.sign));
+    await this.disk.saveWraps(this.node.allWraps());
   }
 
   async createRoom(name: string, members: Record<string, Role> = {}, roomId = randomId("r")): Promise<string> {
     const key = newRoomKey();
     this.ownKeys.set(roomId, { n: 1, key });
-    await this.commit((state) => {
-      state.rooms[roomId] = {
-        creator: this.settings.userId,
-        name: sealRoomName(this.settings.id, roomId, 1, key, name),
-        members: { ...members, [this.settings.userId]: "manage" },
-        epochs: [{ n: 1, commit: keyCommitment(this.settings.id, roomId, 1, key) }]
-      };
-    });
-    this.syncReplicas();
-    this.ownKeys.delete(roomId);
+    try {
+      await this.commit((state) => {
+        state.rooms[roomId] = {
+          creator: this.settings.userId,
+          name: sealRoomName(this.settings.id, roomId, 1, key, name),
+          members: { ...members, [this.settings.userId]: "manage" },
+          epochs: [{ n: 1, commit: keyCommitment(this.settings.id, roomId, 1, key) }]
+        };
+      });
+      this.syncReplicas();
+      await this.keepKey(roomId, 1, key);
+    } finally {
+      this.ownKeys.delete(roomId);
+    }
     this.automateSoon();
     return roomId;
   }
 
   /** Add, change or (with null) remove a member. Removing someone also starts a new room key, in the same change. */
   async setMember(roomId: string, userId: string, role: Role | null): Promise<void> {
-    let rotated: { n: number; key: Uint8Array } | null = null;
+    const room = this.node.chain.state.rooms[roomId];
+    if (!room) throw new MeshServiceError("No such room.");
+    const rotation = role ? null : { n: room.epochs.length + 1, key: newRoomKey() };
     await this.commit((state) => {
-      const room = state.rooms[roomId];
-      if (!room) throw new MeshServiceError("No such room.");
+      const next = state.rooms[roomId]!;
       if (role) {
-        room.members[userId] = role;
+        next.members[userId] = role;
         return;
       }
-      delete room.members[userId];
-      const n = room.epochs.length + 1;
-      const key = newRoomKey();
-      room.epochs.push({ n, commit: keyCommitment(this.settings.id, roomId, n, key) });
-      rotated = { n, key };
+      delete next.members[userId];
+      next.epochs.push({ n: rotation!.n, commit: keyCommitment(this.settings.id, roomId, rotation!.n, rotation!.key) });
     });
-    const done = rotated as { n: number; key: Uint8Array } | null;
-    if (done) this.replicas.get(roomId)?.addOwnKey(done.n, done.key);
+    if (rotation) await this.keepKey(roomId, rotation.n, rotation.key);
     this.automateSoon();
   }
 
@@ -451,9 +541,8 @@ export class MeshService {
   }
 
   async renameRoom(roomId: string, name: string): Promise<void> {
-    const replica = this.replicas.get(roomId);
-    const epoch = replica?.currentEpoch();
-    if (!epoch) throw new MeshServiceError("This device doesn't have the room's key yet.");
+    const epoch = this.replicas.get(roomId)?.sealEpoch();
+    if (!epoch) throw new MeshServiceError("This device doesn't have the room's newest key yet.");
     await this.commit((state) => {
       const room = state.rooms[roomId];
       if (room) room.name = sealRoomName(this.settings.id, roomId, epoch.n, epoch.key, name);
@@ -462,7 +551,7 @@ export class MeshService {
 
   /** An invite link for a new person, granting `rooms` (rooms this user manages). */
   async createInvite(rooms: Record<string, Role>, days = 3): Promise<string> {
-    const invite = newInvite(this.settings.userId, rooms, this.recordTime() + days * 86_400_000);
+    const invite = newInvite({ user: this.settings.userId, device: this.settings.deviceId }, rooms, this.recordTime() + days * 86_400_000);
     await this.commit((state) => {
       state.invites[invite.inviteId] = invite.record;
     });
@@ -471,7 +560,7 @@ export class MeshService {
 
   /** An invite link for another computer of your own. */
   async createDeviceInvite(days = 1): Promise<string> {
-    const invite = newInvite(this.settings.userId, {}, this.recordTime() + days * 86_400_000, this.settings.userId);
+    const invite = newInvite({ user: this.settings.userId, device: this.settings.deviceId }, {}, this.recordTime() + days * 86_400_000, this.settings.userId);
     await this.commit((state) => {
       state.invites[invite.inviteId] = invite.record;
     });
@@ -484,17 +573,21 @@ export class MeshService {
     });
   }
 
+  /** Revoke a device, and withdraw the open invites it made. */
   async revokeDevice(deviceId: string): Promise<void> {
     await this.commit((state) => {
       const device = state.devices[deviceId];
       if (device) device.revoked = true;
+      for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.dev === deviceId && invite.used === undefined) delete state.invites[inviteId];
     });
   }
 
+  /** Remove a person, and withdraw the open invites they made. */
   async removeUser(userId: string): Promise<void> {
     await this.commit((state) => {
       const user = state.users[userId];
       if (user) user.removed = true;
+      for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.by === userId && invite.used === undefined) delete state.invites[inviteId];
     });
   }
 
@@ -541,9 +634,9 @@ export class MeshService {
     for (const roomId of mine) {
       if (this.replicas.has(roomId)) continue;
       const replica = new RoomReplica(this.node, roomId, { sign: this.secrets.sign, agree: this.secrets.agree }, {
-        // A local edit that can't be shared (a reader, or access just ended): the owner rebuilds that document.
-        localRefused: (docId) => {
-          for (const listener of this.refusedListeners) listener(roomId, docId);
+        // An editor's change that can't be shared (a reader, too large, the room full): the owner decides what to do.
+        localRefused: (docId, code) => {
+          for (const listener of this.refusedListeners) listener(roomId, docId, code);
         }
       });
       const own = this.ownKeys.get(roomId);
@@ -572,6 +665,7 @@ export class MeshService {
       await this.rotateWhereNeeded();
       await this.recordJoins();
       await this.withdrawExpiredInvites();
+      this.collectBlobs();
     } catch (error) {
       this.deps.log(`automation: ${(error as Error).message}`);
     } finally {
@@ -584,33 +678,62 @@ export class MeshService {
     return device !== null && roleIn(state, roomId, device.user) !== undefined;
   }
 
+  /**
+   * Devices that have shown they hold a room key: each device wraps a key it obtained to itself, as a receipt. A wrap
+   * someone else sent proves nothing (it could carry a wrong key), so only receipts count.
+   */
+  private holders(roomId: string, n: number): Set<string> {
+    return new Set(
+      this.node
+        .allWraps()
+        .filter((w) => w.body.room === roomId && w.body.n === n && w.body.to === w.body.by)
+        .map((w) => w.body.to)
+    );
+  }
+
   /** Of the devices that hold a room key and are online right now, the lowest id hands it out (fewer duplicates). */
   private isWrapper(roomId: string, n: number): boolean {
     const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
-    const holders = new Set(this.node.allWraps().filter((w) => w.body.room === roomId && w.body.n === n).map((w) => w.body.to));
+    const holders = this.holders(roomId, n);
     holders.add(this.settings.deviceId);
     const candidates = [...holders].filter((device) => online.has(device)).sort();
     return candidates[0] === this.settings.deviceId;
   }
 
-  /** Wrap every room key this device holds for every device entitled to it that has no wrap yet (itself included). */
+  /**
+   * Every key this device holds goes to every entitled device that hasn't confirmed holding it (no receipt yet),
+   * once from each wrapper; and this device files its own receipt. The lowest online holder wraps at once; every
+   * other holder steps in once a device has gone without a receipt for a while, so no single member (who might send
+   * a wrong key, or nothing) can keep a key from anyone.
+   */
   private ensureWraps(): void {
     const state = this.state;
-    const wrapped = new Set(this.node.allWraps().map((w) => `${w.body.room}/${w.body.n}/${w.body.to}`));
+    const now = Date.now();
+    const mine = new Set(this.node.allWraps().filter((w) => w.body.by === this.settings.deviceId).map((w) => `${w.body.room}/${w.body.n}/${w.body.to}`));
+    const stillMissing = new Map<string, number>();
     for (const [roomId, replica] of this.replicas) {
       const room = state.rooms[roomId];
       if (!room) continue;
       for (const epoch of room.epochs) {
         const key = replica.keyFor(epoch.n);
         if (!key) continue;
+        const holders = this.holders(roomId, epoch.n);
+        const wrapper = this.isWrapper(roomId, epoch.n);
         for (const [deviceId, device] of Object.entries(state.devices)) {
-          if (!this.entitled(state, roomId, deviceId) || wrapped.has(`${roomId}/${epoch.n}/${deviceId}`)) continue;
-          if (deviceId !== this.settings.deviceId && !this.isWrapper(roomId, epoch.n)) continue;
-          this.node.addWrap(wrapRoomKey(this.settings.id, roomId, epoch.n, key, { id: deviceId, agree: device.agree }, this.secrets.sign));
-          wrapped.add(`${roomId}/${epoch.n}/${deviceId}`);
+          const slot = `${roomId}/${epoch.n}/${deviceId}`;
+          if (holders.has(deviceId) || mine.has(slot) || !this.entitled(state, roomId, deviceId)) continue;
+          const since = this.missingSince.get(slot) ?? now;
+          stillMissing.set(slot, since);
+          if (deviceId !== this.settings.deviceId && !wrapper && now - since < STEP_IN_MS) continue;
+          try {
+            this.node.addWrap(wrapRoomKey(this.settings.id, roomId, epoch.n, key, { id: deviceId, agree: device.agree }, this.secrets.sign));
+          } catch (error) {
+            this.deps.log(`wrap for ${deviceId}: ${(error as Error).message}`);
+          }
         }
       }
     }
+    this.missingSince = stillMissing;
   }
 
   /**
@@ -624,7 +747,7 @@ export class MeshService {
       if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
       const n = room.epochs.length;
       const stale = this.node.allWraps().some((w) => w.body.room === roomId && w.body.n === n && !this.entitled(state, roomId, w.body.to));
-      if (!stale) continue;
+      if (!stale || !replica.keyFor(n)) continue;
       const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
       const writers = Object.entries(state.devices)
         .filter(([deviceId, device]) => online.has(deviceId) && activeDevice(state, deviceId) && roleAtLeast(roleIn(state, roomId, device.user), "write"))
@@ -635,7 +758,7 @@ export class MeshService {
       await this.commit((next) => {
         next.rooms[roomId]!.epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) });
       });
-      replica.addOwnKey(n + 1, key);
+      await this.keepKey(roomId, n + 1, key);
       this.ensureWraps();
     }
   }
@@ -664,6 +787,34 @@ export class MeshService {
     await this.commit((state) => {
       for (const [inviteId] of expired) delete state.invites[inviteId];
     });
+  }
+
+  /**
+   * Blobs no file of the room uses any more (older versions, deleted files) are dropped after a grace period, and a
+   * blob a file needs again is fetched again. Only with the whole index decrypted, so nothing in use is ever taken.
+   */
+  private collectBlobs(): void {
+    const store = this.node.store;
+    let refetch = false;
+    for (const [roomId, replica] of this.replicas) {
+      if (!replica.isComplete(INDEX_DOC) || replica.epochsMissing().length > 0) continue;
+      const used = new Set<string>();
+      for (const entry of replica.files().values()) if (entry.blob) used.add(`${entry.blob.by}/${entry.blob.id}`);
+      const cutoff = Date.now() - BLOB_GRACE_MS;
+      store.dropBlobs(
+        roomId,
+        store
+          .blobsOf(roomId)
+          .filter((meta) => meta.at < cutoff && !used.has(`${meta.author}/${meta.id}`))
+          .map((meta) => `${meta.author}/${meta.id}`)
+      );
+      for (const [key] of store.gone(roomId)) {
+        if (!used.has(key)) continue;
+        store.undrop(roomId, key);
+        refetch = true;
+      }
+    }
+    if (refetch) this.node.resync();
   }
 }
 

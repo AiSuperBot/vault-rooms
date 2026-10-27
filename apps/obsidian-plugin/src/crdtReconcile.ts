@@ -25,11 +25,20 @@ export type DiffOp = { op: "equal" | "delete" | "insert"; text: string };
  *  the whole differing region - still converges, just without minimal per-region granularity. */
 const MAX_DIFF_CELLS = 1_000_000;
 
-function lcsDiff(a: string, b: string): DiffOp[] {
+function isHighSurrogate(unit: number): boolean {
+  return unit >= 0xd800 && unit <= 0xdbff;
+}
+
+function isLowSurrogate(unit: number): boolean {
+  return unit >= 0xdc00 && unit <= 0xdfff;
+}
+
+/** Works on code points (not UTF-16 units), so an edit never splits a surrogate pair (an emoji, say) in two. */
+function lcsDiff(a: string[], b: string[]): DiffOp[] {
   const n = a.length;
   const m = b.length;
-  if (n === 0) return m ? [{ op: "insert", text: b }] : [];
-  if (m === 0) return n ? [{ op: "delete", text: a }] : [];
+  if (n === 0) return m ? [{ op: "insert", text: b.join("") }] : [];
+  if (m === 0) return n ? [{ op: "delete", text: a.join("") }] : [];
 
   const dp: Uint32Array[] = new Array<Uint32Array>(n + 1);
   for (let i = 0; i <= n; i++) {
@@ -91,13 +100,15 @@ export function computeTextDiff(a: string, b: string): DiffOp[] {
   if (a === b) {
     return a ? [{ op: "equal", text: a }] : [];
   }
-  if (a.length * b.length > MAX_DIFF_CELLS) {
+  const ca = Array.from(a);
+  const cb = Array.from(b);
+  if (ca.length * cb.length > MAX_DIFF_CELLS) {
     const ops: DiffOp[] = [];
     if (a) ops.push({ op: "delete", text: a });
     if (b) ops.push({ op: "insert", text: b });
     return ops;
   }
-  return lcsDiff(a, b);
+  return lcsDiff(ca, cb);
 }
 
 /**
@@ -123,12 +134,15 @@ export function reconcileYTextWithDiskText(ytext: Y.Text, diskText: string, orig
   while (prefix < maxPrefix && oldText[prefix] === diskText[prefix]) {
     prefix++;
   }
+  // Never cut a surrogate pair (an emoji, say) in two: half of one can't be stored or sent.
+  if (prefix > 0 && isHighSurrogate(oldText.charCodeAt(prefix - 1))) prefix--;
 
   let suffix = 0;
   const maxSuffix = Math.min(oldText.length, diskText.length) - prefix;
   while (suffix < maxSuffix && oldText[oldText.length - 1 - suffix] === diskText[diskText.length - 1 - suffix]) {
     suffix++;
   }
+  if (suffix > 0 && isLowSurrogate(oldText.charCodeAt(oldText.length - suffix))) suffix--;
 
   const oldMid = oldText.slice(prefix, oldText.length - suffix);
   const newMid = diskText.slice(prefix, diskText.length - suffix);

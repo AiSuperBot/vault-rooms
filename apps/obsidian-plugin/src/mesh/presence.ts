@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { fromUtf8, openEnvelope, sealPresence, utf8, type KeyPair, type PresenceEnvelope, type RoomReplica } from "@vault-rooms/secure";
+import { fromUtf8, isId, openEnvelope, sealPresence, utf8, type KeyPair, type PresenceEnvelope, type RoomReplica } from "@vault-rooms/secure";
 
 /**
  * Cursors of other people in a room's notes. A cursor travels as a presence envelope: encrypted with the room key,
@@ -24,6 +24,8 @@ interface Remote extends RenderState {
 const STALE_MS = 30_000;
 const RESEND_MS = 15_000;
 const SEND_EVERY_MS = 60;
+const MAX_NOTES = 1000;
+const MAX_CURSORS_PER_NOTE = 50;
 
 /** FNV-1a: stable across devices, so everyone sees the same colour for a person. */
 export function hueFor(userId: string): number {
@@ -122,7 +124,7 @@ export class RoomPresence {
   }
 
   private publishNow(fileId: string, clientId: number, cursor: LiveCursor | null): void {
-    const epoch = this.deps.replica.currentEpoch();
+    const epoch = this.deps.replica.sealEpoch();
     if (!epoch) return;
     const payload = { d: fileId, c: clientId, a: cursor ? Y.relativePositionToJSON(cursor.anchor) : null, h: cursor ? Y.relativePositionToJSON(cursor.head) : null };
     const at = Date.now();
@@ -141,14 +143,19 @@ export class RoomPresence {
     } catch {
       return;
     }
-    if (typeof payload.d !== "string" || !Number.isSafeInteger(payload.c)) return;
+    // Only notes of this room, and only so many cursors: what a member sends can't grow these maps without end.
+    if (!isId(payload.d, "f") || !Number.isSafeInteger(payload.c) || !this.deps.replica.index.has(payload.d)) return;
     const fileId = payload.d;
     const clientId = payload.c as number;
     const anchor = payload.a === null ? null : live(payload.a);
     const head = payload.h === null ? null : live(payload.h);
     let states = this.remote.get(fileId);
-    if (!states) this.remote.set(fileId, (states = new Map()));
+    if (!states) {
+      if (this.remote.size >= MAX_NOTES) return;
+      this.remote.set(fileId, (states = new Map()));
+    }
     const existed = states.has(clientId);
+    if (!existed && states.size >= MAX_CURSORS_PER_NOTE) return;
     if (payload.a === null || !anchor || !head) states.delete(clientId);
     else states.set(clientId, { user: { name: user.name, ...colours(user.id) }, cursor: { anchor, head }, at: Date.now() });
     const change: AwarenessChange = states.has(clientId) ? (existed ? { added: [], updated: [clientId], removed: [] } : { added: [clientId], updated: [], removed: [] }) : { added: [], updated: [], removed: [clientId] };
@@ -161,6 +168,7 @@ export class RoomPresence {
       const removed = [...states].filter(([, state]) => now - state.at > STALE_MS).map(([clientId]) => clientId);
       for (const clientId of removed) states.delete(clientId);
       if (removed.length > 0) for (const facade of this.facades.get(fileId) ?? []) facade.emit({ added: [], updated: [], removed });
+      if (states.size === 0) this.remote.delete(fileId);
     }
     // Keep our own cursor alive for others.
     for (const [fileId, sent] of this.lastSent) {

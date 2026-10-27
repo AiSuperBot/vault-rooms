@@ -147,6 +147,26 @@ describe("reconcileYTextWithDiskText", () => {
     return text.slice(0, start) + randomText(rand, insertLen) + text.slice(start + deleteLen);
   }
 
+  it("never splits an emoji, so what another computer receives is intact", () => {
+    for (const [before, after] of [
+      ["😀", "😃"],
+      ["a😀b", "a😃b"],
+      ["x\u{1F600}", "y\u{1F600}"],
+      ["\u{1F600}\u{1F601}", "\u{1F600}\u{1F602}"],
+      ["תכנית 👍", "תכנית 👎"]
+    ] as const) {
+      const local = new Y.Doc();
+      const text = local.getText("content");
+      text.insert(0, before);
+      const remote = new Y.Doc();
+      Y.applyUpdate(remote, Y.encodeStateAsUpdate(local));
+      local.on("update", (update: Uint8Array) => Y.applyUpdate(remote, update));
+      reconcileYTextWithDiskText(text, after, "disk");
+      expect(text.toString()).toBe(after);
+      expect(remote.getText("content").toString()).toBe(after);
+    }
+  });
+
   const FIXED_SEED = 424242;
 
   it(`converges to the exact target text across randomized reconciles (fixed seed ${FIXED_SEED})`, () => {

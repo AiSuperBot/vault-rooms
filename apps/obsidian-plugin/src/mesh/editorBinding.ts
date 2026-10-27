@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Compartment, EditorState, Prec, Transaction, type Extension } from "@codemirror/state";
+import { Compartment, EditorState, Prec, Transaction, type Extension, type Text } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import * as Y from "yjs";
 import { yCollab } from "y-codemirror.next";
@@ -43,6 +43,54 @@ const READ_ONLY: Extension = Prec.highest([
   EditorState.transactionFilter.of((tr) => (tr.docChanged && tr.annotation(Transaction.userEvent) !== undefined ? [] : tr))
 ]);
 
+/** Whether `pos` falls between the two halves of a surrogate pair (inside an emoji, say). */
+function splitsPair(doc: Text, pos: number): boolean {
+  if (pos <= 0 || pos >= doc.length) return false;
+  const pair = doc.sliceString(pos - 1, pos + 1);
+  const high = pair.charCodeAt(0);
+  const low = pair.charCodeAt(1);
+  return high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff;
+}
+
+/**
+ * A change that would cut a surrogate pair in two (Obsidian applies a file changed elsewhere as a minimal diff, which
+ * can replace half an emoji) is widened to whole characters, with the same result. The shared text can't hold half a
+ * pair: Yjs would turn both halves into U+FFFD, for everyone.
+ */
+export const WHOLE_CHARACTERS: Extension = EditorState.transactionFilter.of((tr) => {
+  if (!tr.docChanged) return tr;
+  const doc = tr.startState.doc;
+  let splits = false;
+  tr.changes.iterChanges((fromA, toA) => {
+    if (splitsPair(doc, fromA) || splitsPair(doc, toA)) splits = true;
+  });
+  if (!splits) return tr;
+  const changes: Array<{ from: number; to: number; insert: string }> = [];
+  tr.changes.iterChanges((fromA, toA, _fromB, _toB, inserted) => {
+    let from = fromA;
+    let to = toA;
+    let insert = inserted.toString();
+    if (splitsPair(doc, from)) insert = doc.sliceString(--from, fromA) + insert;
+    if (splitsPair(doc, to)) insert += doc.sliceString(to, ++to);
+    changes.push({ from, to, insert });
+  });
+  for (let i = 1; i < changes.length; i++) if (changes[i]!.from < changes[i - 1]!.to) return tr;
+  const userEvent = tr.annotation(Transaction.userEvent);
+  const addToHistory = tr.annotation(Transaction.addToHistory);
+  const remote = tr.annotation(Transaction.remote);
+  return {
+    changes,
+    selection: tr.selection,
+    effects: tr.effects,
+    scrollIntoView: tr.scrollIntoView,
+    annotations: [
+      ...(userEvent !== undefined ? [Transaction.userEvent.of(userEvent)] : []),
+      ...(addToHistory !== undefined ? [Transaction.addToHistory.of(addToHistory)] : []),
+      ...(remote !== undefined ? [Transaction.remote.of(remote)] : [])
+    ]
+  };
+});
+
 function sha(text: string): string {
   return createHash("sha256").update(Buffer.from(text, "utf8")).digest("base64url");
 }
@@ -54,7 +102,7 @@ export class EditorBinding {
   constructor(
     private readonly resolve: (vaultPath: string) => BindTarget | null,
     /** Ask the owner to call sync() soon (with the editors open then). */
-    private readonly requestSync: () => void
+    private readonly requestSync: (delayMs?: number) => void
   ) {}
 
   /**
@@ -78,12 +126,20 @@ export class EditorBinding {
     return false;
   }
 
-  /** Bring the bindings in line with the editors that are open now. Safe to call often. */
-  sync(open: Array<{ path: string; view: EditorView }>): void {
-    const targets = new Map<EditorView, BindTarget | null>();
-    for (const { path, view } of open) targets.set(view, this.resolve(path));
+  /** Whether an editor showing this note still has to be bound (so its file's text is needed for `sync`). */
+  needsBinding(view: EditorView): boolean {
+    return !this.bound.has(view) || this.compartment.get(view.state) !== this.bound.get(view)!.extension;
+  }
+
+  /**
+   * Bring the bindings in line with the editors that are open now. Safe to call often. `disk` is the note's text as
+   * the file holds it, for editors not bound yet (null if unknown).
+   */
+  sync(open: Array<{ path: string; view: EditorView; disk: string | null }>): void {
+    const targets = new Map<EditorView, { target: BindTarget | null; disk: string | null }>();
+    for (const { path, view, disk } of open) targets.set(view, { target: this.resolve(path), disk });
     for (const [view, bound] of [...this.bound]) {
-      const target = targets.get(view);
+      const target = targets.get(view)?.target;
       // The editor's state was replaced (a file was loaded into it): the binding is gone, make it again.
       if (this.compartment.get(view.state) !== bound.extension) {
         this.forget(view);
@@ -91,25 +147,33 @@ export class EditorBinding {
       }
       if (!targets.has(view) || !target || target.ytext !== bound.ytext || target.readOnly !== bound.readOnly) this.unbind(view);
     }
-    for (const [view, target] of targets) {
+    let waiting = false;
+    for (const [view, { target, disk }] of targets) {
       if (!target || this.bound.has(view)) continue;
-      this.bind(view, target);
+      if (!this.bind(view, target, disk)) waiting = true;
     }
+    if (waiting) this.requestSync(500);
   }
 
-  private bind(view: EditorView, target: BindTarget): void {
+  /**
+   * Binding shows the shared text in the editor. What the editor held first is only folded into the shared text when
+   * it is exactly the file's text and that text was never shared (changed while not co-edited). An editor holding
+   * anything else is still loading the file, or has typing not saved yet: it is left alone and bound a moment later,
+   * once it matches its file (Obsidian saves typing within seconds), so neither half-loaded nor stale text can ever
+   * take anything away from the shared note.
+   */
+  private bind(view: EditorView, target: BindTarget, disk: string | null): boolean {
     const editorText = view.state.doc.toString();
     const sharedText = target.ytext.toString();
-    // Text in the editor that was never synced is a local edit: fold it into the shared text first, so binding
-    // (which shows the shared text) can't throw it away. Otherwise the editor just shows an older copy.
-    if (editorText !== sharedText && !target.readOnly && target.syncedHash !== null && sha(editorText) !== target.syncedHash) {
-      reconcileYTextWithDiskText(target.ytext, editorText, "editor");
+    if (editorText !== sharedText) {
+      if (disk === null || editorText !== disk) return false;
+      if (!target.readOnly && target.syncedHash !== null && sha(disk) !== target.syncedHash) reconcileYTextWithDiskText(target.ytext, editorText, "editor");
     }
     const undo = new Y.UndoManager(target.ytext);
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
     const now = view.state.doc.toString();
     const shared = target.ytext.toString();
-    const extension: Extension = [yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
+    const extension: Extension = [WHOLE_CHARACTERS, yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
     try {
       view.dispatch({
         ...(now === shared ? {} : { changes: { from: 0, to: now.length, insert: shared } }),
@@ -118,9 +182,10 @@ export class EditorBinding {
     } catch {
       facade.destroy();
       undo.destroy();
-      return;
+      return true;
     }
     this.bound.set(view, { extension, roomId: target.roomId, fileId: target.fileId, ytext: target.ytext, readOnly: target.readOnly, facade, undo });
+    return true;
   }
 
   /** Drop our record of a binding whose editor state is gone (nothing to reconfigure). */
@@ -145,6 +210,11 @@ export class EditorBinding {
 
   unbindRoom(roomId: string): void {
     for (const [view, bound] of [...this.bound]) if (bound.roomId === roomId) this.unbind(view);
+  }
+
+  /** Stop co-editing one note; its editors keep the text they show. */
+  unbindNote(roomId: string, fileId: string): void {
+    for (const [view, bound] of [...this.bound]) if (bound.roomId === roomId && bound.fileId === fileId) this.unbind(view);
   }
 
   unbindAll(): void {

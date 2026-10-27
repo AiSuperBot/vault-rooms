@@ -44,10 +44,10 @@ export function isScope(value: unknown): value is string {
   return typeof value === "string" && /^[a-z0-9]{8,24}$/.test(value);
 }
 
-export async function createDeviceSecrets(store: SecretStore, scope: string, label: string): Promise<{ secrets: DeviceSecrets; certPem: string }> {
+export async function createDeviceSecrets(store: SecretStore, scope: string): Promise<{ secrets: DeviceSecrets; certPem: string }> {
   const sign = signingKeyPairFromSeed(crypto.getRandomValues(new Uint8Array(32)));
   const agree = agreementKeyPairFromSecret(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"));
-  const tls = await createTlsIdentity(label);
+  const tls = await createTlsIdentity();
   const id = ids(scope);
   store.set(id.sign, sign.secretKey);
   store.set(id.agree, agree.secretKey);

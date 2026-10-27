@@ -58,6 +58,11 @@ export class MemoryFiles implements Files {
     return { files: [...files].sort(), folders: [...folders].sort() };
   }
 
+  async stat(path: string): Promise<{ size: number; mtime: number } | null> {
+    const value = this.data.get(path);
+    return value === undefined ? null : { size: value.length, mtime: Date.now() };
+  }
+
   async rmdir(path: string): Promise<void> {
     for (const key of [...this.data.keys()]) if (key === path || key.startsWith(`${path}/`)) this.data.delete(key);
     for (const key of [...this.folders]) if (key === path || key.startsWith(`${path}/`)) this.folders.delete(key);

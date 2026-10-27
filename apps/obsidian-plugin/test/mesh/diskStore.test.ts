@@ -16,7 +16,7 @@ import {
   WorkspaceChain,
   wrapRoomKey
 } from "@vault-rooms/secure";
-import { DiskStore } from "../../src/mesh/diskStore.js";
+import { DiskStore, fileNameOf } from "../../src/mesh/diskStore.js";
 import { MemoryFiles } from "./memoryFiles.js";
 
 function world() {
@@ -35,8 +35,11 @@ function world() {
   return { chain, workspaceId, deviceId, sign, agree, roomId, key, ctx };
 }
 
+const docFile = (root: string, room: string, doc: string) => `${root}/docs/${fileNameOf(room)}/${fileNameOf(doc)}.jsonl`;
+const lines = (text: string) => text.split("\n").filter((line) => line.trim());
+
 describe("disk store", () => {
-  it("round-trips the record, wraps and envelopes", async () => {
+  it("round-trips the record, wraps, envelopes and blobs", async () => {
     const w = world();
     const files = new MemoryFiles();
     const disk = new DiskStore(files, "plugin/mesh/ws1");
@@ -47,7 +50,8 @@ describe("disk store", () => {
     live.add(sealUpdate(w.ctx, doc, 1, utf8("one")));
     live.add(sealUpdate(w.ctx, doc, 2, utf8("two")));
     live.add(sealUpdate(w.ctx, INDEX_DOC, 1, utf8("index")));
-    live.add(sealBlob(w.ctx, utf8("attachment")));
+    const blob = sealBlob(w.ctx, utf8("attachment"));
+    live.add(blob);
     await disk.flush();
 
     const again = new DiskStore(files, "plugin/mesh/ws1");
@@ -55,26 +59,38 @@ describe("disk store", () => {
     expect(await again.loadWraps()).toHaveLength(1);
     const loaded = await again.open();
     expect(loaded.digest(w.roomId)).toBe(live.digest(w.roomId));
+    // The blob's ciphertext stays on disk until it is asked for.
+    expect((await loaded.loadBlob(w.roomId, w.deviceId, blob.id))?.sig).toBe(blob.sig);
     // Loading doesn't write anything back (no duplicated lines).
     await again.flush();
-    expect((await files.read(`plugin/mesh/ws1/docs/${w.roomId}/${doc}.jsonl`)).trim().split("\n")).toHaveLength(2);
+    expect(lines(await files.read(docFile("plugin/mesh/ws1", w.roomId, doc)))).toHaveLength(2);
   });
 
-  it("rewrites a document's log after a snapshot prunes it", async () => {
+  it("names files so that ids differing only in case never share one", () => {
+    const id = randomId("r");
+    const variant = id[0] + [...id.slice(1)].map((ch) => (ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase())).join("");
+    expect(fileNameOf(id)).toBe(fileNameOf(id).toLowerCase());
+    expect(fileNameOf(id)).not.toBe(fileNameOf(variant));
+  });
+
+  it("rewrites a document's log, with its marks, after a snapshot replaces envelopes", async () => {
     const w = world();
     const files = new MemoryFiles();
     const disk = new DiskStore(files, "m");
     const store = await disk.open();
+    store.isMember = () => false;
     const doc = randomId("f");
     for (let clock = 1; clock <= 5; clock++) store.add(sealUpdate(w.ctx, doc, clock, utf8(`u${clock}`)));
     await disk.flush();
     store.add(sealSnapshot(w.ctx, doc, 1, { [w.deviceId]: 4 }, utf8("state")));
     await disk.flush();
-    const lines = (await files.read(`m/docs/${w.roomId}/${doc}.jsonl`)).trim().split("\n");
-    expect(lines.map((line) => JSON.parse(line).k)).toEqual(["s", "u"]);
+    const written = lines(await files.read(docFile("m", w.roomId, doc))).map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(written.map((entry) => entry.k ?? "marks")).toEqual(["marks", "s", "u"]);
+    const reloaded = await new DiskStore(files, "m").open();
+    expect(reloaded.vv(w.roomId, doc)).toEqual({ [w.deviceId]: 5 });
   });
 
-  it("survives a torn last line and an interrupted swap", async () => {
+  it("survives a torn append, an interrupted rewrite and an interrupted swap", async () => {
     const w = world();
     const files = new MemoryFiles();
     const disk = new DiskStore(files, "m");
@@ -82,12 +98,30 @@ describe("disk store", () => {
     const doc = randomId("f");
     store.add(sealUpdate(w.ctx, doc, 1, utf8("kept")));
     await disk.flush();
-    await files.append(`m/docs/${w.roomId}/${doc}.jsonl`, '{"k":"u","ws":"tor');
-    expect((await new DiskStore(files, "m").open()).vv(w.roomId, doc)).toEqual({ [w.deviceId]: 1 });
-    // A swap interrupted after the old copy was moved aside: the old copy is still found.
+    const path = docFile("m", w.roomId, doc);
+    await files.append(path, '\n{"k":"u","ws":"tor');
+    // The next append starts on its own line, so the torn one takes nothing with it.
+    store.add(sealUpdate(w.ctx, doc, 2, utf8("after")));
+    await disk.flush();
+    expect((await new DiskStore(files, "m").open()).vv(w.roomId, doc)).toEqual({ [w.deviceId]: 2 });
+    // A rewrite interrupted after the old log was moved aside: the old copy is still read.
+    await files.rename(path, `${path}.old`);
+    expect((await new DiskStore(files, "m").open()).vv(w.roomId, doc)).toEqual({ [w.deviceId]: 2 });
+    // A swap of the record interrupted the same way.
     await disk.saveChain(w.chain.all());
     await files.rename("m/chain.json", "m/chain.json.old");
     expect(await new DiskStore(files, "m").loadChain()).toHaveLength(2);
+  });
+
+  it("tells when an envelope made here is on disk", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const env = sealUpdate(w.ctx, randomId("f"), 1, utf8("mine"));
+    store.add(env);
+    await disk.persisted(env);
+    expect(await files.exists(docFile("m", w.roomId, env.doc))).toBe(true);
   });
 
   it("keeps the old record if writing the new one fails", async () => {

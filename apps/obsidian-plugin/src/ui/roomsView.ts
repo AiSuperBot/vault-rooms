@@ -1,5 +1,5 @@
 import { ItemView, Notice, setIcon, TFolder, type WorkspaceLeaf } from "obsidian";
-import { activeDevice } from "@vault-rooms/secure";
+import { activeDevice, roleIn } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
 import { confirmAction, CreateWorkspaceModal, InviteModal, JoinModal, LinkModal, MembersModal, NewRoomModal } from "./modals.js";
 
@@ -85,6 +85,12 @@ export class RoomsView extends ItemView {
 
     const state = svc.state;
     const me = state.users[svc.me.userId];
+    // Names needn't be unique: two people with one name are told apart by a short id.
+    const label = (userId: string) => {
+      const name = state.users[userId]?.name ?? "?";
+      const twin = Object.entries(state.users).some(([other, user]) => other !== userId && !user.removed && user.name === name);
+      return twin ? `${name} (${userId.slice(1, 5)})` : name;
+    };
     const online = new Set(svc.connectedDevices());
     const otherDevices = Object.entries(state.devices).filter(([deviceId]) => deviceId !== svc.me.deviceId && activeDevice(state, deviceId));
 
@@ -107,6 +113,7 @@ export class RoomsView extends ItemView {
     const canCreate = svc.isMember() && (state.roomCreation === "members" || svc.isAdmin());
     if (canCreate) roomsHead.createEl("button", { text: "Share a folder" }).onclick = () => new NewRoomModal(this.plugin).open();
     const rooms = svc.rooms().filter((room) => room.role !== undefined);
+    const hidden = new Set(this.plugin.hiddenRooms());
     if (rooms.length === 0) root.createEl("p", { cls: "vault-rooms-muted", text: canCreate ? "No rooms yet. Share a folder to start one." : "No rooms shared with you yet." });
     for (const room of rooms) {
       const row = root.createDiv({ cls: "vault-rooms-room" });
@@ -114,10 +121,11 @@ export class RoomsView extends ItemView {
       setIcon(title.createSpan({ cls: "vault-rooms-icon" }), "folder-lock");
       title.createSpan({ text: room.name ?? "Waiting for the room key…" });
       const folder = this.plugin.folderOf(room.id);
-      row.createDiv({ cls: "vault-rooms-muted", text: `You ${ROLE_LABEL[room.role!]} · ${Object.keys(room.members).length} people${folder ? ` · ${folder}` : ""}` });
+      row.createDiv({ cls: "vault-rooms-muted", text: `You ${ROLE_LABEL[room.role!]} · ${Object.keys(room.members).length} people${folder ? ` · ${folder}` : hidden.has(room.id) ? " · not shown in this vault" : ""}` });
       if (svc.replica(room.id)?.epochsMissing().length) row.createDiv({ cls: "vault-rooms-muted", text: "Some content is waiting for a key from a member who's online." });
       const actions = row.createDiv({ cls: "vault-rooms-actions" });
       actions.createEl("button", { text: "Members" }).onclick = () => new MembersModal(this.plugin, room.id).open();
+      if (hidden.has(room.id)) actions.createEl("button", { text: "Show in this vault" }).onclick = () => this.act(() => this.plugin.showRoom(room.id));
       if (folder)
         actions.createEl("button", { text: "Show folder" }).onclick = () => {
           const target = this.app.vault.getAbstractFileByPath(folder);
@@ -136,7 +144,7 @@ export class RoomsView extends ItemView {
     for (const [userId, user] of Object.entries(state.users)) {
       if (user.removed) continue;
       const row = root.createDiv({ cls: "vault-rooms-person" });
-      row.createDiv({ cls: "vault-rooms-person-name", text: `${user.name}${userId === svc.me.userId ? " (you)" : ""}${user.admin ? " · admin" : ""}` });
+      row.createDiv({ cls: "vault-rooms-person-name", text: `${label(userId)}${userId === svc.me.userId ? " (you)" : ""}${user.admin ? " · admin" : ""}` });
       for (const [deviceId, device] of Object.entries(state.devices)) {
         if (device.user !== userId || device.revoked) continue;
         const line = row.createDiv({ cls: "vault-rooms-device" });
@@ -145,14 +153,14 @@ export class RoomsView extends ItemView {
         line.createSpan({ text: `${device.name}${isMe ? " (this computer)" : ""}` });
         if (!isMe && (svc.isAdmin() || userId === svc.me.userId))
           line.createEl("button", { text: "Revoke", cls: "vault-rooms-small" }).onclick = async () => {
-            if (await confirmAction(this.app, "Revoke computer", `"${device.name}" is cut off from the workspace now, and the keys of its rooms are replaced. Use this for a lost or replaced computer.`, "Revoke")) await this.act(() => svc.revokeDevice(deviceId));
+            if (await confirmAction(this.app, "Revoke computer", `"${device.name}" is cut off from the workspace now, and invites it made stop working. Its rooms get new keys as soon as someone who can edit them is online, so it can't read anything added after that. Use this for a lost or replaced computer.`, "Revoke")) await this.act(() => svc.revokeDevice(deviceId));
           };
       }
       if (svc.isAdmin() && userId !== svc.me.userId) {
         const actions = row.createDiv({ cls: "vault-rooms-actions" });
         actions.createEl("button", { text: user.admin ? "Remove admin" : "Make admin", cls: "vault-rooms-small" }).onclick = () => this.act(() => svc.setAdmin(userId, !user.admin));
         actions.createEl("button", { text: "Remove from workspace", cls: "vault-rooms-small" }).onclick = async () => {
-          if (await confirmAction(this.app, "Remove from workspace", `${user.name} and all their computers are cut off, and the keys of their rooms are replaced. They keep what they already had.`, "Remove")) await this.act(() => svc.removeUser(userId));
+          if (await confirmAction(this.app, "Remove from workspace", `${label(userId)} and all their computers are cut off now, and invites they made stop working. Their rooms get new keys as soon as someone who can edit them is online. They keep what they already had.`, "Remove")) await this.act(() => svc.removeUser(userId));
         };
       }
     }
@@ -163,10 +171,11 @@ export class RoomsView extends ItemView {
       root.createDiv({ cls: "vault-rooms-section" }).createEl("h5", { text: "Open invites" });
       for (const [inviteId, invite] of invites) {
         const row = root.createDiv({ cls: "vault-rooms-invite" });
-        const by = state.users[invite.by]?.name ?? "?";
+        const by = label(invite.by);
         const hours = Math.max(0, Math.round((invite.expires - Date.now()) / 3_600_000));
         row.createSpan({ text: `${invite.forUser ? "Another computer" : "New person"} · by ${by} · expires in ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}` });
-        if (svc.isAdmin() || invite.by === svc.me.userId) row.createEl("button", { text: "Withdraw", cls: "vault-rooms-small" }).onclick = () => this.act(() => svc.withdrawInvite(inviteId));
+        const managesGranted = Object.keys(invite.rooms).some((roomId) => roleIn(state, roomId, svc.me.userId) === "manage");
+        if (svc.isAdmin() || invite.by === svc.me.userId || managesGranted) row.createEl("button", { text: "Withdraw", cls: "vault-rooms-small" }).onclick = () => this.act(() => svc.withdrawInvite(inviteId));
       }
     }
 

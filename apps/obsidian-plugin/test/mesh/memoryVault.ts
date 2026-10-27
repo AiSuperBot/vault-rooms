@@ -3,6 +3,7 @@ import type { FileStat, VaultLike } from "../../src/mesh/roomFolder.js";
 /** An in-memory vault that reports writes, deletions and renames the way Obsidian's vault events do. */
 export class MemoryVault implements VaultLike {
   readonly files = new Map<string, Uint8Array>();
+  readonly folders = new Set<string>();
   readonly trashed: string[] = [];
   private mtimes = new Map<string, number>();
   private clock = 1;
@@ -31,13 +32,18 @@ export class MemoryVault implements VaultLike {
   }
 
   private put(path: string, data: Uint8Array): void {
+    const parts = path.split("/");
+    for (let i = 1; i < parts.length; i++) this.folders.add(parts.slice(0, i).join("/"));
     this.files.set(path, data);
     this.mtimes.set(path, ++this.clock);
   }
 
-  async writeText(path: string, text: string): Promise<void> {
+  async writeText(path: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
+    const current = this.files.get(path);
+    if (current && expected && !expected(Buffer.from(current).toString("utf8"))) return false;
     this.put(path, new Uint8Array(Buffer.from(text, "utf8")));
     this.listener.write?.(path);
+    return true;
   }
 
   async writeBytes(path: string, bytes: Uint8Array): Promise<void> {
@@ -64,8 +70,21 @@ export class MemoryVault implements VaultLike {
     return [...this.files.keys()].filter((path) => path.startsWith(`${folder}/`)).sort();
   }
 
+  folderExists(path: string): boolean {
+    return this.folders.has(path);
+  }
+
   /** Change a file without telling anyone (as if edited while Obsidian was closed). */
   silently(path: string, text: string): void {
     this.put(path, new Uint8Array(Buffer.from(text, "utf8")));
+  }
+
+  /** Delete a whole folder, reporting each file as deleted (as Obsidian does). */
+  removeFolder(folder: string): void {
+    for (const path of this.listFiles(folder)) {
+      this.files.delete(path);
+      this.listener.delete?.(path);
+    }
+    for (const path of [...this.folders]) if (path === folder || path.startsWith(`${folder}/`)) this.folders.delete(path);
   }
 }

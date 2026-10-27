@@ -64,16 +64,20 @@ describe("mesh service", () => {
     await ana.setMember(roomId, ben.me.userId, null);
     await until(() => ben.replica(roomId) === null);
     expect(ana.state.rooms[roomId]!.epochs).toHaveLength(2);
-    expect(ana.replica(roomId)!.currentEpoch()!.n).toBe(2);
+    expect(ana.replica(roomId)!.sealEpoch()!.n).toBe(2);
     // Ben's device never received a wrap of the new key.
     expect(ana.node.allWraps().some((w) => w.body.room === roomId && w.body.n === 2 && w.body.to === ben.me.deviceId)).toBe(false);
   });
 
-  it("refuses to open when this device's keys are missing (a copied vault)", async () => {
+  it("refuses to open when this device's keys are missing (a copied vault), and can still be left", async () => {
     const d = deps("Copy");
     const service = await MeshService.create(d, { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
     await service.stop();
     d.secretValues.clear();
     await expect(MeshService.open(d)).rejects.toThrow(/keys are missing/);
+    await MeshService.forgetUnopened(d);
+    expect(d.settings.workspace).toBeNull();
+    expect([...(d.files as MemoryFiles).data.keys()].filter((key) => key.startsWith(d.dataRoot))).toEqual([]);
   });
+
 });
