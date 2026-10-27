@@ -174,7 +174,8 @@ export class RoomsView extends ItemView {
         const by = label(invite.by);
         const hours = Math.max(0, Math.round((invite.expires - Date.now()) / 3_600_000));
         row.createSpan({ text: `${invite.forUser ? "Another computer" : "New person"} · by ${by} · expires in ${hours < 48 ? `${hours} h` : `${Math.round(hours / 24)} days`}` });
-        const managesGranted = Object.keys(invite.rooms).some((roomId) => roleIn(state, roomId, svc.me.userId) === "manage");
+        const granted = Object.keys(invite.rooms);
+        const managesGranted = granted.length > 0 && granted.every((roomId) => roleIn(state, roomId, svc.me.userId) === "manage");
         if (svc.isAdmin() || invite.by === svc.me.userId || managesGranted) row.createEl("button", { text: "Withdraw", cls: "vault-rooms-small" }).onclick = () => this.act(() => svc.withdrawInvite(inviteId));
       }
     }

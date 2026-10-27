@@ -273,6 +273,7 @@ export class MeshService {
 
   async stop(): Promise<void> {
     this.stopped = true;
+    this.node.stop();
     for (const timer of this.timers) clearInterval(timer as ReturnType<typeof setInterval>);
     if (this.automateTimer) clearTimeout(this.automateTimer);
     this.discovery?.stop();
