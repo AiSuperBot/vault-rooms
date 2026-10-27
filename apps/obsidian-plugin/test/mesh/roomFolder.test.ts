@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { MeshNode, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
+import { MeshNode, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
 import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
 import { MemoryVault } from "./memoryVault.js";
@@ -39,7 +39,11 @@ function setup() {
       },
       wraps: () => pcs.get(device.id)?.replica.refreshKeys()
     });
-    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, { index: () => pcs.get(device.id)?.folder.remoteChanged(), doc: () => pcs.get(device.id)?.folder.remoteChanged() });
+    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, {
+      index: () => pcs.get(device.id)?.folder.remoteChanged(),
+      doc: () => pcs.get(device.id)?.folder.remoteChanged(),
+      clash: (docId, lost) => pcs.get(device.id)?.folder.noteClashed(docId, lost)
+    });
     const folder = new RoomFolder({
       folder: folderPath,
       replica,
@@ -788,5 +792,103 @@ describe("room folder", () => {
     a.folder.remoteChanged();
     await s.settle();
     expect(text(a.vault, "Team/Live.md")).toBe("start\n");
+  });
+
+  /** Ana and Cy, both writers, sharing the room's folder (Ana's files first). */
+  async function pair(files: Record<string, string | Uint8Array> = {}) {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    for (const [path, content] of Object.entries(files)) {
+      if (typeof content === "string") await a.vault.writeText(path, content);
+      else await a.vault.writeBytes(path, content);
+    }
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    return { s, a, c, link };
+  }
+
+  it("keeps one of two values saved at the same moment in the same place, and the other as a copy", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-01\n---\nPlan\n" });
+    link.cut();
+    // Another plugin writes a different date on each computer while they are apart.
+    await a.vault.writeText("Team/Task.md", "---\ndue: 2030-01-03\n---\nPlan\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "---\ndue: 2030-01-04\n---\nPlan\n");
+    await c.folder.settled();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const main = text(a.vault, "Team/Task.md")!;
+    expect(text(c.vault, "Team/Task.md")).toBe(main);
+    expect(["---\ndue: 2030-01-03\n---\nPlan\n", "---\ndue: 2030-01-04\n---\nPlan\n"]).toContain(main);
+    const other = main.includes("01-03") ? "---\ndue: 2030-01-04\n---\nPlan\n" : "---\ndue: 2030-01-03\n---\nPlan\n";
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    expect(copies).toContain(other);
+  });
+
+  it("keeps a new save of an attachment made while its clash copy was being written", async () => {
+    const { s, a, c, link } = await pair({ "Team/img.png": new Uint8Array([1]) });
+    link.cut();
+    await a.vault.writeBytes("Team/img.png", new Uint8Array([2]));
+    await a.folder.settled();
+    await c.vault.writeBytes("Team/img.png", new Uint8Array([3]));
+    await c.folder.settled();
+    // Whichever computer keeps its own version aside to take the other's, its user saves the image once more meanwhile.
+    const saved: string[] = [];
+    for (const [pc, again] of [[a, 4], [c, 5]] as const) {
+      pc.vault.beforeGuardedWrite = (path) => {
+        if (path !== "Team/img.png" || saved.includes(pc.device.name)) return;
+        saved.push(pc.device.name);
+        void pc.vault.writeBytes(path, new Uint8Array([again]));
+      };
+    }
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    expect(saved).toHaveLength(1);
+    const [pc, mine, again] = saved[0] === a.device.name ? [a, 2, 4] : [c, 3, 5];
+    const versions = [...pc.vault.files.entries()].filter(([path]) => path.startsWith("Team/img")).map(([, bytes]) => [...bytes]);
+    expect(versions).toContainEqual([again]);
+    expect(versions).toContainEqual([mine]);
+  });
+
+  it("doesn't read attachments that didn't change when a note does", async () => {
+    const { s, a, c } = await pair({ "Team/img.png": new Uint8Array(1000).fill(7), "Team/Plan.md": "plan\n" });
+    let reads = 0;
+    const read = a.replica.readBlob.bind(a.replica);
+    a.replica.readBlob = (ref) => (reads++, read(ref));
+    await c.vault.writeText("Team/Plan.md", "plan\nmore\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Plan.md")).toBe("plan\nmore\n");
+    expect(reads).toBe(0);
+  });
+
+  it("passes on the work of someone who may no longer write to a computer that catches up later", async () => {
+    const { s, a, c } = await pair();
+    await c.vault.writeText("Team/Cy.md", "from Cy\n");
+    await c.vault.writeBytes("Team/pic.png", new Uint8Array([7, 7]));
+    await s.settle();
+    // Cy may only read from now on; then Rae's computer catches up, from Ana's alone.
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.cy.userId] = "read"))]);
+    s.giveKey(a, s.rae);
+    const r = s.make(s.rae, "Team");
+    s.net.link(r.node, a.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    a.replica.passOnOldWork((author) => author === s.ana.id);
+    await s.settle();
+    await s.settle();
+    expect(text(r.vault, "Team/Cy.md")).toBe("from Cy\n");
+    expect([...(r.vault.files.get("Team/pic.png") ?? [])]).toEqual([7, 7]);
   });
 });

@@ -59,6 +59,56 @@ export interface ReplicaEvents {
   doc?(fileId: string): void;
   /** A local edit made outside `edit` (an editor) couldn't be shared ("read_only", "too_large", ...). */
   localRefused?(docId: string, code: string): void;
+  /**
+   * A whole-note save made here (see `edit`, `save`) and someone else's, made at the same moment, replaced the same text
+   * (two values written over one, say). One of them is kept in the shared note, the same on every computer; `lost`:
+   * this computer's wasn't, so the owner keeps it as a copy.
+   */
+  clash?(docId: string, lost: boolean): void;
+}
+
+/** A run of characters in a document by their Yjs ids. */
+interface IdRange {
+  client: number;
+  clock: number;
+  length: number;
+}
+
+/** A whole-note save made here: what it took out (by id) and what it put in (where). */
+interface FileSave {
+  deleted: IdRange[];
+  inserted: Array<IdRange & { origin: Y.ID | null; right: Y.ID | null }>;
+}
+
+const MAX_FILE_SAVES = 20;
+
+function deletedRanges(update: Uint8Array): IdRange[] {
+  const { ds } = Y.decodeUpdate(update) as unknown as { ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
+  return [...ds.clients].flatMap(([client, items]) => items.map(({ clock, len }) => ({ client, clock, length: len })));
+}
+
+function insertedRanges(update: Uint8Array): FileSave["inserted"] {
+  const { structs } = Y.decodeUpdate(update) as unknown as { structs: Array<{ id: Y.ID; length: number; origin?: Y.ID | null; rightOrigin?: Y.ID | null; content?: unknown }> };
+  return structs
+    .filter((struct) => struct.content !== undefined)
+    .map((struct) => ({ client: struct.id.client, clock: struct.id.clock, length: struct.length, origin: struct.origin ?? null, right: struct.rightOrigin ?? null }));
+}
+
+function overlap(a: IdRange[], b: IdRange[]): IdRange[] {
+  const out: IdRange[] = [];
+  for (const x of a) {
+    for (const y of b) {
+      if (x.client !== y.client) continue;
+      const from = Math.max(x.clock, y.clock);
+      const to = Math.min(x.clock + x.length, y.clock + y.length);
+      if (from < to) out.push({ client: x.client, clock: from, length: to - from });
+    }
+  }
+  return out;
+}
+
+function within(ranges: IdRange[], id: Y.ID | null): boolean {
+  return id !== null && ranges.some((r) => r.client === id.client && id.clock >= r.clock && id.clock < r.clock + r.length);
 }
 
 function validBlobRef(value: unknown): BlobRef | undefined {
@@ -79,6 +129,14 @@ export class RoomReplica {
   private blobRescues: Array<{ oldId: string; bytes: Uint8Array }> = [];
   private localEditAt = new Map<DocId, number>();
   private editing = false;
+  /** The edit under way is a whole-note save (see `edit`). */
+  private saving = false;
+  /** Recent whole-note saves made here, per note, to spot a clash with someone else's (see ReplicaEvents.clash). */
+  private fileSaves = new Map<DocId, FileSave[]>();
+  /** Documents this device passed on, with the work of former writers it covered then (see passOnOldWork). */
+  private passedOn = new Map<DocId, Set<string>>();
+  /** Files whose version by a former writer is being passed on (see passOnOldWork). */
+  private passingOn = new Set<string>();
   private refusal: string | null = null;
   private destroyed = false;
 
@@ -335,6 +393,10 @@ export class RoomReplica {
 
   private localUpdate(docId: DocId, update: Uint8Array): void {
     this.localEditAt.set(docId, Date.now());
+    if (this.saving) {
+      const saves = [...(this.fileSaves.get(docId) ?? []), { deleted: deletedRanges(update), inserted: insertedRanges(update) }];
+      this.fileSaves.set(docId, saves.slice(-MAX_FILE_SAVES));
+    }
     try {
       this.publishLocal(docId, update);
     } catch (error) {
@@ -348,17 +410,20 @@ export class RoomReplica {
 
   /**
    * Make a local edit to a document as one transaction. "refused": it couldn't be shared (read only, too large, over
-   * the room's storage limit), and the document was rebuilt without it.
+   * the room's storage limit), and the document was rebuilt without it. `save`: it is a whole-note save made outside an
+   * editor (a file written by another program or plugin), which may clash with someone else's (see ReplicaEvents.clash).
    */
-  edit(docId: DocId, change: (doc: Y.Doc) => void): EditResult {
+  edit(docId: DocId, change: (doc: Y.Doc) => void, save = false): EditResult {
     if (this.destroyed) fail("destroyed");
     const state = this.loadDoc(docId);
     this.refusal = null;
     this.editing = true;
+    this.saving = save;
     try {
       state.doc.transact(() => change(state.doc));
     } finally {
       this.editing = false;
+      this.saving = false;
     }
     if (this.refusal !== null) {
       this.reload(docId);
@@ -412,6 +477,7 @@ export class RoomReplica {
     } catch {
       return false; // not a valid Yjs update: ignore it rather than corrupt the document
     }
+    if (env.author !== this.node.deviceId && this.fileSaves.has(docId)) this.checkClash(docId, env, bytes);
     // A snapshot's "covers" is only its author's claim: it never counts as applied updates here.
     if (env.k === "u") this.markApplied(state, env.author, env.clock);
     state.sinceSnapshot++;
@@ -465,6 +531,102 @@ export class RoomReplica {
       } catch (error) {
         this.events.localRefused?.(docId, error instanceof SecureError ? error.code : "error");
       }
+    }
+  }
+
+  // ---- clashing saves ----
+
+  /**
+   * Did someone else's change, made at the same moment, take out text a whole-note save of ours took out too? Then both
+   * replaced the same text (a date changed to two different values, say), and merging them character by character would
+   * mix the two. The save of the computer with the lower device id is kept: the other's new text there is taken out
+   * again, by both computers alike (taking out twice changes nothing), and the other keeps its version as a copy.
+   */
+  private checkClash(docId: DocId, env: UpdateEnvelope | SnapshotEnvelope, bytes: Uint8Array): void {
+    let theirs: IdRange[];
+    let theirInserted: FileSave["inserted"];
+    try {
+      theirs = deletedRanges(bytes);
+      theirInserted = insertedRanges(bytes);
+    } catch {
+      return;
+    }
+    const lost = this.node.deviceId > env.author;
+    const remove: IdRange[] = [];
+    for (const save of this.fileSaves.get(docId) ?? []) {
+      // A snapshot that already holds this save was made after it: no clash, whatever it took out since.
+      if (env.k === "s" && save.inserted.some((mine) => theirInserted.some((t) => t.client === mine.client && t.clock + t.length >= mine.clock + mine.length))) continue;
+      if (env.k === "s" && save.inserted.length === 0) continue;
+      const both = overlap(save.deleted, theirs);
+      if (both.length === 0) continue;
+      const loser = lost ? save.inserted : theirInserted;
+      remove.push(...loser.filter((item) => within(both, item.origin) || within(both, item.right)));
+      this.events.clash?.(docId, lost);
+    }
+    if (remove.length > 0) queueMicrotask(() => this.takeOut(docId, remove));
+  }
+
+  /** Take characters out of a note by their ids (those still there). */
+  private takeOut(docId: DocId, ranges: IdRange[]): void {
+    const state = this.docs.get(docId);
+    if (!state || this.destroyed || !this.canWrite() || !this.sealEpoch()) return;
+    const text = state.doc.getText("content");
+    const spans: Array<[number, number]> = [];
+    let index = 0;
+    type Item = { id: Y.ID; length: number; deleted: boolean; countable: boolean; right: Item | null };
+    for (let item = (text as unknown as { _start: Item | null })._start; item; item = item.right) {
+      if (item.deleted || !item.countable) continue;
+      for (const r of ranges) {
+        if (r.client !== item.id.client) continue;
+        const from = Math.max(r.clock, item.id.clock);
+        const to = Math.min(r.clock + r.length, item.id.clock + item.length);
+        if (from < to) spans.push([index + from - item.id.clock, to - from]);
+      }
+      index += item.length;
+    }
+    if (spans.length === 0) return;
+    this.edit(docId, () => {
+      for (const [at, length] of spans.sort((x, y) => y[0] - x[0])) text.delete(at, length);
+    });
+  }
+
+  // ---- passing on the work of former writers ----
+
+  /**
+   * Work peers no longer take from its authors (`writes(author)` false: revoked, removed, made readers), though they did
+   * it while they could, is passed on as this device's own: a snapshot of each document holding some of it, and a copy
+   * of each file version of theirs still in use. Without that, a computer that catches up later would never get it.
+   * Call it now and then; once everything is passed on it does nothing.
+   */
+  passOnOldWork(writes: (author: string) => boolean): void {
+    if (this.destroyed || !this.canWrite() || !this.sealEpoch()) return;
+    const store = this.node.store;
+    for (const docId of store.docs(this.roomId)) {
+      const { updates, snapshots } = store.envelopesOf(this.roomId, docId);
+      const old = [...updates, ...snapshots].filter((env) => !writes(env.author)).map((env) => envelopeKey(env));
+      const done = this.passedOn.get(docId);
+      if (old.length === 0 || (done && old.every((key) => done.has(key))) || !this.isComplete(docId)) continue;
+      const mine = snapshots.filter((s) => s.author === this.node.deviceId).sort((a, b) => b.seq - a.seq)[0];
+      const held = mine ? this.contentsOf(mine) : null;
+      if ((held && Y.equalSnapshots(held, Y.snapshot(this.loadDoc(docId).doc))) || this.snapshot(docId, true)) this.passedOn.set(docId, new Set(old));
+    }
+    for (const [fileId, entry] of this.files()) {
+      const blob = entry.blob;
+      if (!blob || writes(blob.by) || this.passingOn.has(fileId)) continue;
+      this.passingOn.add(fileId);
+      void this.readBlob(blob)
+        .then((bytes) => {
+          if (!bytes || this.destroyed) return;
+          const copy = this.putBlob(bytes);
+          this.editIndex((files) => {
+            const now = files.get(fileId);
+            if (now?.blob?.by === blob.by && now.blob.id === blob.id) files.set(fileId, { ...now, blob: copy, base: blob.id });
+          });
+        })
+        .catch(() => {
+          // can't be passed on now (no room key, storage full): tried again next time
+        })
+        .finally(() => this.passingOn.delete(fileId));
     }
   }
 
@@ -573,12 +735,13 @@ export class RoomReplica {
    * Compact a document: publish its full state, covering exactly the updates applied here. Skipped while Yjs still
    * holds updates whose dependencies haven't arrived, so a snapshot never drops anything.
    */
-  snapshot(docId: DocId): SnapshotEnvelope | null {
+  snapshot(docId: DocId, always = false): SnapshotEnvelope | null {
     const state = this.docs.get(docId);
     if (!state || !this.canWrite() || !this.sealEpoch()) return null;
     const store = state.doc.store as unknown as { pendingStructs: unknown; pendingDs: unknown };
     if (store.pendingStructs || store.pendingDs) return null;
-    if (Object.keys(state.applied).length === 0) return null;
+    // `always`: even a document held as snapshots only (nothing applied here), as when passing work on.
+    if (!always && Object.keys(state.applied).length === 0) return null;
     const seq = this.node.store.maxSnapshotSeq(this.roomId, docId, this.node.deviceId) + 1;
     let env: SnapshotEnvelope;
     try {

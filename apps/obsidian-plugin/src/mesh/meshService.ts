@@ -2,6 +2,7 @@ import { networkInterfaces } from "node:os";
 import {
   activeDevice,
   canonicalJson,
+  concurrentReductions,
   createGenesis,
   deviceIdFor,
   Discovery,
@@ -96,6 +97,7 @@ export class MeshService {
   private activityListeners = new Set<(roomId: string) => void>();
   private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
   private lostRoomListeners = new Set<(roomId: string) => void>();
+  private clashListeners = new Set<(roomId: string, docId: string, lost: boolean) => void>();
   private server: PeerServer | null = null;
   private manager: PeerManager | null = null;
   private discovery: Discovery | null = null;
@@ -345,6 +347,12 @@ export class MeshService {
     return () => this.refusedListeners.delete(listener);
   }
 
+  /** A whole-note save made here clashed with someone else's (see RoomReplica's clash event). */
+  onClash(listener: (roomId: string, docId: string, lost: boolean) => void): () => void {
+    this.clashListeners.add(listener);
+    return () => this.clashListeners.delete(listener);
+  }
+
   /** A room this device created didn't survive a conflict and couldn't be made again. */
   onLostRoom(listener: (roomId: string) => void): () => void {
     this.lostRoomListeners.add(listener);
@@ -402,6 +410,7 @@ export class MeshService {
     const failed: string[] = [];
     const fork = this.node.chain.versionAt(lost[0]!.body.v - 1)?.body.state;
     const winner = this.node.chain.state;
+    const won = this.node.chain.since(lost[0]!.body.v);
     if (!fork) return;
     for (let i = 0; i < lost.length; i++) {
       const version = lost[i]!;
@@ -445,6 +454,12 @@ export class MeshService {
         for (const inviteId of reopened) delete state.invites[inviteId];
       }).catch((error: Error) => this.deps.log(`withdraw reopened invites: ${error.message}`));
     }
+    // Concurrent revocations add up: what the losing branch took away is taken away here too, by whoever may, and what
+    // those it took standing from granted at the same moment is taken back (see concurrentReductions).
+    await this.commit((state) => {
+      const reduced = concurrentReductions(fork, lost, won, state, this.settings.userId);
+      if (reduced) Object.assign(state, reduced);
+    }).catch((error: Error) => this.deps.log(`concurrent reductions: ${error.message}`));
     if (failed.length > 0) this.deps.notify("A change you made to the workspace clashed with someone else's at the same moment and couldn't be made again. Please check it and make it again if it's still needed.");
   }
 
@@ -702,6 +717,9 @@ export class MeshService {
         // An editor's change that can't be shared (a reader, too large, the room full): the owner decides what to do.
         localRefused: (docId, code) => {
           for (const listener of this.refusedListeners) listener(roomId, docId, code);
+        },
+        clash: (docId, lost) => {
+          for (const listener of this.clashListeners) listener(roomId, docId, lost);
         }
       });
       const own = this.ownKeys.get(roomId);
@@ -731,6 +749,7 @@ export class MeshService {
       await this.recordJoins();
       await this.withdrawExpiredInvites();
       this.collectBlobs();
+      this.passOnOldWork();
     } catch (error) {
       this.deps.log(`automation: ${(error as Error).message}`);
     } finally {
@@ -853,6 +872,17 @@ export class MeshService {
     await this.commit((state) => {
       for (const [inviteId] of expired) delete state.invites[inviteId];
     });
+  }
+
+  /** Work of people who may no longer write in a room is passed on by the writers holding it (RoomReplica.passOnOldWork). */
+  private passOnOldWork(): void {
+    const state = this.state;
+    for (const [roomId, replica] of this.replicas) {
+      replica.passOnOldWork((author) => {
+        const device = activeDevice(state, author);
+        return device !== null && roleAtLeast(roleIn(state, roomId, device.user), "write");
+      });
+    }
   }
 
   /**

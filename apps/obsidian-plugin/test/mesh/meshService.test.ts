@@ -119,6 +119,9 @@ describe("mesh service", () => {
     await until(() => ben.node.chain.state.devices[ben.me.deviceId] !== undefined);
     await ana.setAdmin(ben.me.userId, true);
     await until(() => ben.isAdmin());
+    // Ana's computer is off from now on (so Ben's device is the one recording the join).
+    services.splice(services.indexOf(ana), 1);
+    await ana.stop();
     // Ben's invite link leaks; Mal joins with it, Ben's device lets him in, and Ben takes him back out.
     const invite = parseInviteLink(await ben.createInvite({}));
     const parent = ben.node.chain.head;

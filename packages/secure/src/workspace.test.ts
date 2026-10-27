@@ -6,7 +6,7 @@ import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, JOIN_EXPIRY_SLACK_MS, newInvite, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName } from "./keys.js";
 import { createRoom, fold, founder, invite, newDevice, step, type TestDevice } from "./testkit.js";
-import { LIMITS, nextVersion, parseSignedVersion, rebaseChange, roleIn, signVersion, verifyGenesis, versionHash, type WorkspaceState } from "./workspace.js";
+import { concurrentReductions, LIMITS, nextVersion, parseSignedVersion, rebaseChange, roleIn, signVersion, verifyGenesis, versionHash, type WorkspaceState } from "./workspace.js";
 
 function forbidden(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, joins: JoinRecord[] = [], now = Date.now()): string {
   try {
@@ -444,6 +444,42 @@ describe("devices and users", () => {
     // The winner lowered him: raising him again doesn't apply, taking him out does.
     expect(merged("manage", "read")).toBe("read");
     expect(merged(undefined, "read")).toBeUndefined();
+  });
+
+  it("adds up concurrent revocations, but not those of someone the winning branch revoked", () => {
+    const { chain, admin: a } = founder();
+    const { joiner: b } = invite(chain, a, { userName: "B" });
+    const { joiner: c } = invite(chain, a, { userName: "C" });
+    step(chain, a, (state) => {
+      state.users[b.userId]!.admin = true;
+      state.users[c.userId]!.admin = true;
+    });
+    const fork = chain.state;
+    const won = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true));
+    const byC = nextVersion(chain.workspaceId, chain.head, c.sign, (state) => (state.devices[a.id]!.revoked = true));
+    const byB = nextVersion(chain.workspaceId, chain.head, b.sign, (state) => (state.devices[c.id]!.revoked = true));
+    // C's revocation of A lost the race, but C still stands: it is made again. B's lost too, and B was revoked.
+    expect(concurrentReductions(fork, [byC], [won], won.body.state, c.userId)!.devices[a.id]!.revoked).toBe(true);
+    expect(concurrentReductions(fork, [byB], [won], won.body.state, c.userId)).toBeNull();
+  });
+
+  it("takes back what a device granted at the same moment it was revoked", () => {
+    const { chain, admin: a } = founder();
+    const { joiner: b } = invite(chain, a, { userName: "B" });
+    const { joiner: e } = invite(chain, a, { userName: "E" });
+    const { roomId } = createRoom(chain, a, "Docs", { [b.userId]: "manage" });
+    step(chain, a, (state) => (state.users[b.userId]!.admin = true));
+    const fork = chain.state;
+    // B (its computer stolen) makes E an admin and gives E the room while A revokes B's computer; B's change wins.
+    const won = nextVersion(chain.workspaceId, chain.head, b.sign, (state) => {
+      state.users[e.userId]!.admin = true;
+      state.rooms[roomId]!.members[e.userId] = "write";
+    });
+    const lost = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true));
+    const after = concurrentReductions(fork, [lost], [won], won.body.state, a.userId)!;
+    expect(after.devices[b.id]!.revoked).toBe(true);
+    expect(after.users[e.userId]!.admin).toBe(false);
+    expect(after.rooms[roomId]!.members[e.userId]).toBeUndefined();
   });
 
   it("rejects a version whose signature doesn't match its signer", () => {
