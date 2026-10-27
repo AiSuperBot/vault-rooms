@@ -17,3 +17,4 @@ export * from "./frames.js";
 export * from "./peers.js";
 export * from "./tlsIdentity.js";
 export * from "./transport.js";
+export { cleanName } from "./validate.js";

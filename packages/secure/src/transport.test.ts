@@ -28,8 +28,8 @@ async function until(check: () => boolean, ms = 8000): Promise<void> {
 }
 
 async function world() {
-  const tlsA = await createTlsIdentity("ana");
-  const tlsC = await createTlsIdentity("cy");
+  const tlsA = await createTlsIdentity();
+  const tlsC = await createTlsIdentity();
   const { chain, ws, admin: ana } = founder("Team", "Ana", tlsA.fingerprint);
   const { joiner: cy } = invite(chain, ana, { userName: "Cy", tls: tlsC.fingerprint });
   const { roomId, key } = createRoom(chain, ana, "Plans", { [cy.userId]: "write" });
@@ -56,6 +56,15 @@ describe("frames", () => {
     expect(out).toEqual([{ a: 1 }, { b: "two" }]);
     const small = new FrameReader(10);
     expect(() => small.push(encodeFrame({ long: "x".repeat(50) }))).toThrow(/frame_too_large/);
+  });
+
+  it("read a frame that trickles in a byte at a time, and refuse empty ones", () => {
+    const bytes = encodeFrame({ text: "x".repeat(5000) });
+    const reader = new FrameReader();
+    const out: unknown[] = [];
+    for (let i = 0; i < bytes.length; i++) out.push(...reader.push(bytes.subarray(i, i + 1)));
+    expect(out).toEqual([{ text: "x".repeat(5000) }]);
+    expect(() => new FrameReader().push(Buffer.from([0, 0, 0, 0]))).toThrow(/bad_frame/);
   });
 });
 
@@ -86,7 +95,7 @@ describe("TLS transport", () => {
     const server = new PeerServer(config, () => rejected.push("accepted!"), (reason) => rejected.push(reason));
     const port = await server.listen(0, "127.0.0.1");
     cleanups.push(() => server.close());
-    const impostor: TransportConfig = { workspaceId: w.ws, deviceId: w.cy.id, deviceKey: newSigningKeyPair(), tls: await createTlsIdentity("x"), membership: () => w.chain.state };
+    const impostor: TransportConfig = { workspaceId: w.ws, deviceId: w.cy.id, deviceKey: newSigningKeyPair(), tls: await createTlsIdentity(), membership: () => w.chain.state };
     await expect(dial(impostor, "127.0.0.1", port, { device: w.ana.id, fingerprint: w.tlsA.fingerprint })).rejects.toThrow();
     await until(() => rejected.length > 0);
     expect(rejected).toEqual(["auth_signature"]);
@@ -114,8 +123,8 @@ describe("TLS transport", () => {
 
   it("lets a new device join over TLS with an invite link, then sync", async () => {
     const w = await world();
-    const tlsD = await createTlsIdentity("dee");
-    const fresh = newInvite(w.ana.userId, { [w.roomId]: "read" }, Date.now() + 3_600_000);
+    const tlsD = await createTlsIdentity();
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, { [w.roomId]: "read" }, Date.now() + 3_600_000);
     step(w.chain, w.ana, (state) => (state.invites[fresh.inviteId] = fresh.record));
     const a = await peer(w.chain, w.ana, w.tlsA);
     a.node.publish(sealUpdate({ ws: w.ws, room: w.roomId, n: 1, key: w.key, author: w.ana.sign }, INDEX_DOC, 1, utf8("for Dee")));
@@ -137,9 +146,9 @@ describe("TLS transport", () => {
     const w = await world();
     const other = await world();
     const b = await peer(other.chain, other.ana, other.tlsA);
-    const fresh = newInvite(w.ana.userId, {}, Date.now() + 3_600_000);
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
     const link = { workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers: [`127.0.0.1:${b.port}`] };
-    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity("eve"), newUserId: randomId("u") })).rejects.toThrow(/could not join/);
+    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toThrow(/could not join/);
   });
 });
 

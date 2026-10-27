@@ -165,6 +165,48 @@ function sharedSecret(secretKey: string, publicKey: string): Uint8Array {
   return shared;
 }
 
+// ---- checks for public keys that arrive in records ----
+
+/**
+ * The y-coordinates (little-endian, sign bit cleared) of the eight points of small order on edwards25519, plus the
+ * non-canonical spellings p and p+1 of 0 and 1. A signing key that is one of them can make signatures that verify for
+ * any message on some Ed25519 implementations, so such keys are refused wherever a key enters the record.
+ */
+const SMALL_ORDER_ED25519 = [
+  "00".repeat(32),
+  "01" + "00".repeat(31),
+  "26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+  "c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a",
+  "ec" + "ff".repeat(30) + "7f",
+  "ed" + "ff".repeat(30) + "7f",
+  "ee" + "ff".repeat(30) + "7f"
+];
+
+export function isSmallOrderSigningKey(publicKey: string): boolean {
+  const bytes = Buffer.from(fromB64u(publicKey, 32));
+  bytes[31] = bytes[31]! & 0x7f;
+  return SMALL_ORDER_ED25519.includes(bytes.toString("hex"));
+}
+
+const PROBE_AGREEMENT_SECRET = b64u(hashTagged("agreement-key-probe"));
+const agreementChecks = new Map<string, boolean>();
+
+/** True for an X25519 key whose shared secret with anyone is known in advance (small order) or that isn't usable at all. */
+export function isWeakAgreementKey(publicKey: string): boolean {
+  let weak = agreementChecks.get(publicKey);
+  if (weak === undefined) {
+    try {
+      sharedSecret(PROBE_AGREEMENT_SECRET, publicKey);
+      weak = false;
+    } catch {
+      weak = true;
+    }
+    if (agreementChecks.size >= 4096) agreementChecks.clear();
+    agreementChecks.set(publicKey, weak);
+  }
+  return weak;
+}
+
 function boxKey(shared: Uint8Array, epk: string, recipient: string, purpose: string): Uint8Array {
   return hkdf(shared, concatBytes(fromB64u(epk, 32), fromB64u(recipient, 32)), `box/${purpose}`);
 }

@@ -4,7 +4,7 @@ import { hashTagged, hkdf, randomBytes, sign, signingKeyPairFromSeed, verify, ty
 import { fail } from "./errors.js";
 import { deviceIdFor, isHash, isId, randomId } from "./ids.js";
 import * as v from "./validate.js";
-import type { DeviceRecord, InviteRecord, Role, WorkspaceState } from "./workspace.js";
+import { grantedRooms, inviteCreatorStands, parseAgreementKey, parseSigningKey, type DeviceRecord, type InviteRecord, type Role, type WorkspaceState } from "./workspace.js";
 
 /**
  * Invites. The link carries a random 32-byte secret. From it both sides derive an Ed25519 "invite key": the admin
@@ -23,12 +23,12 @@ export interface NewInvite {
   record: InviteRecord;
 }
 
-export function newInvite(byUserId: string, rooms: Record<string, Role>, expires: number, forUser?: string): NewInvite {
+export function newInvite(by: { user: string; device: string }, rooms: Record<string, Role>, expires: number, forUser?: string): NewInvite {
   const secret = randomBytes(32);
   return {
     inviteId: randomId("i"),
     secret,
-    record: { by: byUserId, key: inviteKeyFromSecret(secret).publicKey, expires, rooms, ...(forUser ? { forUser } : {}) }
+    record: { by: by.user, dev: by.device, key: inviteKeyFromSecret(secret).publicKey, expires, rooms, ...(forUser ? { forUser } : {}) }
   };
 }
 
@@ -129,7 +129,7 @@ export function parseJoinRecord(value: unknown): JoinRecord {
   if (b.kind !== "vr-join-v1") v.bad("join.kind");
   const user = v.obj(b.user, "join.user", ["id", "name"]);
   const device = v.obj(b.device, "join.device", ["id", "name", "sign", "agree", "tls"]);
-  const sign = v.b64(device.sign, "join.device.sign", 32);
+  const sign = parseSigningKey(device.sign, "join.device.sign");
   const id = v.id(device.id, "join.device.id", "d");
   if (deviceIdFor(sign) !== id) v.bad("join.device.id");
   return {
@@ -138,7 +138,7 @@ export function parseJoinRecord(value: unknown): JoinRecord {
       ws: v.hash(b.ws, "join.ws"),
       invite: v.id(b.invite, "join.invite", "i"),
       user: { id: v.id(user.id, "join.user.id", "u"), name: v.name(user.name, "join.user.name") },
-      device: { id, name: v.name(device.name, "join.device.name"), sign, agree: v.b64(device.agree, "join.device.agree", 32), tls: v.hash(device.tls, "join.device.tls") },
+      device: { id, name: v.name(device.name, "join.device.name"), sign, agree: parseAgreementKey(device.agree, "join.device.agree"), tls: v.hash(device.tls, "join.device.tls") },
       at: v.int(b.at, "join.at", 0, Number.MAX_SAFE_INTEGER)
     },
     inviteSig: v.b64(o.inviteSig, "join.inviteSig", 64),
@@ -179,6 +179,8 @@ export function verifyJoinRecord(state: WorkspaceState, workspaceId: string, joi
   if (!invite) fail("join_no_invite");
   if (invite.used !== undefined) fail("join_used");
   if (firstSeen > invite.expires + JOIN_EXPIRY_SLACK_MS) fail("join_expired");
+  // The creator must still stand: their device active, and (inviting a new person) still an admin.
+  if (!inviteCreatorStands(state, invite)) fail("join_creator");
   if (invite.forUser !== undefined) {
     const user = state.users[invite.forUser];
     if (body.user.id !== invite.forUser || !user || user.removed) fail("join_user");
@@ -220,17 +222,21 @@ export function applyJoins(
   return { state: next, applied };
 }
 
-/** Records a join in a state: the user (unless joining as another device), the device, the invite as used, and its room grants. */
+/**
+ * Records a join in a state: the user (unless joining as another device), the device, the invite as used, and its
+ * room grants (those its creator still manages).
+ */
 export function foldJoinInto(state: WorkspaceState, join: JoinRecord): void {
   const invite = state.invites[join.body.invite];
   if (!invite || invite.used !== undefined) fail("join_used");
   const { user, device } = join.body;
+  const grants = grantedRooms(state, invite);
   if (invite.forUser === undefined) state.users[user.id] = { name: user.name, admin: false };
   const record: DeviceRecord = { user: user.id, name: device.name, sign: device.sign, agree: device.agree, tls: device.tls };
   state.devices[device.id] = record;
   invite.used = device.id;
-  for (const [roomId, role] of Object.entries(invite.rooms)) {
-    const room = state.rooms[roomId];
-    if (room && !room.deleted && room.members[user.id] === undefined) room.members[user.id] = role;
+  for (const [roomId, role] of Object.entries(grants)) {
+    const room = state.rooms[roomId]!;
+    if (room.members[user.id] === undefined) room.members[user.id] = role;
   }
 }

@@ -18,6 +18,8 @@ export const DISCOVERY_GROUP = "239.255.86.83";
 const ANNOUNCE_EVERY_MS = 15_000;
 const MAX_AGE_MS = 120_000;
 const MAX_PACKETS_PER_SECOND = 100;
+/** Per sender address, so one noisy machine can't drown out everyone else's announcements. */
+const MAX_PACKETS_PER_SOURCE = 10;
 
 interface AnnouncementBody {
   k: "vr-peer";
@@ -69,6 +71,7 @@ export class Discovery {
   private timer: ReturnType<typeof setInterval> | null = null;
   private windowStart = 0;
   private windowCount = 0;
+  private perSource = new Map<string, number>();
 
   constructor(private readonly options: DiscoveryOptions) {}
 
@@ -108,8 +111,11 @@ export class Discovery {
     if (now - this.windowStart > 1000) {
       this.windowStart = now;
       this.windowCount = 0;
+      this.perSource.clear();
     }
-    if (++this.windowCount > MAX_PACKETS_PER_SECOND) return;
+    const fromSource = (this.perSource.get(address) ?? 0) + 1;
+    if (this.perSource.size < 1000) this.perSource.set(address, fromSource);
+    if (fromSource > MAX_PACKETS_PER_SOURCE || ++this.windowCount > MAX_PACKETS_PER_SECOND) return;
     const found = readAnnouncement(packet, this.options.workspaceId, this.options.membership(), now);
     if (found && found.device !== this.options.deviceId) this.options.onPeer(found.device, address, found.port);
   }

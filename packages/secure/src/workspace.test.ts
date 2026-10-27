@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { b64u } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { SecureError } from "./errors.js";
 import { randomId } from "./ids.js";
-import { createJoinRecord, foldJoinInto, JOIN_EXPIRY_SLACK_MS, newInvite, type JoinRecord } from "./invite.js";
+import { createJoinRecord, foldJoinInto, JOIN_EXPIRY_SLACK_MS, newInvite, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName } from "./keys.js";
 import { createRoom, fold, founder, invite, newDevice, step, type TestDevice } from "./testkit.js";
-import { nextVersion, parseSignedVersion, roleIn, signVersion, verifyGenesis, versionHash, type WorkspaceState } from "./workspace.js";
+import { LIMITS, nextVersion, parseSignedVersion, rebaseChange, roleIn, signVersion, verifyGenesis, versionHash, type WorkspaceState } from "./workspace.js";
 
 function forbidden(chain: WorkspaceChain, device: TestDevice, change: (state: WorkspaceState) => void, joins: JoinRecord[] = [], now = Date.now()): string {
   try {
@@ -121,7 +122,7 @@ describe("devices and users", () => {
       })
     ).toBe(`forbidden:device_add:${fake.id}`);
     // Nor through an invite "for" Ben that Ana makes herself.
-    const forBen = newInvite(admin.userId, {}, Date.now() + 3_600_000, ben.userId);
+    const forBen = newInvite({ user: admin.userId, device: admin.id }, {}, Date.now() + 3_600_000, ben.userId);
     expect(forbidden(chain, admin, (state) => (state.invites[forBen.inviteId] = forBen.record))).toBe(`forbidden:invite_device:${forBen.inviteId}`);
   });
 
@@ -129,7 +130,7 @@ describe("devices and users", () => {
     const { chain, admin } = founder();
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
     const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "write" });
-    const own = newInvite(ben.userId, {}, Date.now() + 3_600_000, ben.userId);
+    const own = newInvite({ user: ben.userId, device: ben.id }, {}, Date.now() + 3_600_000, ben.userId);
     step(chain, ben, (state) => (state.invites[own.inviteId] = own.record));
     const laptop = newDevice(ben.userId, "Ben laptop");
     const join = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: own.inviteId, secret: own.secret, user: { id: ben.userId, name: "Ben" }, deviceName: laptop.name, deviceKey: laptop.sign, agreementPublicKey: laptop.agree.publicKey, tlsFingerprint: laptop.tls });
@@ -153,7 +154,7 @@ describe("devices and users", () => {
     const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
     const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "manage" });
     step(chain, admin, (state) => delete state.rooms[roomId]!.members[admin.userId]);
-    const sneaky = newInvite(admin.userId, { [roomId]: "read" }, Date.now() + 3_600_000);
+    const sneaky = newInvite({ user: admin.userId, device: admin.id }, { [roomId]: "read" }, Date.now() + 3_600_000);
     expect(forbidden(chain, admin, (state) => (state.invites[sneaky.inviteId] = sneaky.record))).toBe(`forbidden:invite_room:${sneaky.inviteId}`);
   });
 
@@ -229,10 +230,10 @@ describe("devices and users", () => {
     fold(chain, ben, join); // Ben isn't an admin, but the proof is all that's needed.
     expect(roleIn(chain.state, roomId, join.body.user.id)).toBe("read");
     // Ben's own-device invite: Ana (admin) doesn't know its secret, so she can't fill it with her device.
-    const own = newInvite(ben.userId, {}, Date.now() + 3_600_000, ben.userId);
+    const own = newInvite({ user: ben.userId, device: ben.id }, {}, Date.now() + 3_600_000, ben.userId);
     step(chain, ben, (state) => (state.invites[own.inviteId] = own.record));
     const anasDevice = newDevice(ben.userId, "Ana's spare");
-    const forged = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: own.inviteId, secret: newInvite(ben.userId, {}, 0).secret, user: { id: ben.userId, name: "Ben" }, deviceName: anasDevice.name, deviceKey: anasDevice.sign, agreementPublicKey: anasDevice.agree.publicKey, tlsFingerprint: anasDevice.tls });
+    const forged = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: own.inviteId, secret: newInvite({ user: ben.userId, device: ben.id }, {}, 0).secret, user: { id: ben.userId, name: "Ben" }, deviceName: anasDevice.name, deviceKey: anasDevice.sign, agreementPublicKey: anasDevice.agree.publicKey, tlsFingerprint: anasDevice.tls });
     expect(forbidden(chain, admin, (state) => foldJoinInto(state, forged), [forged])).toBe(`forbidden:invite_proof:${own.inviteId}`);
   });
 
@@ -264,6 +265,124 @@ describe("devices and users", () => {
     const other = newDevice(admin.userId);
     expect(forbidden(chain, admin, (state) => (state.devices[admin.id]!.agree = other.agree.publicKey))).toBe(`forbidden:device_keys:${admin.id}`);
     expect(forbidden(chain, admin, (state) => (state.users[admin.userId]!.admin = false))).toBe("forbidden:no_admin");
+  });
+
+  it("an invite dies with its creator's standing", () => {
+    const { chain, ws, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    step(chain, admin, (state) => (state.users[ben.userId]!.admin = true));
+    // Ben, an admin for now, invites someone; then Ana takes his admin rights away.
+    const { join, inviteId } = invite(chain, ben, { fold: false });
+    step(chain, admin, (state) => (state.users[ben.userId]!.admin = false));
+    expect(() => verifyJoinRecord(chain.state, ws, join, Date.now())).toThrow(/join_creator/);
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join])).toBe(`forbidden:invite_creator:${inviteId}`);
+  });
+
+  it("a stolen computer's invite for another device of its user stops working once it is revoked", () => {
+    const { chain, ws, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { join, inviteId } = invite(chain, ben, { forUser: ben, fold: false });
+    step(chain, admin, (state) => (state.devices[ben.id]!.revoked = true));
+    expect(() => verifyJoinRecord(chain.state, ws, join, Date.now())).toThrow(/join_creator/);
+    expect(forbidden(chain, admin, (state) => foldJoinInto(state, join), [join])).toBe(`forbidden:invite_creator:${inviteId}`);
+  });
+
+  it("an invite grants only the rooms its creator still manages, and their managers may withdraw it", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { joiner: cy } = invite(chain, admin, { userName: "Cy" });
+    const { roomId } = createRoom(chain, admin, "Docs", { [ben.userId]: "manage" });
+    const { roomId: kept } = createRoom(chain, admin, "Kept");
+    const { join } = invite(chain, admin, { rooms: { [roomId]: "write", [kept]: "read" }, fold: false });
+    // Ben, a manager of Docs, takes Ana's management of it away before the join is recorded.
+    step(chain, ben, (state) => (state.rooms[roomId]!.members[admin.userId] = "read"));
+    fold(chain, admin, join);
+    expect(roleIn(chain.state, roomId, join.body.user.id)).toBeUndefined();
+    expect(roleIn(chain.state, kept, join.body.user.id)).toBe("read");
+    const { inviteId } = invite(chain, admin, { rooms: { [kept]: "read" }, fold: false });
+    expect(forbidden(chain, cy, (state) => delete state.invites[inviteId])).toBe(`forbidden:invite_withdraw:${inviteId}`);
+    step(chain, admin, (state) => (state.rooms[kept]!.members[cy.userId] = "manage"));
+    step(chain, cy, (state) => delete state.invites[inviteId]);
+  });
+
+  it("one key epoch per version, and the last ones are kept for managers", () => {
+    const { chain, admin } = founder();
+    const { joiner: writer } = invite(chain, admin, { userName: "Wen" });
+    const { roomId } = createRoom(chain, admin, "Docs", { [writer.userId]: "write" });
+    const epoch = (state: WorkspaceState) => {
+      const n = state.rooms[roomId]!.epochs.length + 1;
+      state.rooms[roomId]!.epochs.push({ n, commit: keyCommitment(chain.workspaceId, roomId, n, newRoomKey()) });
+    };
+    expect(
+      forbidden(chain, writer, (state) => {
+        epoch(state);
+        epoch(state);
+      })
+    ).toBe(`forbidden:room_epochs:${roomId}`);
+    const saved = LIMITS.writerEpochs;
+    LIMITS.writerEpochs = 3;
+    try {
+      step(chain, writer, epoch);
+      step(chain, writer, epoch);
+      expect(forbidden(chain, writer, epoch)).toBe(`forbidden:room_rotate_limit:${roomId}`);
+      step(chain, admin, epoch);
+    } finally {
+      LIMITS.writerEpochs = saved;
+    }
+  });
+
+  it("every version changes something, and no one user fills the invite table", () => {
+    const { chain, admin } = founder();
+    expect(forbidden(chain, admin, () => {})).toBe("forbidden:no_change");
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const own = () => newInvite({ user: ben.userId, device: ben.id }, {}, Date.now() + 3_600_000, ben.userId);
+    for (let i = 0; i < LIMITS.invitesPerUser; i++) {
+      const next = own();
+      step(chain, ben, (state) => (state.invites[next.inviteId] = next.record));
+    }
+    const extra = own();
+    expect(forbidden(chain, ben, (state) => (state.invites[extra.inviteId] = extra.record))).toBe(`forbidden:invite_limit:${extra.inviteId}`);
+  });
+
+  it("refuses keys of small order and room ids that differ only in case", () => {
+    const { chain, admin } = founder();
+    const { join } = invite(chain, admin, { fold: false });
+    const weak = JSON.parse(JSON.stringify(join));
+    weak.body.device.agree = b64u(new Uint8Array(32));
+    expect(() => parseJoinRecord(weak)).toThrow(/join\.device\.agree/);
+    const identity = JSON.parse(JSON.stringify(join));
+    identity.body.device.sign = b64u(Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 1 : 0)));
+    expect(() => parseJoinRecord(identity)).toThrow(/join\.device\.sign/);
+    const { roomId } = createRoom(chain, admin);
+    const raw = JSON.parse(JSON.stringify(chain.head));
+    const variant = roomId[0] + [...roomId.slice(1)].map((ch) => (ch === ch.toLowerCase() ? ch.toUpperCase() : ch.toLowerCase())).join("");
+    raw.body.state.rooms[variant] = raw.body.state.rooms[roomId];
+    expect(() => parseSignedVersion(raw)).toThrow(/\.id$/);
+  });
+
+  it("refuses versions dated far ahead of the receiver's clock", () => {
+    const { chain, admin } = founder();
+    const now = Date.now();
+    const future = nextVersion(chain.workspaceId, chain.head, admin.sign, (state) => (state.name = "Later"), now + 3_600_000);
+    expect(chain.offer([future], now)).toEqual({ status: "rejected", reason: "forbidden:future" });
+    expect(chain.offer([future], now + 3_600_000).status).toBe("appended");
+  });
+
+  it("re-applies a version lost in a fork on top of the winner, keeping the winner's changes", () => {
+    const { chain, admin } = founder();
+    const { joiner: ben } = invite(chain, admin, { userName: "Ben" });
+    const { roomId } = createRoom(chain, admin, "Docs");
+    const base = chain.state;
+    const lost = structuredClone(base);
+    lost.rooms[roomId]!.members[ben.userId] = "write";
+    lost.name = "Lost name";
+    const winner = structuredClone(base);
+    winner.users[ben.userId]!.name = "Benjamin";
+    const merged = rebaseChange(base, lost, winner);
+    expect(merged.name).toBe("Lost name");
+    expect(merged.users[ben.userId]!.name).toBe("Benjamin");
+    expect(merged.rooms[roomId]!.members[ben.userId]).toBe("write");
+    step(chain, admin, (state) => Object.assign(state, merged));
   });
 
   it("rejects a version whose signature doesn't match its signer", () => {

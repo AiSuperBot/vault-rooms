@@ -4,7 +4,7 @@ import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { randomId } from "./ids.js";
 import { keyCommitment, newRoomKey, wrapRoomKey } from "./keys.js";
-import { openEnvelope } from "./envelope.js";
+import { openEnvelope, sealSnapshot } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
 import { RoomReplica, type FileEntry } from "./replica.js";
@@ -166,7 +166,7 @@ describe("room replica", () => {
     expect([...a.replica.files().values()].map((f) => f.path)).toEqual(["Fine.md"]);
   });
 
-  it("shares attachments as encrypted blobs others can check", () => {
+  it("shares attachments as encrypted blobs others can check", async () => {
     const s = setup();
     const a = s.member(s.ana);
     const c = s.member(s.cy);
@@ -177,10 +177,10 @@ describe("room replica", () => {
     const fileId = randomId("f");
     a.replica.editIndex((files) => files.set(fileId, { path: "img.png", kind: "bin", blob: ref }));
     s.net.link(a.node, c.node);
-    s.net.pump();
+    await s.net.settle();
     c.replica.refreshKeys();
     const entry = c.replica.files().get(fileId)!;
-    expect(fromUtf8(c.replica.readBlob(entry.blob!)!)).toBe("PNG bytes");
+    expect(fromUtf8((await c.replica.readBlob(entry.blob!))!)).toBe("PNG bytes");
   });
 
   it("compacts with a snapshot that a newcomer can start from", () => {
@@ -199,6 +199,128 @@ describe("room replica", () => {
     s.net.pump();
     c.replica.refreshKeys();
     expect(c.replica.noteText(fileId)).toBe(text.toString());
+  });
+
+  it("a snapshot that lies about what it covers takes nothing away from members and freezes nothing", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "Keep me");
+    s.net.pump();
+    // Cy, a writer, publishes an empty state claiming to cover every counter of everyone.
+    const lie = sealSnapshot({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.cy.sign }, fileId, 1, { [s.ana.id]: Number.MAX_SAFE_INTEGER, [s.cy.id]: Number.MAX_SAFE_INTEGER }, Y.encodeStateAsUpdate(new Y.Doc()));
+    expect(c.node.publish(lie)).toBe(true);
+    s.net.pump();
+    // Ana keeps every update (the snapshot doesn't contain them), and her text and counters are untouched.
+    expect(a.node.store.envelopesOf(s.roomId, fileId).updates.length).toBeGreaterThan(0);
+    expect(a.replica.reload(fileId).getText("content").toString()).toBe("Keep me");
+    expect(a.node.store.maxClock(s.roomId, fileId, s.ana.id)).toBeLessThan(10);
+    a.replica.noteDoc(fileId).getText("content").insert(7, " and more");
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe("Keep me and more");
+  });
+
+  it("an honest snapshot is checked, then replaces what it really contains", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    s.wrapFor(s.ana);
+    a.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "One");
+    a.replica.noteDoc(fileId).getText("content").insert(3, " two");
+    const before = a.node.store.envelopesOf(s.roomId, fileId).updates.length;
+    expect(a.replica.snapshot(fileId)).not.toBeNull();
+    expect(before).toBeGreaterThan(0);
+    expect(a.node.store.envelopesOf(s.roomId, fileId).updates).toHaveLength(0);
+    expect(a.replica.reload(fileId).getText("content").toString()).toBe("One two");
+    expect(a.node.store.vv(s.roomId, fileId)[s.ana.id]).toBe(before);
+  });
+
+  it("seals new content only under the room's newest key, holding edits until it arrives", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    c.replica.refreshKeys();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    const fileId = addNote(a.replica, "Plan.md", "Before");
+    s.net.pump();
+    // Ana removes Rae and rotates; Cy learns of the new epoch before she has its key.
+    const k2 = newRoomKey();
+    a.node.offerVersions([
+      nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => {
+        delete state.rooms[s.roomId]!.members[s.rae.userId];
+        state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) });
+      })
+    ]);
+    a.replica.addOwnKey(2, k2);
+    s.net.pump();
+    expect(c.replica.sealEpoch()).toBeNull();
+    expect(c.replica.edit(fileId, (doc) => doc.getText("content").insert(6, " (Cy)"))).toBe("queued");
+    // Nothing went out under the old key, which Rae still has.
+    expect(a.node.store.envelopesOf(s.roomId, fileId).updates.every((u) => u.author !== s.cy.id)).toBe(true);
+    s.wrapFor(s.cy, 2, k2);
+    s.net.pump();
+    expect(a.replica.noteText(fileId)).toBe("Before (Cy)");
+    expect(a.node.store.envelopesOf(s.roomId, fileId).updates.filter((u) => u.author === s.cy.id).every((u) => u.n === 2)).toBe(true);
+  });
+
+  it("drops a key the record no longer backs, and sends again what was sealed under it", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    c.replica.refreshKeys();
+    const link = s.net.link(a.node, c.node);
+    s.net.pump();
+    const fileId = addNote(a.replica, "Plan.md", "Start");
+    s.net.pump();
+    link.cut();
+    // Apart, both start epoch 2 with their own key, and Cy writes under hers.
+    const kc = newRoomKey();
+    const ka = newRoomKey();
+    c.node.offerVersions([nextVersion(s.ws, c.node.chain.head, s.cy.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, kc) }))]);
+    c.replica.addOwnKey(2, kc);
+    c.replica.noteDoc(fileId).getText("content").insert(5, " by Cy");
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, ka) }))]);
+    a.replica.addOwnKey(2, ka);
+    // They meet: Ana's rotation wins (she is an admin). Cy drops her key and gets Ana's.
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    expect(c.node.chain.headHash).toBe(a.node.chain.headHash);
+    c.replica.refreshKeys();
+    expect(c.replica.keyFor(2)).toBeUndefined();
+    expect(a.replica.noteText(fileId)).toBe("Start");
+    s.wrapFor(s.cy, 2, ka);
+    s.net.pump();
+    expect(a.replica.noteText(fileId)).toBe("Start by Cy");
+  });
+
+  it("refuses an edit it can't share and rebuilds the document without it", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const r = s.member(s.rae);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.rae);
+    a.replica.refreshKeys();
+    s.net.link(a.node, r.node);
+    s.net.pump();
+    r.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "Original");
+    s.net.pump();
+    expect(r.replica.edit(fileId, (doc) => doc.getText("content").insert(0, "Vandal "))).toBe("refused");
+    expect(r.refused).toEqual([]);
+    expect(r.replica.noteText(fileId)).toBe("Original");
   });
 
   it("after a key rotation, a removed member can't read new content", () => {

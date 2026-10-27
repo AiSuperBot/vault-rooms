@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
+import { randomBytes } from "./crypto.js";
 import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope } from "./envelope.js";
 import { randomId } from "./ids.js";
+import { createJoinRecord, joinHash } from "./invite.js";
 import { unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
@@ -187,7 +189,7 @@ describe("mesh", () => {
     net.link(b, c);
     net.link(a, c);
     net.pump();
-    a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, 1, utf8("cursor")));
+    a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now(), utf8("cursor")));
     const delivered = net.pump();
     expect(seen).toEqual([ana.id]);
     expect(delivered).toBeLessThan(20);
@@ -205,6 +207,71 @@ describe("mesh", () => {
     net.pump();
     expect(a.connectedDevices()).toEqual([]);
     expect(x.connectedDevices()).toEqual([]);
+  });
+
+  it("keeps nothing a stranger sends before joining, and only one wrap per slot", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    const stranger = founder().admin;
+    const session = a.connect({ send: () => {}, close: () => {} }, stranger.id);
+    // A made-up join for an invite nobody issued: refused, and not kept for later.
+    const fake = createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Eve" }, deviceName: "Eve", deviceKey: stranger.sign, agreementPublicKey: stranger.agree.publicKey, tlsFingerprint: stranger.tls });
+    session.receive({ t: "join", join: fake });
+    expect(session.isClosed).toBe(true);
+    expect(a.joinEntries()).toEqual([]);
+    expect(a.addWrap(wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign))).toBe(true);
+    expect(a.addWrap(wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign))).toBe(false);
+    expect(a.allWraps()).toHaveLength(1);
+  });
+
+  it("keeps one join per invite, the one every peer picks", () => {
+    const { chain, ws, ana } = setup();
+    const a = nodeFor(chain, ana);
+    const withInvite = invite(chain, ana, { fold: false });
+    a.offerVersions(chain.since(a.chain.length));
+    const joins = [withInvite.join];
+    for (let i = 0; i < 5; i++) {
+      const device = founder().admin;
+      joins.push(createJoinRecord({ workspaceId: ws, inviteId: withInvite.inviteId, secret: withInvite.secret, user: { id: randomId("u"), name: `Twin ${i}` }, deviceName: "Twin", deviceKey: device.sign, agreementPublicKey: device.agree.publicKey, tlsFingerprint: device.tls }));
+    }
+    for (const j of joins) a.addJoin(j);
+    expect(a.pendingJoinRecords()).toHaveLength(1);
+    const lowest = joins.map((j) => joinHash(j)).sort()[0];
+    expect(joinHash(a.pendingJoinRecords()[0]!)).toBe(lowest);
+  });
+
+  it("refuses presence that isn't fresh", () => {
+    const { chain, ws, ana, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    expect(a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now() - 5 * 60_000, utf8("old")))).toBe(false);
+    expect(a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now(), utf8("now")))).toBe(true);
+  });
+
+  it("sends what it made only once it is stored", async () => {
+    const { chain, ana, cy, roomId, key, seal } = setup();
+    const net = new Network();
+    const a = nodeFor(chain, ana);
+    const c = nodeFor(chain, cy);
+    let release: () => void = () => {};
+    a.persist = () => new Promise<void>((resolve) => (release = resolve));
+    net.link(a, c);
+    net.pump();
+    a.publish(seal(ana, 1, "pending"));
+    net.pump();
+    expect(texts(c, roomId, key)).toEqual([]);
+    release();
+    await net.settle();
+    expect(texts(c, roomId, key)).toEqual(["pending"]);
+  });
+
+  it("a joining device refuses a record that doesn't know its invite", () => {
+    const { chain, ws, ana } = setup();
+    const { join } = invite(WorkspaceChain.load(chain.all()), ana, { fold: false });
+    const outcome: string[] = [];
+    const handshake = new JoinHandshake({ send: () => {}, close: () => {} }, ws, join, () => outcome.push("accepted"), (reason) => outcome.push(reason));
+    handshake.receive({ t: "hello", ws, head: chain.head.body.v, recent: [] });
+    handshake.receive({ t: "versions", versions: JSON.parse(JSON.stringify(chain.all())) });
+    expect(outcome).toEqual([expect.stringMatching(/join_no_invite/)]);
   });
 
   it("says nothing to a device that isn't a member until it presents a join", () => {

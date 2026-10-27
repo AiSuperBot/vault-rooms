@@ -12,33 +12,53 @@ export function encodeFrame(message: unknown): Buffer {
   return Buffer.concat([head, body]);
 }
 
-/** Collects bytes from a stream and yields whole frames. Throws on an oversized frame or bad JSON. */
+/**
+ * Collects bytes from a stream and yields whole frames. Throws on an oversized frame or bad JSON. Each byte is copied
+ * once, straight into the frame it belongs to, so a frame that trickles in a byte at a time costs no more than one
+ * that arrives at once.
+ */
 export class FrameReader {
-  private chunks: Buffer[] = [];
-  private buffered = 0;
+  private header = Buffer.alloc(4);
+  private headerGot = 0;
+  private body: Buffer | null = null;
+  private bodyGot = 0;
 
-  constructor(private readonly maxFrame = MAX_FRAME) {}
+  constructor(private maxFrame = MAX_FRAME) {}
+
+  /** Change the frame size limit (e.g. once the other side is a member). */
+  setLimit(maxFrame: number): void {
+    this.maxFrame = maxFrame;
+  }
 
   push(chunk: Buffer): unknown[] {
-    this.chunks.push(chunk);
-    this.buffered += chunk.length;
     const out: unknown[] = [];
-    for (;;) {
-      if (this.buffered < 4) return out;
-      const all = this.chunks.length === 1 ? this.chunks[0]! : Buffer.concat(this.chunks);
-      this.chunks = [all];
-      const length = all.readUInt32BE(0);
-      if (length > this.maxFrame) fail("frame_too_large");
-      if (all.length < 4 + length) return out;
-      const body = all.subarray(4, 4 + length);
-      const rest = all.subarray(4 + length);
-      this.chunks = rest.length > 0 ? [rest] : [];
-      this.buffered = rest.length;
+    let offset = 0;
+    while (offset < chunk.length || (this.body !== null && this.bodyGot === this.body.length)) {
+      if (this.body === null) {
+        const n = Math.min(4 - this.headerGot, chunk.length - offset);
+        chunk.copy(this.header, this.headerGot, offset, offset + n);
+        this.headerGot += n;
+        offset += n;
+        if (this.headerGot < 4) break;
+        this.headerGot = 0;
+        const length = this.header.readUInt32BE(0);
+        if (length > this.maxFrame) fail("frame_too_large");
+        this.body = Buffer.allocUnsafe(length);
+        this.bodyGot = 0;
+      }
+      const n = Math.min(this.body.length - this.bodyGot, chunk.length - offset);
+      chunk.copy(this.body, this.bodyGot, offset, offset + n);
+      this.bodyGot += n;
+      offset += n;
+      if (this.bodyGot < this.body.length) break;
+      const body = this.body;
+      this.body = null;
       try {
         out.push(JSON.parse(body.toString("utf8")));
       } catch {
         fail("bad_frame");
       }
     }
+    return out;
   }
 }

@@ -20,14 +20,15 @@ export function certificateFingerprint(der: Uint8Array): string {
   return b64u(new Uint8Array(createHash("sha256").update(der).digest()));
 }
 
-export async function createTlsIdentity(deviceLabel: string, now = new Date()): Promise<TlsIdentity> {
+/** The certificate names no one: anybody on the network can see it during the TLS handshake. */
+export async function createTlsIdentity(now = new Date()): Promise<TlsIdentity> {
   const algorithm = { name: "ECDSA", namedCurve: "P-256" } as const;
   const keys = await webcrypto.subtle.generateKey(algorithm, true, ["sign", "verify"]);
   const notAfter = new Date(now);
   notAfter.setUTCFullYear(notAfter.getUTCFullYear() + 30);
   const cert = await x509.X509CertificateGenerator.createSelfSigned({
     serialNumber: randomBytes(16).toString("hex"),
-    name: `CN=${deviceLabel.replace(/[^A-Za-z0-9_-]/g, "") || "vault-rooms-device"}`,
+    name: "CN=vault-rooms",
     // A day of slack for peers whose clocks run behind.
     notBefore: new Date(now.getTime() - 86_400_000),
     notAfter,

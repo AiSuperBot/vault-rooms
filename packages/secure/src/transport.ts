@@ -1,7 +1,7 @@
 import * as tls from "node:tls";
 import { b64u, concatBytes, utf8 } from "./bytes.js";
 import { hashTagged, sign, verify, type KeyPair } from "./crypto.js";
-import { encodeFrame, FrameReader } from "./frames.js";
+import { encodeFrame, FrameReader, MAX_FRAME } from "./frames.js";
 import { deviceIdFor } from "./ids.js";
 import type { Channel, PeerMessage } from "./mesh.js";
 import { certificateFingerprint, type TlsIdentity } from "./tlsIdentity.js";
@@ -19,7 +19,9 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
  * - A device that isn't a member yet (joining) sends its public key along; the other side lets it through only to
  *   present its join record (the mesh session enforces that).
  *
- * Before authentication, frames are capped at 64 KiB and the exchange must finish within 10 seconds.
+ * Until the other side is a member, frames are capped at 64 KiB, the connection counts against a small limit of
+ * such connections, and it must become a member within 10 seconds or it is closed. Anyone on the network can
+ * generate a key, so authenticating alone earns nothing more.
  */
 
 const EXPORTER_LABEL = "EXPORTER-vault-rooms-peer-auth";
@@ -77,6 +79,7 @@ class Wire {
   private handlers: Array<(message: unknown) => void> = [];
   private closeHandlers: Array<(reason: string) => void> = [];
   private closed = false;
+  private promoted = false;
   private lastHeard = Date.now();
   private lastSent = Date.now();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -100,9 +103,11 @@ class Wire {
     socket.on("error", () => this.close("socket_error"));
   }
 
-  /** After authentication: full-size frames, heartbeats, and a cap on what may queue up unsent. */
-  authenticated(): void {
-    this.reader = new FrameReader();
+  /** The other side is a member (or a peer we dialled and checked): full-size frames and heartbeats. */
+  promote(): void {
+    if (this.promoted || this.closed) return;
+    this.promoted = true;
+    this.reader.setLimit(MAX_FRAME);
     this.timer = setInterval(() => {
       const now = Date.now();
       if (now - this.lastHeard > SILENCE_LIMIT_MS) return this.close("timeout");
@@ -139,8 +144,9 @@ class Wire {
     for (const handler of this.closeHandlers) handler(reason);
   }
 
-  link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"]): PeerLink {
-    this.authenticated();
+  /** A joining device's link stays limited until the mesh session calls `channel.ready()` (then `onReady` runs). */
+  link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void): PeerLink {
+    if (!joining) this.promote();
     this.handlers = [];
     return {
       remoteDevice,
@@ -148,7 +154,14 @@ class Wire {
       direction,
       joining,
       unverifiedAcceptor,
-      channel: { send: (message: PeerMessage) => this.write(message), close: (reason: string) => this.close(reason) },
+      channel: {
+        send: (message: PeerMessage) => this.write(message),
+        close: (reason: string) => this.close(reason),
+        ready: () => {
+          this.promote();
+          onReady?.();
+        }
+      },
       onMessage: (handler) => this.onMessage(handler),
       onClose: (handler) => this.onClose(handler)
     };
@@ -192,6 +205,7 @@ export class PeerServer {
     this.unauthenticated++;
     const wire = new Wire(socket);
     let settled = false;
+    let authenticated = false;
     const finish = (reason?: string) => {
       if (settled) return;
       settled = true;
@@ -202,10 +216,10 @@ export class PeerServer {
         this.onReject(reason, address);
       }
     };
-    const deadline = setTimeout(() => finish("auth_timeout"), AUTH_TIMEOUT_MS);
+    let deadline = setTimeout(() => finish("auth_timeout"), AUTH_TIMEOUT_MS);
     wire.onClose((reason) => finish(reason));
     wire.onMessage((raw) => {
-      if (settled) return;
+      if (settled || authenticated) return;
       try {
         const message = v.obj(raw, "auth", ["t", "tag", "device", "key", "to", "sig"]);
         if (message.t !== "auth" || message.tag !== workspaceTag(this.config.workspaceId)) return finish("auth_workspace");
@@ -221,8 +235,17 @@ export class PeerServer {
         const meant = message.to === undefined ? "" : this.config.deviceId;
         if (!verify(key, "peer-auth", authBytes("hello", ekm, device, meant, tag), v.b64(message.sig, "auth.sig", 64))) return finish("auth_signature");
         wire.write({ t: "auth_ok", device: this.config.deviceId, sig: sign(this.config.deviceKey.secretKey, "peer-auth-ok", authBytes("ok", ekm, device, this.config.deviceId, tag)) });
-        finish();
-        this.onPeer(wire.link(device, "in", !member));
+        authenticated = true;
+        if (member) {
+          finish();
+          this.onPeer(wire.link(device, "in", false));
+          return;
+        }
+        // A joining device: it keeps the small frames, its place in the limited count and a fresh deadline until its
+        // join makes it a member and the session starts.
+        clearTimeout(deadline);
+        deadline = setTimeout(() => finish("join_timeout"), AUTH_TIMEOUT_MS);
+        this.onPeer(wire.link(device, "in", true, undefined, () => finish()));
       } catch {
         finish("auth_malformed");
       }

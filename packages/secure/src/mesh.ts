@@ -2,13 +2,13 @@ import { b64u, utf8 } from "./bytes.js";
 import { canonicalJson } from "./canonical.js";
 import { WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
-import { isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
+import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
 import { applyJoins, joinHash, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { parseKeyWrap, verifyKeyWrap, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
-import { activeDevice, parseSignedVersion, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, parseSignedVersion, roleIn, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 /**
  * A mesh node: this device's copy of the workspace (record, pending joins, key wraps, encrypted room content) and
@@ -21,6 +21,8 @@ import { activeDevice, parseSignedVersion, type SignedVersion, type WorkspaceSta
 export interface Channel {
   send(message: PeerMessage): void;
   close(reason: string): void;
+  /** Called once the other side is a member and the session is running (a transport lifts its pre-membership limits). */
+  ready?(): void;
 }
 
 type Recent = Array<[number, string]>;
@@ -35,7 +37,7 @@ export type PeerMessage =
   | { t: "wraps"; wraps: unknown[] }
   /** Summaries of the rooms I hold. */
   | { t: "digests"; rooms: Record<string, string> }
-  /** Exactly what I hold of one room, so the other side can send what I lack. */
+  /** Exactly what I hold of one room (blobs as "author/id", those dropped here included), so the other side can send what I lack. */
   | { t: "room"; room: string; docs: Record<string, DocSummary>; blobs: string[] }
   | { t: "envelopes"; items: unknown[] }
   /** One new envelope, live. */
@@ -61,7 +63,9 @@ const RECENT = 64;
 const MAX_ITEMS = 500;
 const MAX_BATCH_BYTES = 8 << 20;
 const PRESENCE_MEMORY = 2000;
+const PRESENCE_WINDOW_MS = 60_000;
 const MAX_PENDING = 2000;
+const MAX_JOIN_VERSIONS = 1_000_000;
 
 function hashOf(purpose: string, value: unknown): string {
   return b64u(hashTagged(purpose, utf8(canonicalJson(value))));
@@ -71,17 +75,51 @@ function errorText(error: unknown): string {
   return error instanceof SecureError ? `${error.code}:${error.message}` : `error:${String(error)}`;
 }
 
+/** A token bucket: `burst` at once, then one more every `everyMs`. */
+class Budget {
+  private tokens: number;
+  private last: number;
+
+  constructor(
+    private readonly burst: number,
+    private readonly everyMs: number,
+    now: number
+  ) {
+    this.tokens = burst;
+    this.last = now;
+  }
+
+  take(now: number): boolean {
+    this.tokens = Math.min(this.burst, this.tokens + (now - this.last) / this.everyMs);
+    this.last = now;
+    if (this.tokens < 1) return false;
+    this.tokens--;
+    return true;
+  }
+}
+
 export class MeshNode {
   readonly store: EnvelopeStore;
   chain: WorkspaceChain;
   private joins = new Map<string, { join: JoinRecord; firstSeen: number }>();
+  /** One wrap per (room, epoch, recipient, wrapper): a member can't pile up wraps. */
   private wraps = new Map<string, KeyWrap>();
   /** Joins and wraps that didn't verify yet (our record may be behind); retried when membership changes. */
   private pendingJoins = new Map<string, { join: JoinRecord; firstSeen: number }>();
   private pendingWraps = new Map<string, KeyWrap>();
   private sessions = new Set<PeerSession>();
   private seenPresence = new Set<string>();
+  private olderPresence = new Set<string>();
+  private presenceBudgets = new Map<string, Budget>();
+  private memberRooms = new Set<string>();
   private effectiveCache: WorkspaceState | null = null;
+  /** Envelopes made here that aren't safely stored yet: they don't leave this device until they are. */
+  private unpersisted = new Set<string>();
+  /**
+   * Set by the owner: resolves once an envelope made here is safely on disk. Only then is it sent, so a crash can
+   * never lose an envelope a peer already has, and the counter it used is never handed out twice.
+   */
+  persist: ((env: StoredEnvelope) => Promise<void>) | null = null;
 
   constructor(
     chain: WorkspaceChain,
@@ -92,6 +130,9 @@ export class MeshNode {
   ) {
     this.chain = chain;
     this.store = store ?? new EnvelopeStore();
+    this.store.isMember = (room) => this.isMemberOf(room);
+    this.store.now = now;
+    this.memberRooms = this.currentMemberRooms();
   }
 
   get workspaceId(): string {
@@ -104,6 +145,31 @@ export class MeshNode {
     return this.effectiveCache;
   }
 
+  /** Whether this device may read a room (its user is a member). */
+  isMemberOf(room: string): boolean {
+    const state = this.effective();
+    const device = activeDevice(state, this.deviceId);
+    return device !== null && roleIn(state, room, device.user) !== undefined;
+  }
+
+  private currentMemberRooms(): Set<string> {
+    return new Set(Object.keys(this.effective().rooms).filter((room) => this.isMemberOf(room)));
+  }
+
+  /**
+   * Keep a valid join unless one for the same invite with a lower hash is kept already (the one every peer picks, see
+   * applyJoins): whoever holds an invite link can make any number of joins with it, but only one is ever kept.
+   */
+  private keepJoin(hash: string, entry: { join: JoinRecord; firstSeen: number }): boolean {
+    for (const [other, kept] of this.joins) {
+      if (kept.join.body.invite !== entry.join.body.invite) continue;
+      if (other <= hash) return false;
+      this.joins.delete(other);
+    }
+    this.joins.set(hash, entry);
+    return true;
+  }
+
   private membershipChanged(): void {
     // Joins the record now covers, or that turned invalid, are dropped; pending ones get another chance.
     for (const [hash, entry] of [...this.joins, ...this.pendingJoins]) {
@@ -111,23 +177,32 @@ export class MeshNode {
       this.pendingJoins.delete(hash);
       try {
         verifyJoinRecord(this.chain.state, this.workspaceId, entry.join, entry.firstSeen);
-        this.joins.set(hash, entry);
+        this.keepJoin(hash, entry);
       } catch (error) {
         if (error instanceof SecureError && error.code === "join_no_invite") this.pendingJoins.set(hash, entry);
       }
     }
     this.effectiveCache = null;
-    for (const [hash, wrap] of this.pendingWraps) {
+    for (const [slot, wrap] of this.pendingWraps) {
       if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) continue;
-      this.pendingWraps.delete(hash);
-      this.wraps.set(hash, wrap);
+      this.pendingWraps.delete(slot);
+      if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
       this.events.wraps?.();
     }
+    // Rooms this device just joined: what it took on snapshots' word while it only relayed them is checked now.
+    const rooms = this.currentMemberRooms();
+    for (const room of rooms) if (!this.memberRooms.has(room)) this.store.distrustClaims(room);
+    this.memberRooms = rooms;
     for (const session of [...this.sessions]) {
       if (session.ready && !activeDevice(this.effective(), session.remoteDevice)) session.close("not_a_member");
       else session.resync();
     }
     this.events.membership?.();
+  }
+
+  /** Compare rooms with every peer again (e.g. after forgetting that a blob was dropped). */
+  resync(): void {
+    for (const session of this.sessions) session.resync();
   }
 
   pendingJoinRecords(): JoinRecord[] {
@@ -142,7 +217,7 @@ export class MeshNode {
   /** Reload saved joins and wraps without passing them on (peers get them at the next sync). */
   restore(joins: Array<{ join: JoinRecord; firstSeen: number }>, wraps: KeyWrap[]): void {
     for (const entry of joins) this.pendingJoins.set(joinHash(entry.join), entry);
-    for (const wrap of wraps) this.pendingWraps.set(hashOf("wrap-hash", wrap), wrap);
+    for (const wrap of wraps) this.pendingWraps.set(wrapSlot(wrap), wrap);
     this.membershipChanged();
   }
 
@@ -153,61 +228,101 @@ export class MeshNode {
   // ---- adding things (made here or received) ----
 
   offerVersions(versions: SignedVersion[], from?: PeerSession): OfferResult {
-    const result = this.chain.offer(versions);
+    const result = this.chain.offer(versions, this.now());
     if (result.status === "appended" || result.status === "replaced") {
       this.events.chain?.(result);
-      this.broadcast({ t: "versions", versions: this.chain.since(versions[0]!.body.v) }, from);
+      // Pass on only what is new here.
+      this.broadcast({ t: "versions", versions: this.chain.since(this.chain.length - result.count) }, from);
       this.membershipChanged();
     }
     return result;
   }
 
-  /** True if the join was new and valid. A join for an invite our record doesn't know yet is kept for later. */
-  addJoin(join: JoinRecord, from?: PeerSession): boolean {
+  /**
+   * True if the join was new and valid. A join for an invite our record doesn't know yet is kept for later, but only
+   * when a member passed it on (`keepPending`): a stranger presenting a made-up join gets nothing stored.
+   */
+  addJoin(join: JoinRecord, from?: PeerSession, keepPending = true): boolean {
     const hash = joinHash(join);
     if (this.joins.has(hash) || this.pendingJoins.has(hash)) return false;
     const entry = { join, firstSeen: this.now() };
     try {
       verifyJoinRecord(this.chain.state, this.workspaceId, join, entry.firstSeen);
     } catch (error) {
-      if (error instanceof SecureError && error.code === "join_no_invite" && this.pendingJoins.size < MAX_PENDING) this.pendingJoins.set(hash, entry);
+      if (keepPending && error instanceof SecureError && error.code === "join_no_invite" && this.pendingJoins.size < MAX_PENDING) this.pendingJoins.set(hash, entry);
       throw error;
     }
-    this.joins.set(hash, entry);
+    if (!this.keepJoin(hash, entry)) return false;
     this.broadcast({ t: "joins", joins: [join] }, from);
     this.membershipChanged();
     return true;
   }
 
   addWrap(wrap: KeyWrap, from?: PeerSession): boolean {
-    const hash = hashOf("wrap-hash", wrap);
-    if (this.wraps.has(hash) || this.pendingWraps.has(hash)) return false;
+    const slot = wrapSlot(wrap);
+    if (this.wraps.has(slot) || this.pendingWraps.has(slot)) return false;
     if (!verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
-      if (this.pendingWraps.size < MAX_PENDING) this.pendingWraps.set(hash, wrap);
+      if (this.pendingWraps.size < MAX_PENDING) this.pendingWraps.set(slot, wrap);
       return false;
     }
-    this.wraps.set(hash, wrap);
+    this.wraps.set(slot, wrap);
     this.events.wraps?.();
     this.broadcast({ t: "wraps", wraps: [wrap] }, from);
     return true;
   }
 
-  /** Store and pass on a room envelope (presence is only passed on). False if invalid or already known. */
+  /** Store and pass on a room envelope (presence is only passed on). False if invalid, already known or refused. */
   publish(env: Envelope, from?: PeerSession): boolean {
     if (!verifyEnvelope(this.effective(), this.workspaceId, env)) return false;
-    if (env.k === "p") {
-      const key = `${env.room}/${env.author}/${env.at}/${env.sig}`;
-      if (this.seenPresence.has(key)) return false;
-      if (this.seenPresence.size >= PRESENCE_MEMORY) this.seenPresence.clear();
-      this.seenPresence.add(key);
-      this.events.presence?.(env);
+    if (env.k === "p") return this.presence(env, from);
+    const result = this.store.add(env);
+    if (result === "conflict") this.events.rejected?.("equivocation", env.author);
+    if (result === "quota") this.events.rejected?.(`quota:${env.room}`, env.author);
+    if (result !== "added") return false;
+    this.events.envelope?.(env);
+    if (from || env.author !== this.deviceId || !this.persist) {
       this.broadcast({ t: "push", env }, from);
       return true;
     }
-    const result = this.store.add(env);
-    if (result === "conflict") this.events.rejected?.("equivocation", env.author);
-    if (result !== "added") return false;
-    this.events.envelope?.(env);
+    const key = envelopeKey(env);
+    this.unpersisted.add(key);
+    this.persist(env).then(
+      () => {
+        this.unpersisted.delete(key);
+        this.broadcast({ t: "push", env });
+      },
+      (error: unknown) => {
+        // Not stored: it stays on this device (the file on disk still has the change, to be shared again later).
+        this.events.rejected?.(`not_stored:${errorText(error)}`, this.deviceId);
+      }
+    );
+    return true;
+  }
+
+  /** @internal Whether an envelope made here is still waiting to be stored (and so mustn't be sent yet). */
+  isUnpersisted(env: StoredEnvelope): boolean {
+    return this.unpersisted.size > 0 && this.unpersisted.has(envelopeKey(env));
+  }
+
+  /** Presence: only fresh messages, at a bounded rate per author, each passed on once. */
+  private presence(env: PresenceEnvelope, from?: PeerSession): boolean {
+    const now = this.now();
+    if (Math.abs(now - env.at) > PRESENCE_WINDOW_MS) return false;
+    const key = `${env.room}/${env.author}/${env.at}/${env.sig}`;
+    if (this.seenPresence.has(key) || this.olderPresence.has(key)) return false;
+    let budget = this.presenceBudgets.get(env.author);
+    if (!budget) {
+      if (this.presenceBudgets.size >= PRESENCE_MEMORY) this.presenceBudgets.clear();
+      this.presenceBudgets.set(env.author, (budget = new Budget(60, 40, now)));
+    }
+    if (!budget.take(now)) return false;
+    // Two generations, so a message seen just before a turnover still isn't passed on twice.
+    if (this.seenPresence.size >= PRESENCE_MEMORY) {
+      this.olderPresence = this.seenPresence;
+      this.seenPresence = new Set();
+    }
+    this.seenPresence.add(key);
+    this.events.presence?.(env);
     this.broadcast({ t: "push", env }, from);
     return true;
   }
@@ -249,10 +364,16 @@ export class MeshNode {
   }
 }
 
+function wrapSlot(wrap: KeyWrap): string {
+  const { room, n, to, by } = wrap.body;
+  return `${room}/${n}/${to}/${by}`;
+}
+
 /** One peer, over one channel. The node owns the shared state; the session only speaks the protocol. */
 export class PeerSession {
   ready = false;
   private closed = false;
+  private budgets = new Map<string, Budget>();
 
   constructor(
     private readonly node: MeshNode,
@@ -268,6 +389,7 @@ export class PeerSession {
 
   private begin(): void {
     this.ready = true;
+    this.channel.ready?.();
     this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
   }
 
@@ -296,6 +418,18 @@ export class PeerSession {
     this.node.events.rejected?.(reason, this.remoteDevice);
   }
 
+  /** Requests that make this side send a lot are rationed per session; honest peers stay well within it. */
+  private allow(kind: string, burst: number, everyMs: number): boolean {
+    let budget = this.budgets.get(kind);
+    if (!budget) {
+      if (this.budgets.size >= 5000) this.budgets.clear();
+      this.budgets.set(kind, (budget = new Budget(burst, everyMs, this.node.now())));
+    }
+    if (budget.take(this.node.now())) return true;
+    this.reject(`rate:${kind}`);
+    return false;
+  }
+
   /** Feed one message from the channel. Never throws: bad input is reported, and before membership ends the session. */
   receive(raw: unknown): void {
     if (this.closed) return;
@@ -313,13 +447,14 @@ export class PeerSession {
       if (message.t !== "join") return this.close("not_a_member");
       const join = parseJoinRecord(message.join);
       if (join.body.device.id !== this.remoteDevice) return this.close("join_mismatch");
-      this.node.addJoin(join, this);
+      this.node.addJoin(join, this, false);
       if (!activeDevice(this.node.effective(), this.remoteDevice)) return this.close("not_a_member");
       this.begin();
       return;
     }
     switch (message.t) {
       case "hello":
+        if (!this.allow("hello", 3, 30_000)) return;
         return this.onHello(message);
       case "versions":
         return this.onVersions(message.versions);
@@ -328,6 +463,7 @@ export class PeerSession {
       case "wraps":
         return this.each(message.wraps, (wrap) => this.node.addWrap(parseKeyWrap(wrap), this));
       case "digests":
+        if (!this.allow("digests", 20, 3_000)) return;
         return this.onDigests(message.rooms);
       case "room":
         return this.onRoom(message);
@@ -407,31 +543,58 @@ export class PeerSession {
   }
 
   private sendRoom(room: string): void {
+    const store = this.node.store;
     const docs: Record<string, DocSummary> = {};
-    for (const doc of this.node.store.docs(room)) docs[doc] = { vv: this.node.store.vv(room, doc), snaps: this.node.store.snapshotKeys(room, doc) };
-    this.send({ t: "room", room, docs, blobs: this.node.store.blobIds(room) });
+    for (const doc of store.docs(room)) docs[doc] = { vv: store.vv(room, doc), snaps: store.snapshotKeys(room, doc) };
+    this.send({ t: "room", room, docs, blobs: [...store.blobKeys(room), ...store.gone(room).map(([key]) => key)] });
   }
 
   /** The other side told us exactly what it holds of a room: send what it lacks. */
   private onRoom(message: Record<string, unknown>): void {
     const room = v.id(message.room, "room.room", "r");
     if (!this.rooms().includes(room)) return;
+    if (!this.allow(`room:${room}`, 6, 10_000)) return;
     const theirs = parseRoomSummary(message.docs);
     if (!Array.isArray(message.blobs) || message.blobs.length > 100_000) v.bad("room.blobs");
-    const theirBlobs = new Set(message.blobs.map((id) => v.hash(id, "room.blob")));
+    const theirBlobs = new Set(message.blobs.map((key) => (isBlobKey(key) ? key : v.bad("room.blob"))));
     const store = this.node.store;
     const missing: StoredEnvelope[] = [];
     for (const doc of store.docs(room)) {
       const summary = theirs.get(doc) ?? { vv: {}, snaps: [] };
-      const sent = new Set<StoredEnvelope>(store.missingFor(room, doc, summary.vv));
-      for (const key of store.snapshotKeys(room, doc)) if (!summary.snaps.includes(key)) sent.add(store.snapshotByKey(room, doc, key)!);
-      missing.push(...sent);
+      const snaps = new Set(summary.snaps);
+      for (const key of store.snapshotKeys(room, doc)) if (!snaps.has(key)) missing.push(store.snapshotByKey(room, doc, key)!);
+      missing.push(...store.missingFor(room, doc, summary.vv));
     }
-    for (const id of store.blobIds(room)) if (!theirBlobs.has(id)) missing.push(store.blob(room, id)!);
-    // Keep messages a reasonable size.
+    // Envelopes still being stored go out on their own once they are.
+    this.sendBatched(missing.filter((env) => !this.node.isUnpersisted(env)));
+    const blobs = store.blobsOf(room).filter((meta) => !theirBlobs.has(`${meta.author}/${meta.id}`));
+    if (blobs.length > 0) void this.sendBlobs(room, blobs);
+  }
+
+  /** Blobs are read from storage one at a time and sent in their own batches. */
+  private async sendBlobs(room: string, blobs: Array<{ author: string; id: string }>): Promise<void> {
     let batch: StoredEnvelope[] = [];
     let bytes = 0;
-    for (const env of missing) {
+    for (const { author, id } of blobs) {
+      if (this.closed) return;
+      const env = await this.node.store.loadBlob(room, author, id);
+      if (!env || this.node.isUnpersisted(env)) continue;
+      batch.push(env);
+      bytes += env.ct.length;
+      if (bytes > MAX_BATCH_BYTES) {
+        this.send({ t: "envelopes", items: batch });
+        batch = [];
+        bytes = 0;
+      }
+    }
+    if (batch.length > 0) this.send({ t: "envelopes", items: batch });
+  }
+
+  /** Keep messages a reasonable size. */
+  private sendBatched(envs: StoredEnvelope[]): void {
+    let batch: StoredEnvelope[] = [];
+    let bytes = 0;
+    for (const env of envs) {
       batch.push(env);
       bytes += env.ct.length;
       if (batch.length >= MAX_ITEMS || bytes > MAX_BATCH_BYTES) {
@@ -462,8 +625,8 @@ function parseRoomSummary(raw: unknown): Map<string, DocSummary> {
 
 /**
  * A device joining with an invite link has no workspace record yet. It sends its join record, receives the record
- * from genesis, and checks that it is the workspace the link named. Then the caller starts a normal node and
- * session on the same channel.
+ * from genesis, and checks that it is the workspace the link named and that the record knows this invite. Then the
+ * caller starts a normal node and session on the same channel.
  */
 export class JoinHandshake {
   private versions: SignedVersion[] = [];
@@ -488,15 +651,19 @@ export class JoinHandshake {
       const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
       if (message.t === "hello") {
         if (message.ws !== this.workspaceId) fail("other_workspace");
-        this.targetHead = v.int(message.head, "hello.head", 0, 1e12);
+        this.targetHead = v.int(message.head, "hello.head", 0, MAX_JOIN_VERSIONS);
         this.channel.send({ t: "hello", ws: this.workspaceId, head: -1, recent: [] });
       } else if (message.t === "versions") {
         if (!Array.isArray(message.versions) || message.versions.length > MAX_ITEMS) v.bad("versions");
+        if (this.versions.length + message.versions.length > MAX_JOIN_VERSIONS) fail("too_many_versions");
         this.versions.push(...message.versions.map(parseSignedVersion));
       }
-      if (this.targetHead >= 0 && this.versions.length === this.targetHead + 1) {
-        const chain = WorkspaceChain.load(this.versions);
+      if (this.targetHead >= 0 && this.versions.length >= this.targetHead + 1) {
+        const chain = WorkspaceChain.load(this.versions.slice(0, this.targetHead + 1), Date.now());
         if (chain.workspaceId !== this.workspaceId) fail("other_workspace");
+        // The record must know this invite: still open for this join, or already recorded for this device.
+        const invite = chain.state.invites[this.join.body.invite];
+        if (invite?.used !== this.join.body.device.id) verifyJoinRecord(chain.state, this.workspaceId, this.join, Date.now());
         this.done = true;
         this.onChain(chain);
       }

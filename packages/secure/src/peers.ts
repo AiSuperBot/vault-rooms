@@ -24,14 +24,25 @@ export interface PeerManagerEvents {
   dialFailed?(target: string, reason: string): void;
 }
 
-interface Candidate extends Address {
-  firstSeen: number;
+interface Seen extends Address {
   lastSeen: number;
+}
+
+/**
+ * Where a device was announced from. Anyone can replay a member's announcement from another address, so a new address
+ * never replaces one that worked: each address is tried, and backs off, on its own.
+ */
+interface Candidate {
+  firstSeen: number;
+  addresses: Map<string, Seen>;
+  /** The address the last successful connection used. */
+  good?: string;
 }
 
 const WAIT_FOR_DIAL_MS = 8_000;
 const MIN_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 60_000;
+const ADDRESSES_PER_DEVICE = 4;
 
 export class PeerManager {
   private links = new Map<string, { link: PeerLink; session: PeerSession }>();
@@ -70,8 +81,14 @@ export class PeerManager {
   candidate(device: string, host: string, port: number): void {
     if (device === this.config.deviceId) return;
     const now = this.now();
-    const known = this.candidates.get(device);
-    this.candidates.set(device, { host, port, firstSeen: known && known.host === host && known.port === port ? known.firstSeen : now, lastSeen: now });
+    let candidate = this.candidates.get(device);
+    if (!candidate) this.candidates.set(device, (candidate = { firstSeen: now, addresses: new Map() }));
+    const key = `${host}:${port}`;
+    candidate.addresses.set(key, { host, port, lastSeen: now });
+    if (candidate.addresses.size > ADDRESSES_PER_DEVICE) {
+      const oldest = [...candidate.addresses].filter(([k]) => k !== candidate!.good && k !== key).sort(([, a], [, b]) => a.lastSeen - b.lastSeen)[0];
+      if (oldest) candidate.addresses.delete(oldest[0]);
+    }
     this.maybeDial(device);
   }
 
@@ -104,16 +121,24 @@ export class PeerManager {
   }
 
   private maybeDial(device: string): void {
-    if (this.stopped || this.links.has(device) || this.dialing.has(device) || this.inBackoff(device)) return;
+    if (this.stopped || this.links.has(device) || this.dialing.has(device)) return;
     const candidate = this.candidates.get(device);
     const record = activeDevice(this.node.effective(), device);
     if (!candidate || !record) return;
     // The lower id dials; the higher one waits a little in case the other side can't reach it (a firewall), then dials too.
     if (this.config.deviceId > device && this.now() - candidate.firstSeen < WAIT_FOR_DIAL_MS) return;
+    // The address that worked last, else the most recently announced one that isn't backing off.
+    const usable = [...candidate.addresses].filter(([key]) => !this.inBackoff(`${device}@${key}`));
+    const [key, address] = usable.find(([k]) => k === candidate.good) ?? usable.sort(([, a], [, b]) => b.lastSeen - a.lastSeen)[0] ?? [];
+    if (!key || !address) return;
     this.dialing.add(device);
-    dial(this.config, candidate.host, candidate.port, { device, fingerprint: record.tls })
-      .then((link) => this.attach(link))
-      .catch((error: Error) => this.failed(device, error.message))
+    dial(this.config, address.host, address.port, { device, fingerprint: record.tls })
+      .then((link) => {
+        candidate.good = key;
+        this.backoff.delete(`${device}@${key}`);
+        this.attach(link);
+      })
+      .catch((error: Error) => this.failed(`${device}@${key}`, error.message))
       .finally(() => this.dialing.delete(device));
   }
 
@@ -149,7 +174,6 @@ export class PeerManager {
     const session = this.node.connect(link.channel, link.remoteDevice);
     const entry = { link, session };
     this.links.set(link.remoteDevice, entry);
-    this.backoff.delete(link.remoteDevice);
     link.onMessage((message) => session.receive(message));
     link.onClose((reason) => {
       session.close(reason);

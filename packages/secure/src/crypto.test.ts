@@ -3,6 +3,8 @@ import { b64u, fromB64u, utf8 } from "./bytes.js";
 import { canonicalJson, parseCanonical } from "./canonical.js";
 import {
   hashTagged,
+  isSmallOrderSigningKey,
+  isWeakAgreementKey,
   newAgreementKeyPair,
   newSigningKeyPair,
   open,
@@ -112,6 +114,82 @@ describe("sealed boxes to a device", () => {
   it("refuse a low-order public key instead of encrypting under a known key", () => {
     const zero = b64u(new Uint8Array(32));
     expect(code(() => sealToDevice(zero, "wrap", utf8("k"), utf8("ctx")))).not.toBe("no error");
+  });
+});
+
+describe("public keys of small order", () => {
+  // Plain edwards25519 arithmetic, only to check the list against the curve.
+  const p = 2n ** 255n - 19n;
+  const L = 2n ** 252n + 27742317777372353535851937790883648493n;
+  const mod = (a: bigint) => ((a % p) + p) % p;
+  const pow = (base: bigint, e: bigint) => {
+    let r = 1n;
+    let b = mod(base);
+    for (; e > 0n; e >>= 1n) {
+      if (e & 1n) r = mod(r * b);
+      b = mod(b * b);
+    }
+    return r;
+  };
+  const d = mod(-121665n * pow(121666n, p - 2n));
+  type P = [bigint, bigint, bigint]; // projective X, Y, Z
+  const add = ([x1, y1, z1]: P, [x2, y2, z2]: P): P => {
+    const a = mod(z1 * z2);
+    const b = mod(a * a);
+    const c = mod(x1 * x2);
+    const dd = mod(y1 * y2);
+    const e = mod(d * c * dd);
+    const f = mod(b - e);
+    const g = mod(b + e);
+    return [mod(a * f * ((x1 + y1) * (x2 + y2) - c - dd)), mod(a * g * (dd + c)), mod(f * g)];
+  };
+  const times = (n: bigint, point: P): P => {
+    let result: P = [0n, 1n, 1n];
+    let addend = point;
+    for (; n > 0n; n >>= 1n) {
+      if (n & 1n) result = add(result, addend);
+      addend = add(addend, addend);
+    }
+    return result;
+  };
+  const encodeY = ([x, y, z]: P): string => {
+    const inv = pow(z, p - 2n);
+    const ay = mod(y * inv);
+    void x;
+    return Buffer.from(ay.toString(16).padStart(64, "0"), "hex").reverse().toString("hex");
+  };
+  const randomPoint = (): P => {
+    for (;;) {
+      const y = mod(BigInt(`0x${Buffer.from(randomBytes(32)).toString("hex")}`));
+      const u = mod(y * y - 1n);
+      const v = mod(d * y * y + 1n);
+      let x = mod(u * pow(v, 3n) * pow(mod(u * pow(v, 7n)), (p - 5n) / 8n));
+      if (mod(v * x * x) !== u) x = mod(x * pow(2n, (p - 1n) / 4n));
+      if (mod(v * x * x) === u) return [x, y, 1n];
+    }
+  };
+
+  it("are exactly the eight torsion points (by their y), in every spelling", () => {
+    const torsion = new Set<string>();
+    for (let i = 0; i < 80; i++) torsion.add(encodeY(times(L, randomPoint())));
+    expect(torsion.size).toBe(5); // y = 1, -1, 0, and ±y of the points of order 8
+    for (const y of torsion) {
+      const key = Buffer.from(y, "hex");
+      expect(isSmallOrderSigningKey(b64u(key))).toBe(true);
+      key[31] = key[31]! | 0x80;
+      expect(isSmallOrderSigningKey(b64u(key))).toBe(true);
+    }
+    // p and p + 1, the other spellings of 0 and 1.
+    expect(isSmallOrderSigningKey(b64u(Buffer.from(`ed${"ff".repeat(30)}7f`, "hex")))).toBe(true);
+    expect(isSmallOrderSigningKey(b64u(Buffer.from(`ee${"ff".repeat(30)}7f`, "hex")))).toBe(true);
+    for (let i = 0; i < 20; i++) expect(isSmallOrderSigningKey(newSigningKeyPair().publicKey)).toBe(false);
+  });
+
+  it("refuse agreement keys whose shared secret is known in advance", () => {
+    expect(isWeakAgreementKey(b64u(new Uint8Array(32)))).toBe(true);
+    expect(isWeakAgreementKey(b64u(Uint8Array.from({ length: 32 }, (_, i) => (i === 0 ? 1 : 0))))).toBe(true);
+    expect(isWeakAgreementKey(b64u(Buffer.from("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800", "hex")))).toBe(true);
+    for (let i = 0; i < 20; i++) expect(isWeakAgreementKey(newAgreementKeyPair().publicKey)).toBe(false);
   });
 });
 
