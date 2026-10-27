@@ -18,6 +18,10 @@ export interface PluginSettings {
   mountRoot: string;
 }
 
+/** Where an instance of this plugin that is stopping leaves its promise for the next one (shared by every instance). */
+const STOPPING = Symbol.for("vault-rooms.stopping");
+const shared = globalThis as unknown as Record<symbol, Promise<void> | undefined>;
+
 function randomScope(): string {
   return Array.from(crypto.getRandomValues(new Uint8Array(12)), (b) => (b % 36).toString(36)).join("");
 }
@@ -69,11 +73,21 @@ export default class VaultRoomsPlugin extends Plugin {
     // Editors: bind every open note of a room, whichever pane it is in.
     for (const event of ["active-leaf-change", "file-open", "layout-change"] as const) this.registerEvent(this.app.workspace.on(event as "layout-change", () => this.syncEditors()));
 
-    this.app.workspace.onLayoutReady(() => void this.startService());
+    // An instance of the plugin still stopping (updated, or turned off and on) finishes writing before this one reads.
+    this.app.workspace.onLayoutReady(() => void Promise.resolve(shared[STOPPING]).then(() => (this.unloaded ? undefined : this.startService())));
   }
 
+  private unloaded = false;
+
   async onunload(): Promise<void> {
-    await this.stopService();
+    // Obsidian doesn't wait for this: the next instance waits for it instead (see onload).
+    this.unloaded = true;
+    const done = Promise.all([shared[STOPPING], this.stopService()]).then(
+      () => {},
+      (error: Error) => console.debug(`Vault Rooms: stopping: ${error.message}`)
+    );
+    shared[STOPPING] = done;
+    await done;
   }
 
   // ---- settings ----
@@ -170,7 +184,7 @@ export default class VaultRoomsPlugin extends Plugin {
   private async stopFolders(): Promise<void> {
     for (const unsubscribe of this.unsubscribers.splice(0)) unsubscribe();
     this.editors.unbindAll();
-    for (const folder of this.folders.values()) await folder.stop();
+    await Promise.all([...this.folders.values()].map((folder) => folder.stop()));
     this.folders.clear();
     for (const presence of this.presences.values()) presence.destroy();
     this.presences.clear();
