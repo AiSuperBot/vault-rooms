@@ -52,7 +52,7 @@ Nobody needs to be online at the same time as anyone else for things to work: wh
 ## Everyday behaviour
 
 - **Offline edits** are kept and merged when computers meet. Notes merge character by character.
-- **Conflicts:** if a non-note file, or a note edited while Obsidian was closed, changed on two computers at once, nothing is overwritten: the version on this computer is kept next to it as `name (conflict <computer> <date>).ext`, and shared.
+- **Conflicts:** if a non-note file, or a note changed outside the editor (while Obsidian was closed, or by another program), changed on two computers at once, nothing is overwritten: the version on this computer is kept next to it as `name (conflict <computer> <date>).ext`, and shared.
 - **Deletions** by others go to your trash (the system trash, or Obsidian's `.trash` folder), and only if your copy was unchanged and you weren't working on it; otherwise your copy stays and is shared again.
 - **Deleting a room's folder** on your computer only hides the room there; nothing is deleted for anyone else. *Show in this vault* in the panel brings it back.
 - **Read-only rooms:** notes open read-only; a change to a file is put back, with your version kept as a copy on your computer only.
