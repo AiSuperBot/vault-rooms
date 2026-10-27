@@ -112,6 +112,27 @@ describe("mesh service", () => {
     await until(() => ben.replica(roomId)?.keyFor(2) !== undefined);
   });
 
+  it("withdraws the invite of someone let in and taken back out in a branch that lost a race", async () => {
+    const ana = await started(await MeshService.create(deps("Ana5"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const ben = await started(await MeshService.join(deps("Ben5"), { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ben.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    await ana.setAdmin(ben.me.userId, true);
+    await until(() => ben.isAdmin());
+    // Ben's invite link leaks; Mal joins with it, Ben's device lets him in, and Ben takes him back out.
+    const invite = parseInviteLink(await ben.createInvite({}));
+    const parent = ben.node.chain.head;
+    const mal = newDevice(`u${"L".repeat(22)}`, "Mal PC");
+    ben.node.addJoin(createJoinRecord({ workspaceId: ben.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: mal.userId, name: "Mal" }, deviceName: mal.name, deviceKey: mal.sign, agreementPublicKey: mal.agree.publicKey, tlsFingerprint: mal.tls }));
+    await until(() => ben.node.chain.state.devices[mal.id] !== undefined);
+    await ben.removeUser(mal.userId);
+    // At the same moment, Ana made Ben an admin no more: her change wins, and Mal's recording with it is gone.
+    const sibling = nextVersion(ben.settings.id, parent, ana.secrets.sign, (state) => (state.users[ben.me.userId]!.admin = false));
+    expect(ben.node.offerVersions([sibling]).status).toBe("replaced");
+    await until(() => ben.node.chain.state.invites[invite.inviteId] === undefined);
+    expect(ben.state.devices[mal.id]).toBeUndefined();
+  });
+
   it("never goes online once stopped", async () => {
     const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
     service.settings.port = 0;

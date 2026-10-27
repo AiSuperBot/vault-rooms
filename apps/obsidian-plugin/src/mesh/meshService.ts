@@ -9,6 +9,7 @@ import {
   formatInviteLink,
   INDEX_DOC,
   JOIN_EXPIRY_SLACK_MS,
+  joinerStands,
   joinWorkspace,
   keyCommitment,
   MeshNode,
@@ -397,11 +398,12 @@ export class MeshService {
    */
   private async reapply(lost: SignedVersion[]): Promise<void> {
     const failed: string[] = [];
+    const fork = this.node.chain.versionAt(lost[0]!.body.v - 1)?.body.state;
+    if (!fork) return;
     for (let i = 0; i < lost.length; i++) {
       const version = lost[i]!;
       if (version.body.by !== this.settings.deviceId || version.body.joins) continue;
-      const base = i === 0 ? this.node.chain.versionAt(version.body.v - 1)?.body.state : lost[i - 1]!.body.state;
-      if (!base) continue;
+      const base = i === 0 ? fork : lost[i - 1]!.body.state;
       const keys = new Map(
         Object.entries(version.body.state.rooms)
           .filter(([roomId, room]) => base.rooms[roomId] !== undefined && room.epochs.length > base.rooms[roomId]!.epochs.length)
@@ -409,7 +411,7 @@ export class MeshService {
       );
       try {
         await this.commit((state) => {
-          Object.assign(state, rebaseChange(base, version.body.state, state));
+          Object.assign(state, rebaseChange(base, version.body.state, state, fork));
           for (const [roomId, key] of keys) {
             const room = state.rooms[roomId];
             if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
@@ -426,7 +428,35 @@ export class MeshService {
         for (const roomId of Object.keys(version.body.state.rooms)) if (!base.rooms[roomId] && !this.node.chain.state.rooms[roomId]) for (const listener of this.lostRoomListeners) listener(roomId);
       }
     }
+    // Someone the lost branch brought in and took back out isn't in the winner's record at all, and the invite that
+    // brought them is open there again: it is withdrawn (by a device that may), so its link can't bring them back.
+    const end = lost[lost.length - 1]!.body.state;
+    const reopened = lost
+      .flatMap((version) => version.body.joins ?? [])
+      .filter((join) => !joinerStands(end, join))
+      .map((join) => join.body.invite)
+      .filter((inviteId) => {
+        const invite = this.node.chain.state.invites[inviteId];
+        return invite !== undefined && invite.used === undefined && (this.isAdmin() || invite.by === this.settings.userId);
+      });
+    if (reopened.length > 0) {
+      await this.commit((state) => {
+        for (const inviteId of reopened) delete state.invites[inviteId];
+      }).catch((error: Error) => this.deps.log(`withdraw reopened invites: ${error.message}`));
+    }
     if (failed.length > 0) this.deps.notify("A change you made to the workspace clashed with someone else's at the same moment and couldn't be made again. Please check it and make it again if it's still needed.");
+  }
+
+  /** Let go of a service that was opened but never started: nothing is written (another instance may be using its files). */
+  discard(): void {
+    this.stopped = true;
+    this.node.stop();
+    for (const timer of this.saveTimers.values()) clearTimeout(timer);
+    this.saveTimers.clear();
+    if (this.automateTimer) clearTimeout(this.automateTimer);
+    this.disk.discard();
+    for (const replica of this.replicas.values()) replica.destroy();
+    this.replicas.clear();
   }
 
   // ---- state for the UI ----

@@ -113,9 +113,7 @@ export class EditorBinding {
   constructor(
     private readonly resolve: (vaultPath: string) => BindTarget | null,
     /** Ask the owner to call sync() soon (with the editors open then). */
-    private readonly requestSync: (delayMs?: number) => void,
-    /** An editor stopped co-editing a note: the text it shows then (all of it already in the shared text). */
-    private readonly left?: (roomId: string, fileId: string, text: string) => void
+    private readonly requestSync: (delayMs?: number) => void
   ) {}
 
   /**
@@ -211,7 +209,6 @@ export class EditorBinding {
   private unbind(view: EditorView): void {
     const bound = this.bound.get(view);
     if (!bound) return;
-    this.left?.(bound.roomId, bound.fileId, view.state.doc.toString());
     this.forget(view);
     try {
       view.dispatch({ effects: this.compartment.reconfigure([]) });
