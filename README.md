@@ -13,7 +13,8 @@ This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms
 - **End-to-end encryption.** A computer only holds readable copies of the rooms its user belongs to. Content, file names and room names of other rooms pass through or are stored only as ciphertext.
 - **Per-folder access.** Each room has its own members, each with a role: *can read*, *can edit*, or *manages* (can add and remove people). Even a workspace admin can't get into a room without its managers.
 - **Invite links.** One link per new person, valid for a limited time, used once. Adding another computer of your own works the same way.
-- **Revocation.** Revoke a lost computer or remove a person: they are cut off at once, and the keys of their rooms are replaced, so nothing added afterwards reaches them.
+- **Revocation.** Revoke a lost computer or remove a person: they are cut off at once, invites they made stop working, and their rooms get new keys as soon as someone who can edit them is online, so nothing added afterwards reaches them.
+- **Nothing is lost.** Files are only removed when someone deleted them in the room, and then to the trash. A version that clashes with someone else's, or can't be shared, is kept next to it as a copy, never overwritten.
 
 ## Requirements
 
@@ -51,15 +52,19 @@ Nobody needs to be online at the same time as anyone else for things to work: wh
 ## Everyday behaviour
 
 - **Offline edits** are kept and merged when computers meet. Notes merge character by character.
-- **Conflicts:** if a non-note file, or a note edited while Obsidian was closed, changed on two computers at once, nothing is overwritten: the local version is kept next to it as `name (conflict <computer> <date>).ext`, and shared.
-- **Deletions** go to your trash (following Obsidian's *Deleted files* setting), and only if your copy was unchanged; a file you changed after someone else deleted it is shared again.
-- **Read-only rooms:** notes open read-only, and local changes to files are put back.
-- **Moving a room's folder** is fine; the room follows it.
+- **Conflicts:** if a non-note file, or a note edited while Obsidian was closed, changed on two computers at once, nothing is overwritten: the version on this computer is kept next to it as `name (conflict <computer> <date>).ext`, and shared.
+- **Deletions** by others go to your trash (the system trash, or Obsidian's `.trash` folder), and only if your copy was unchanged and you weren't working on it; otherwise your copy stays and is shared again.
+- **Deleting a room's folder** on your computer only hides the room there; nothing is deleted for anyone else. *Show in this vault* in the panel brings it back.
+- **Read-only rooms:** notes open read-only; a change to a file is put back, with your version kept as a copy on your computer only.
+- **Moving a room's folder** is fine; the room follows it. A room's folder can't go inside another room's folder (such a move is undone).
+- **File types:** notes, canvases, bases, text and data files, PDF, EPUB, Word/Excel/PowerPoint (`.docx`, `.xlsx`, `.pptx`) and OpenDocument files, images, audio, video and ZIP files are shared. Programs, scripts, shortcuts, web pages and documents that can carry macros are not, in either direction, so nobody can plant something that runs when opened.
 - **Leaving:** leaving a room or the workspace stops syncing; your files stay on your computer.
 
 ## Limits
 
-- Desktop only. Large files are shared up to about 32 MB each.
+- Desktop only. Notes are shared up to about 6 MB each, other files up to about 32 MB; larger ones stay on the computer they're on.
+- If you use plugins that run code written in notes (Dataview JavaScript, Templater scripts), anyone who can edit a room could run code on your computer: see [SECURITY.md](SECURITY.md).
+- A copy of a vault (or one moved outside Obsidian and opened as a new vault) has to join the workspace again.
 - Peers can see some metadata: which computers are online, which rooms exist (as random ids), how many files a room has, sizes and timing of changes, and who made each change.
 - A removed member keeps what they had already synced; new keys only protect what comes after.
 - A computer that only talks to a malicious peer could be kept out of date (not deceived: everything is signed).
