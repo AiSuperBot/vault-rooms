@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { utf8 } from "./bytes.js";
+import { canonicalJson } from "./canonical.js";
+import { sign } from "./crypto.js";
 import { SecureError } from "./errors.js";
 import { newRoomKey, openRoomName, parseKeyWrap, unwrapRoomKey, verifyKeyWrap, wrapRoomKey } from "./keys.js";
 import { createRoom, founder, invite, newDevice } from "./testkit.js";
@@ -39,8 +42,13 @@ describe("room keys", () => {
   it("are refused if they carry a key other than the committed one", () => {
     const { chain, ws, admin, member, roomId } = setup();
     const wrong = wrapRoomKey(ws, roomId, 1, newRoomKey(), { id: member.id, agree: member.agree.publicKey }, admin.sign);
-    expect(verifyKeyWrap(chain.state, ws, wrong)).toBe(true); // well-formed and properly signed...
-    expect(code(() => unwrapRoomKey(chain.state, ws, wrong, member.agree))).toBe("key_mismatch"); // ...but useless
+    // Naming another key's commitment, it doesn't count at all...
+    expect(verifyKeyWrap(chain.state, ws, wrong)).toBe(false);
+    // ...and naming the right one while carrying another key, it verifies but is useless to its recipient.
+    const body = { ...wrong.body, commit: chain.state.rooms[roomId]!.epochs[0]!.commit };
+    const lying = { body, sig: sign(admin.sign.secretKey, "key-wrap", utf8(canonicalJson(body))) };
+    expect(verifyKeyWrap(chain.state, ws, lying)).toBe(true);
+    expect(code(() => unwrapRoomKey(chain.state, ws, lying, member.agree))).toBe("key_mismatch");
   });
 
   it("can't be redirected or edited", () => {

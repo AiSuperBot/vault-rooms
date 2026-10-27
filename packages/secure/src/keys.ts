@@ -39,6 +39,11 @@ export interface KeyWrapBody {
   ws: string;
   room: string;
   n: number;
+  /**
+   * Commitment of the key inside. A wrap only counts while the record's epoch has this commitment, so after two
+   * rotations raced, wraps (and receipts) of the key that lost stop counting everywhere.
+   */
+  commit: string;
   /** Recipient device. */
   to: string;
   /** Wrapping device. */
@@ -72,6 +77,7 @@ export function wrapRoomKey(
   const body: KeyWrapBody = {
     kind: "vr-wrap-v1",
     ...head,
+    commit: keyCommitment(workspaceId, roomId, n, key),
     by: deviceIdFor(wrapper.publicKey),
     at: now,
     box: sealToDevice(recipient.agree, WRAP_BOX, key, wrapAad(head))
@@ -81,7 +87,7 @@ export function wrapRoomKey(
 
 export function parseKeyWrap(value: unknown): KeyWrap {
   const o = v.obj(value, "wrap", ["body", "sig"]);
-  const b = v.obj(o.body, "wrap.body", ["kind", "ws", "room", "n", "to", "by", "at", "box"]);
+  const b = v.obj(o.body, "wrap.body", ["kind", "ws", "room", "n", "commit", "to", "by", "at", "box"]);
   if (b.kind !== "vr-wrap-v1") v.bad("wrap.kind");
   const box = v.obj(b.box, "wrap.box", ["epk", "nonce", "ct"]);
   return {
@@ -90,6 +96,7 @@ export function parseKeyWrap(value: unknown): KeyWrap {
       ws: v.hash(b.ws, "wrap.ws"),
       room: v.id(b.room, "wrap.room", "r"),
       n: v.int(b.n, "wrap.n", 1, 1e9),
+      commit: v.hash(b.commit, "wrap.commit"),
       to: v.id(b.to, "wrap.to", "d"),
       by: v.id(b.by, "wrap.by", "d"),
       at: v.int(b.at, "wrap.at", 0, Number.MAX_SAFE_INTEGER),
@@ -101,13 +108,14 @@ export function parseKeyWrap(value: unknown): KeyWrap {
 
 /**
  * Who may wrap and receive: the wrapper is an active device whose user is a member of the room, and the recipient
- * is an active device whose user is a member. Anyone (members or not) can check this; only the recipient can open it.
+ * is an active device whose user is a member; the wrap names the epoch's key commitment as the record has it.
+ * Anyone (members or not) can check this; only the recipient can open it.
  */
 export function verifyKeyWrap(state: WorkspaceState, workspaceId: string, wrap: KeyWrap): boolean {
   const { body } = wrap;
   if (body.ws !== workspaceId) return false;
   const room = liveRoom(state, body.room);
-  if (!room || body.n > room.epochs.length) return false;
+  if (!room || room.epochs[body.n - 1]?.commit !== body.commit) return false;
   const wrapper = activeDevice(state, body.by);
   const recipient = activeDevice(state, body.to);
   if (!wrapper || !recipient) return false;

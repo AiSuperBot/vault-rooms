@@ -5,7 +5,7 @@ import { randomBytes } from "./crypto.js";
 import { INDEX_DOC, openEnvelope, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
 import { randomId } from "./ids.js";
 import { createJoinRecord, joinHash } from "./invite.js";
-import { unwrapRoomKey, wrapRoomKey } from "./keys.js";
+import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion } from "./workspace.js";
@@ -250,6 +250,34 @@ describe("mesh", () => {
     expect(a.addWrap(forged)).toBe(false);
     expect(a.addWrap(genuine)).toBe(true);
     expect(a.allWraps()).toEqual([genuine]);
+  });
+
+  it("drops wraps (receipts included) of a key that lost a rotation race, so the right one can take their place", () => {
+    const { chain, ws, ana, cy, roomId } = setup();
+    const net = new Network();
+    const a = nodeFor(chain, ana);
+    const c = nodeFor(chain, cy);
+    const link = net.link(a, c);
+    net.pump();
+    link.cut();
+    // Apart, both rotate the room's key; Cy files a receipt for hers.
+    const kc = newRoomKey();
+    const ka = newRoomKey();
+    c.offerVersions([nextVersion(ws, c.chain.head, cy.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(ws, roomId, 2, kc) }))]);
+    expect(c.addWrap(wrapRoomKey(ws, roomId, 2, kc, { id: cy.id, agree: cy.agree.publicKey }, cy.sign))).toBe(true);
+    a.offerVersions([nextVersion(ws, a.chain.head, ana.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(ws, roomId, 2, ka) }))]);
+    // They meet; Ana's rotation wins. Cy's receipt for the losing key no longer counts, and Ana's wrap gets through.
+    net.link(a, c);
+    net.pump();
+    expect(c.chain.headHash).toBe(a.chain.headHash);
+    expect(c.allWraps().filter((w) => w.body.n === 2)).toEqual([]);
+    const right = wrapRoomKey(ws, roomId, 2, ka, { id: cy.id, agree: cy.agree.publicKey }, ana.sign);
+    expect(a.addWrap(right)).toBe(true);
+    net.pump();
+    expect(c.allWraps().map((w) => w.body.commit)).toContain(keyCommitment(ws, roomId, 2, ka));
+    // A wrap naming another commitment than the record's is refused outright.
+    const stale = wrapRoomKey(ws, roomId, 2, kc, { id: cy.id, agree: cy.agree.publicKey }, cy.sign);
+    expect(c.addWrap(stale)).toBe(false);
   });
 
   it("stores before sending, and keeps trying when storing fails", async () => {

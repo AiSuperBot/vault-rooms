@@ -1,5 +1,5 @@
 import * as Y from "yjs";
-import { envelopeKey, INDEX_DOC, openEnvelope, sealBlob, sealSnapshot, sealUpdate, type DocId, type SnapshotEnvelope, type StoredEnvelope, type UpdateEnvelope } from "./envelope.js";
+import { blobKeyOf, envelopeKey, INDEX_DOC, openEnvelope, sealBlob, sealSnapshot, sealUpdate, type DocId, type SnapshotEnvelope, type StoredEnvelope, type UpdateEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
 import { isHash, isId } from "./ids.js";
 import { keyCommitment, unwrapRoomKey, type KeyWrap } from "./keys.js";
@@ -254,6 +254,16 @@ export class RoomReplica {
   /** Whether local edits of a document are waiting for the room's newest key. */
   hasUnsent(docId: DocId): boolean {
     return this.unsent.has(docId);
+  }
+
+  /** Whether something this device made (for one document, or anywhere in the room) isn't safely stored yet. */
+  hasUnstored(docId?: DocId): boolean {
+    return this.node.hasUnpersisted(this.roomId, docId);
+  }
+
+  /** This device. */
+  get deviceId(): string {
+    return this.node.deviceId;
   }
 
   /** A blob's plaintext, if its ciphertext is held here and its key is known. */
@@ -527,7 +537,11 @@ export class RoomReplica {
     if (!this.canWrite()) fail("read_only");
     const ctx = this.sealContext();
     const env = sealBlob(ctx, bytes);
-    if (!this.node.store.blob(this.roomId, this.node.deviceId, env.id) && !this.node.publish(env)) fail("publish_refused");
+    if (!this.node.store.blob(this.roomId, this.node.deviceId, env.id)) {
+      // The same file added back after its blob was cleaned up here: it is wanted again.
+      this.node.store.undrop(this.roomId, blobKeyOf(this.node.deviceId, env.id));
+      if (!this.node.publish(env)) fail("publish_refused");
+    }
     return { by: this.node.deviceId, id: env.id, n: ctx.n, size: bytes.length };
   }
 

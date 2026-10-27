@@ -1,7 +1,7 @@
 import { hostname } from "node:os";
 import { MarkdownView, Notice, normalizePath, Plugin, TAbstractFile, TFile, TFolder, type WorkspaceLeaf } from "obsidian";
 import type { EditorView } from "@codemirror/view";
-import { cleanName, isWithin, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
+import { cleanName, isWithin, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
 import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
 import { adapterFiles, ObsidianVault } from "./mesh/obsidianVault.js";
@@ -94,13 +94,15 @@ export default class VaultRoomsPlugin extends Plugin {
   mountRootProblem(path: string): string | null {
     const root = normalizePath(path);
     if (safeRoomPath(root) === null) return "Use a folder name without a leading dot or special characters.";
-    if (this.roomAt(`${root}/x`)) return "That folder is inside a room.";
+    if (root.length > MAX_PATH - MAX_SEGMENT - 1) return "That folder's path is too long.";
+    if (this.roomFolders().some(([, folder]) => isWithin(root, folder))) return "That folder is a room's folder, or inside one.";
     return null;
   }
 
-  private mountRoot(): string {
-    const root = normalizePath(this.settings.mountRoot);
-    return this.mountRootProblem(root) === null ? root : "Rooms";
+  /** Where rooms shared with you go: the chosen folder, or the first usable of "Rooms", "Rooms 2", ... (null if none). */
+  private mountRoot(): string | null {
+    const candidates = [this.settings.mountRoot, "Rooms", ...Array.from({ length: 8 }, (_, i) => `Rooms ${i + 2}`)];
+    return candidates.map((root) => normalizePath(root)).find((root) => this.mountRootProblem(root) === null) ?? null;
   }
 
   private deps(): MeshDeps {
@@ -225,10 +227,11 @@ export default class VaultRoomsPlugin extends Plugin {
       .map(([roomId, room]) => [roomId, room.folder]);
   }
 
-  /** The room whose folder holds a vault path (the innermost, if folders were ever nested). */
+  /** The room whose folder holds a vault path (the innermost, if folders were ever nested), compared like the disk does. */
   private roomAt(path: string): string | null {
+    const key = pathKey(path);
     let best: { roomId: string; length: number } | null = null;
-    for (const [roomId, folder] of this.roomFolders()) if (path.startsWith(`${folder}/`) && (!best || folder.length > best.length)) best = { roomId, length: folder.length };
+    for (const [roomId, folder] of this.roomFolders()) if (key.startsWith(`${pathKey(folder)}/`) && (!best || folder.length > best.length)) best = { roomId, length: folder.length };
     return best?.roomId ?? null;
   }
 
@@ -242,16 +245,31 @@ export default class VaultRoomsPlugin extends Plugin {
     return null;
   }
 
-  /** A folder for a room shared with you: under the mount root, named after the room, clashing with nothing. */
-  private freeFolder(name: string): string {
+  /** A folder for a room shared with you: under the mount root, named after the room, clashing with nothing (or null). */
+  private freeFolder(name: string): string | null {
     const root = this.mountRoot();
+    if (!root) return null;
     const segment = folderName(name);
     const taken = new Map(this.app.vault.getAllLoadedFiles().map((file) => [pathKey(file.path), file]));
-    for (let i = 1; ; i++) {
+    for (let i = 1; i <= 200; i++) {
       const candidate = `${root}/${i === 1 ? segment : `${segment} ${i}`}`;
       const existing = taken.get(pathKey(candidate));
       if (existing && !(existing instanceof TFolder && existing.children.length === 0)) continue;
       if (this.folderProblem(candidate) === null) return candidate;
+    }
+    return null;
+  }
+
+  /** Rooms that found no usable folder: tried again when the folder for shared rooms changes. */
+  private unplaced = new Set<string>();
+
+  /** Try again to show rooms that couldn't get a folder (after the folder for shared rooms changed). */
+  retryUnplaced(): void {
+    const svc = this.service;
+    for (const roomId of [...this.unplaced]) {
+      this.unplaced.delete(roomId);
+      const replica = svc?.replica(roomId);
+      if (replica) void this.onReplica(roomId, replica);
     }
   }
 
@@ -308,6 +326,9 @@ export default class VaultRoomsPlugin extends Plugin {
     if (!replica) {
       // Access ended (or the room was deleted): stop syncing; the files stay on this computer.
       await this.unmount(roomId);
+      // Back meanwhile (a room re-made after a race): show it again, nothing to tell.
+      const again = svc.replica(roomId);
+      if (again) return this.onReplica(roomId, again);
       // Keep the folder assignment: if access comes back, the room returns to the same folder.
       const folder = ws.rooms[roomId]?.folder;
       if (folder && !ws.rooms[roomId]?.hidden) new Notice(`You no longer have access to the room in "${folder}". Its files stay on this computer but no longer sync.`, 10000);
@@ -323,7 +344,13 @@ export default class VaultRoomsPlugin extends Plugin {
         return;
       }
       this.pendingMounts.delete(roomId);
-      ws.rooms[roomId] = { folder: this.freeFolder(name) };
+      const free = this.freeFolder(name);
+      if (!free) {
+        if (!this.unplaced.has(roomId)) new Notice(`"${name}" can't be shown: no usable folder for it was found. Choose another folder for rooms shared with you in the Vault Rooms settings.`, 12000);
+        this.unplaced.add(roomId);
+        return;
+      }
+      ws.rooms[roomId] = { folder: free };
       await this.saveSettings();
     }
     const folderPath = ws.rooms[roomId]!.folder;
@@ -368,10 +395,12 @@ export default class VaultRoomsPlugin extends Plugin {
 
   private async unmount(roomId: string): Promise<void> {
     this.editors.unbindRoom(roomId);
-    await this.folders.get(roomId)?.stop();
+    // Forgotten before waiting for it to stop, so the room can be shown again meanwhile.
+    const folder = this.folders.get(roomId);
     this.folders.delete(roomId);
     this.presences.get(roomId)?.destroy();
     this.presences.delete(roomId);
+    await folder?.stop();
   }
 
   /** The room's folder was deleted on this computer: that hides the room here; nothing is deleted for anyone else. */
@@ -471,6 +500,11 @@ export default class VaultRoomsPlugin extends Plugin {
    * then handled like any change that can't be shared (kept, never overwritten).
    */
   private onLocalRefused(roomId: string, docId: string, code: string): void {
+    // Called from inside the editor's own update: act once it is over.
+    window.setTimeout(() => this.handleRefused(roomId, docId, code), 0);
+  }
+
+  private handleRefused(roomId: string, docId: string, code: string): void {
     const replica = this.service?.replica(roomId);
     if (!replica) return;
     if (code === "read_only") {
@@ -493,7 +527,7 @@ export default class VaultRoomsPlugin extends Plugin {
     const presence = hit ? this.presences.get(hit.roomId) : null;
     if (!hit || !replica || !presence) return null;
     const fileId = hit.folder.noteIdAt(path);
-    if (!fileId) return null;
+    if (!fileId || !replica.isComplete(fileId)) return null;
     return { roomId: hit.roomId, fileId, ytext: replica.noteDoc(fileId).getText("content"), presence, readOnly: !replica.canWrite(), syncedHash: hit.folder.syncedHash(fileId) };
   }
 
@@ -519,16 +553,24 @@ export default class VaultRoomsPlugin extends Plugin {
       .finally(() => (this.syncing = false));
   }
 
-  private async collectEditors(): Promise<Array<{ path: string; view: EditorView; disk: string | null }>> {
-    const open: Array<{ path: string; view: EditorView; disk: string | null }> = [];
+  private async collectEditors(): Promise<Array<{ path: string; view: EditorView; disk: string | null; synced: string | null }>> {
+    const open: Array<{ path: string; view: EditorView; disk: string | null; synced: string | null }> = [];
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
       if (!(view instanceof MarkdownView) || !view.file) continue;
       const cm = (view.editor as unknown as { cm?: EditorView }).cm;
       if (!cm) continue;
       let disk: string | null = null;
-      if (this.editors.needsBinding(cm) && this.folderFor(view.file.path)) disk = await this.app.vault.cachedRead(view.file).then(normalizeNote, () => null);
-      open.push({ path: view.file.path, view: cm, disk });
+      let synced: string | null = null;
+      const hit = this.folderFor(view.file.path);
+      if (this.editors.needsBinding(cm) && hit) {
+        // What was synced is taken before the file is read: if the room folder writes a newer version in between, the
+        // two disagree and nothing is folded back.
+        const fileId = hit.folder.noteIdAt(view.file.path);
+        synced = fileId ? hit.folder.syncedHash(fileId) : null;
+        disk = await this.app.vault.cachedRead(view.file).then(normalizeNote, () => null);
+      }
+      open.push({ path: view.file.path, view: cm, disk, synced });
     }
     return open;
   }

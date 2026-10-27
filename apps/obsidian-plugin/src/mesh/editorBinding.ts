@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Compartment, EditorState, Prec, Transaction, type Extension, type Text } from "@codemirror/state";
+import { Compartment, EditorState, Prec, Transaction, type Annotation, type Extension, type Text } from "@codemirror/state";
 import { EditorView, ViewPlugin } from "@codemirror/view";
 import * as Y from "yjs";
 import { yCollab } from "y-codemirror.next";
@@ -75,20 +75,19 @@ export const WHOLE_CHARACTERS: Extension = EditorState.transactionFilter.of((tr)
     changes.push({ from, to, insert });
   });
   for (let i = 1; i < changes.length; i++) if (changes[i]!.from < changes[i - 1]!.to) return tr;
+  // Every annotation goes along (the one y-codemirror marks its own changes with included, which isn't exported).
+  const all = (tr as unknown as { annotations?: unknown }).annotations;
   const userEvent = tr.annotation(Transaction.userEvent);
   const addToHistory = tr.annotation(Transaction.addToHistory);
   const remote = tr.annotation(Transaction.remote);
-  return {
-    changes,
-    selection: tr.selection,
-    effects: tr.effects,
-    scrollIntoView: tr.scrollIntoView,
-    annotations: [
-      ...(userEvent !== undefined ? [Transaction.userEvent.of(userEvent)] : []),
-      ...(addToHistory !== undefined ? [Transaction.addToHistory.of(addToHistory)] : []),
-      ...(remote !== undefined ? [Transaction.remote.of(remote)] : [])
-    ]
-  };
+  const annotations = Array.isArray(all)
+    ? (all as Annotation<unknown>[])
+    : [
+        ...(userEvent !== undefined ? [Transaction.userEvent.of(userEvent)] : []),
+        ...(addToHistory !== undefined ? [Transaction.addToHistory.of(addToHistory)] : []),
+        ...(remote !== undefined ? [Transaction.remote.of(remote)] : [])
+      ];
+  return { changes, selection: tr.selection, effects: tr.effects, scrollIntoView: tr.scrollIntoView, annotations };
 });
 
 function sha(text: string): string {
@@ -135,9 +134,9 @@ export class EditorBinding {
    * Bring the bindings in line with the editors that are open now. Safe to call often. `disk` is the note's text as
    * the file holds it, for editors not bound yet (null if unknown).
    */
-  sync(open: Array<{ path: string; view: EditorView; disk: string | null }>): void {
-    const targets = new Map<EditorView, { target: BindTarget | null; disk: string | null }>();
-    for (const { path, view, disk } of open) targets.set(view, { target: this.resolve(path), disk });
+  sync(open: Array<{ path: string; view: EditorView; disk: string | null; synced?: string | null }>): void {
+    const targets = new Map<EditorView, { target: BindTarget | null; disk: string | null; synced?: string | null }>();
+    for (const { path, view, disk, synced } of open) targets.set(view, { target: this.resolve(path), disk, synced });
     for (const [view, bound] of [...this.bound]) {
       const target = targets.get(view)?.target;
       // The editor's state was replaced (a file was loaded into it): the binding is gone, make it again.
@@ -148,9 +147,9 @@ export class EditorBinding {
       if (!targets.has(view) || !target || target.ytext !== bound.ytext || target.readOnly !== bound.readOnly) this.unbind(view);
     }
     let waiting = false;
-    for (const [view, { target, disk }] of targets) {
+    for (const [view, { target, disk, synced }] of targets) {
       if (!target || this.bound.has(view)) continue;
-      if (!this.bind(view, target, disk)) waiting = true;
+      if (!this.bind(view, target, disk, synced === undefined ? target.syncedHash : synced)) waiting = true;
     }
     if (waiting) this.requestSync(500);
   }
@@ -162,7 +161,7 @@ export class EditorBinding {
    * once it matches its file (Obsidian saves typing within seconds), so neither half-loaded nor stale text can ever
    * take anything away from the shared note.
    */
-  private bind(view: EditorView, target: BindTarget, disk: string | null): boolean {
+  private bind(view: EditorView, target: BindTarget, disk: string | null, synced: string | null): boolean {
     const editorText = view.state.doc.toString();
     // An editor holds "\n" line endings only; the shared text has to match it character for character.
     if (target.ytext.toString().includes("\r")) {
@@ -172,7 +171,7 @@ export class EditorBinding {
     const sharedText = target.ytext.toString();
     if (editorText !== sharedText) {
       if (disk === null || editorText !== disk) return false;
-      if (!target.readOnly && target.syncedHash !== null && sha(disk) !== target.syncedHash) reconcileYTextWithDiskText(target.ytext, editorText, "editor");
+      if (!target.readOnly && synced !== null && sha(disk) !== synced) reconcileYTextWithDiskText(target.ytext, editorText, "editor");
     }
     const undo = new Y.UndoManager(target.ytext);
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
