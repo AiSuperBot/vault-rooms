@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
 import { keyCommitment, newRoomKey } from "./keys.js";
+import { foldJoinInto } from "./invite.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { nextVersion, versionHash } from "./workspace.js";
 
@@ -165,6 +166,23 @@ describe("workspace chain", () => {
     expect(anaChain.offer([removal]).status).toBe("replaced");
     expect(anaChain.state.rooms[roomId]!.members[mal.userId]).toBeUndefined();
     expect(anaChain.state.rooms[roomId]!.epochs).toHaveLength(2);
+  });
+
+  it("letting someone in and then revoking them still counts as a revocation", () => {
+    const { chain: anaChain, admin: ana } = founder();
+    const { joiner: ben } = invite(anaChain, ana, { userName: "Ben" });
+    step(anaChain, ana, (state) => (state.users[ben.userId]!.admin = true));
+    const fork = WorkspaceChain.load(anaChain.all());
+    // Ben records the join of someone whose invite link leaked, then revokes their device; Ana renames meanwhile.
+    const { joiner: mal, join } = invite(fork, ben, { userName: "Mal", fold: false });
+    const recorded = step(fork, ben, (state) => foldJoinInto(state, join), Date.now(), [join]);
+    const revoked = step(fork, ben, (state) => (state.devices[mal.id]!.revoked = true));
+    step(anaChain, ana, (state) => (state.name = "Ana's"));
+    const branch = fork.since(anaChain.length - 1);
+    expect(branch.map((version) => versionHash(version))).toContain(versionHash(recorded));
+    expect(anaChain.offer(branch).status).toBe("replaced");
+    expect(anaChain.state.devices[mal.id]!.revoked).toBe(true);
+    expect(versionHash(anaChain.head)).toBe(versionHash(revoked));
   });
 
   it("taking standing away and giving it back in the same branch wins nothing", () => {

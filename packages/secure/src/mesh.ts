@@ -4,7 +4,7 @@ import { MAX_FORK_DEPTH, WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
 import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
-import { applyJoins, joinHash, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
+import { applyJoins, joinerStands, joinHash, parseJoinRecord, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
@@ -292,8 +292,14 @@ export class MeshNode {
   offerVersions(versions: SignedVersion[], from?: PeerSession): OfferResult {
     const result = this.chain.offer(versions, this.now());
     if (result.status === "replaced") {
-      // Joins recorded in versions that lost wait again, until an admin or the invite's creator records them again.
-      for (const version of result.lost) for (const join of version.body.joins ?? []) this.pendingJoins.set(joinHash(join), { join, firstSeen: version.body.at });
+      // Joins recorded in versions that lost wait again, until an admin or the invite's creator records them again;
+      // not someone the lost branch itself took back out.
+      const end = result.lost[result.lost.length - 1]!.body.state;
+      for (const version of result.lost) {
+        for (const join of version.body.joins ?? []) {
+          if (joinerStands(end, join) && this.pendingJoins.size < MAX_PENDING) this.pendingJoins.set(joinHash(join), { join, firstSeen: version.body.at });
+        }
+      }
     }
     if (result.status === "appended" || result.status === "replaced") {
       this.effectiveCache = null;
