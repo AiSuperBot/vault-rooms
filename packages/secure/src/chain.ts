@@ -160,15 +160,6 @@ function reducesSignersOf(forkState: WorkspaceState, a: SignedVersion[], b: Sign
   return false;
 }
 
-/** Whether a branch starts a new key epoch for some room (a rotation, usually after someone lost access). */
-function rotatesKey(forkState: WorkspaceState, branch: SignedVersion[]): boolean {
-  const final = branch[branch.length - 1]!.body.state;
-  return Object.entries(final.rooms).some(([roomId, room]) => {
-    const before = forkState.rooms[roomId];
-    return before !== undefined && room.epochs.length > before.epochs.length;
-  });
-}
-
 /** Ordering of a branch's first signer: admins first, then the user listed earliest. */
 function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: SignedVersion): { user: string; order: [number, number] } {
   const device = activeDevice(forkState, first.body.by)!;
@@ -180,10 +171,10 @@ function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: 
  *
  * 1. A branch that takes away standing a version of the other relied on wins (`reducesSignersOf`), so nobody can race
  *    a branch of their own past their removal from the workspace, as an admin, or from a room.
- * 2. Otherwise a branch that starts a new room key wins, so a rotation can't be pushed aside by an unrelated change.
- * 3. Otherwise the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the signer, unlike a
- *    hash, which a signer can grind by re-signing with small changes.
- * 4. Two branches started by the same user (on two of their devices): the one carrying more versions by other people
+ * 2. Otherwise the branch whose first signer ranks higher wins (`rank`). Rank can't be changed by the signer, unlike a
+ *    hash, which a signer can grind by re-signing with small changes. (A key rotation that loses is simply made again
+ *    by the automation, which still sees that it is needed.)
+ * 3. Two branches started by the same user (on two of their devices): the one carrying more versions by other people
  *    wins, so one user can't throw away others' changes; then the lower device id, then the lower hash.
  */
 export function preferBranch(
@@ -197,9 +188,6 @@ export function preferBranch(
   const aReduces = reducesSignersOf(forkState, a, b);
   const bReduces = reducesSignersOf(forkState, b, a);
   if (aReduces !== bReduces) return aReduces;
-  const aRotates = rotatesKey(forkState, a);
-  const bRotates = rotatesKey(forkState, b);
-  if (aRotates !== bRotates) return aRotates;
   const ra = rank(forkState, seniority, a[0]!);
   const rb = rank(forkState, seniority, b[0]!);
   for (let i = 0; i < ra.order.length; i++) if (ra.order[i] !== rb.order[i]) return ra.order[i]! < rb.order[i]!;

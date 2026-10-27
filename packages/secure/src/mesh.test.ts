@@ -8,7 +8,7 @@ import { createJoinRecord, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
-import { nextVersion } from "./workspace.js";
+import { nextVersion, rebaseChange } from "./workspace.js";
 
 function nodeFor(chain: WorkspaceChain, device: TestDevice, log: string[] = []): MeshNode {
   return new MeshNode(WorkspaceChain.load(chain.all()), device.id, { rejected: (reason) => log.push(reason) });
@@ -252,7 +252,48 @@ describe("mesh", () => {
     expect(a.allWraps()).toEqual([genuine]);
   });
 
-  it("drops wraps (receipts included) of a key that lost a rotation race, so the right one can take their place", () => {
+  it("keeps the wraps of a room whose creation lost a race, so the room made again has its key", () => {
+    const { chain, ws, ana, ben } = setup();
+    step(chain, ana, (state) => (state.users[ben.userId]!.admin = true));
+    const b = nodeFor(chain, ben);
+    const parent = b.chain.head;
+    // Ben creates a room and files his receipt for its key.
+    const draft = WorkspaceChain.load(b.chain.all());
+    const { roomId, key } = createRoom(draft, ben, "Design");
+    const lost = draft.head;
+    b.offerVersions([lost]);
+    const receipt = wrapRoomKey(ws, roomId, 1, key, { id: ben.id, agree: ben.agree.publicKey }, ben.sign);
+    expect(b.addWrap(receipt)).toBe(true);
+    // At the same moment Ana, who ranks higher, changed something else: her version wins, and the room is gone...
+    expect(b.offerVersions([nextVersion(ws, parent, ana.sign, (state) => (state.name = "Ana's"))]).status).toBe("replaced");
+    expect(b.allWraps()).toEqual([]);
+    expect(b.savedWraps()).toEqual([receipt]);
+    // ...until Ben's device makes it again, with the same key: the receipt counts again, here and after a restart.
+    b.offerVersions([nextVersion(ws, b.chain.head, ben.sign, (state) => void Object.assign(state, rebaseChange(parent.body.state, lost.body.state, state)))]);
+    expect(b.allWraps()).toEqual([receipt]);
+    const restarted = nodeFor(b.chain, ben);
+    restarted.restore([], b.savedWraps());
+    expect(restarted.allWraps()).toEqual([receipt]);
+  });
+
+  it("stops storing, and trying again, once stopped", async () => {
+    vi.useFakeTimers();
+    try {
+      const { chain, ana, seal } = setup();
+      const a = nodeFor(chain, ana);
+      let tries = 0;
+      a.persist = () => (tries++, Promise.reject(new Error("disk full")));
+      a.publish(seal(ana, 1, "never stored"));
+      await vi.advanceTimersByTimeAsync(0);
+      a.stop();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(tries).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("wraps (receipts included) of a key that lost a rotation race stop counting, so the right one can take their place", () => {
     const { chain, ws, ana, cy, roomId } = setup();
     const net = new Network();
     const a = nodeFor(chain, ana);

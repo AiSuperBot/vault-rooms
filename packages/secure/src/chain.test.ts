@@ -149,15 +149,17 @@ describe("workspace chain", () => {
     expect(fork.offer([rename]).status).toBe("rejected");
   });
 
-  it("a key rotation isn't pushed aside by an unrelated change of a higher-ranked signer", () => {
+  it("a writer's key rotation can't push aside the changes of someone who ranks higher", () => {
     const { chain: anaChain, admin: ana } = founder();
     const { joiner: wen } = invite(anaChain, ana, { userName: "Wen" });
     const { roomId } = createRoom(anaChain, ana, "Docs", { [wen.userId]: "write" });
     const fork = WorkspaceChain.load(anaChain.all());
+    // A rotation signed as a sibling of Ana's change loses (it is made again on top when it is still needed), so a
+    // writer can't throw away recent changes of others by rotating a key.
     const rotation = nextVersion(fork.workspaceId, fork.head, wen.sign, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(fork.workspaceId, roomId, 2, newRoomKey()) }));
     step(anaChain, ana, (state) => (state.name = "Ana's"));
-    expect(anaChain.offer([rotation]).status).toBe("replaced");
-    expect(anaChain.state.rooms[roomId]!.epochs).toHaveLength(2);
+    expect(anaChain.offer([rotation]).status).toBe("rejected");
+    expect(anaChain.state.name).toBe("Ana's");
   });
 
   it("one user signing on two computers can't throw away other people's changes", () => {
