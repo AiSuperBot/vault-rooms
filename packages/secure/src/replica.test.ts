@@ -7,7 +7,7 @@ import { keyCommitment, newRoomKey, wrapRoomKey } from "./keys.js";
 import { envelopeKey, openEnvelope, sealSnapshot } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
-import { RoomReplica, type FileEntry } from "./replica.js";
+import { RoomReplica, type FileEntry, type ReplicaEvents } from "./replica.js";
 import { EnvelopeStore, STORE_LIMITS } from "./store.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion } from "./workspace.js";
@@ -55,10 +55,10 @@ function setup() {
     }
     return node;
   };
-  const member = (device: TestDevice): Member => {
+  const member = (device: TestDevice, events: ReplicaEvents = {}): Member => {
     const node = nodeOf(device);
     const refused: string[] = [];
-    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, { localRefused: (_doc, code) => refused.push(code) });
+    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, { localRefused: (_doc, code) => refused.push(code), ...events });
     const m = { device, node, replica, refused };
     members.set(device.id, m);
     return m;
@@ -252,6 +252,50 @@ describe("room replica", () => {
     expect(() => s.net.pump(5_000)).not.toThrow();
     const kept = [a, c, b].map((m) => m.node.store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => envelopeKey(snapshot)).join());
     expect(new Set(kept).size).toBe(1);
+  });
+
+  it("leaves a clash in the note while nobody can keep the copy, and settles it when the saves are restored", async () => {
+    const s = setup();
+    let keep = false;
+    const copies: string[] = [];
+    const clash = (_doc: string, version: string) => (keep ? copies.push(version) > 0 : false);
+    const a = s.member(s.ana, { clash });
+    const c = s.member(s.cy, { clash });
+    for (const device of [s.ana, s.cy]) s.wrapFor(device);
+    a.replica.refreshKeys();
+    let link = s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Task.md", "due: 1\nbody\n");
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe("due: 1\nbody\n");
+    link.cut();
+    // Each saves the first line whole, as a plugin's write is taken in (see reconcileYTextByLines).
+    const save = (m: Member, line: string) =>
+      m.replica.edit(fileId, (doc) => {
+        const text = doc.getText("content");
+        text.insert(0, line);
+        text.delete(line.length, "due: 1\n".length);
+      }, true);
+    save(a, "due: 2\n");
+    save(c, "due: 3\n");
+    link = s.net.link(a.node, c.node);
+    s.net.pump();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    s.net.pump();
+    // Nobody could keep a copy (the room's folder away, say): both lines stay.
+    const dues = (m: Member) => m.replica.noteText(fileId).split("\n").filter((line) => line.startsWith("due"));
+    expect(dues(a)).toHaveLength(2);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+    // The folder is back: its saves are restored, and the clash is settled, with a copy.
+    keep = true;
+    for (const m of [a, c]) m.replica.restoreSaves(JSON.parse(JSON.stringify(m.replica.recentSaves())));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    s.net.pump();
+    expect(dues(a)).toHaveLength(1);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+    expect(copies).toHaveLength(1);
+    expect(copies[0]).toBe(`${dues(a)[0] === "due: 2" ? "due: 3" : "due: 2"}\nbody\n`);
   });
 
   it("doesn't hold a save twice when the same saves are restored on a running replica", () => {

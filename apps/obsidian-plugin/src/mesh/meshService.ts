@@ -97,7 +97,7 @@ export class MeshService {
   private activityListeners = new Set<(roomId: string) => void>();
   private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
   private lostRoomListeners = new Set<(roomId: string) => void>();
-  private clashListeners = new Set<(roomId: string, docId: string, version: string) => void>();
+  private clashListeners = new Set<(roomId: string, docId: string, version: string) => boolean>();
   private server: PeerServer | null = null;
   private manager: PeerManager | null = null;
   private discovery: Discovery | null = null;
@@ -347,8 +347,8 @@ export class MeshService {
     return () => this.refusedListeners.delete(listener);
   }
 
-  /** A whole-note save made here lost a clash with someone else's; `version`: ours, to keep (see RoomReplica's clash event). */
-  onClash(listener: (roomId: string, docId: string, version: string) => void): () => void {
+  /** A whole-note save made here lost a clash; `version`: ours, to keep; true if kept (see RoomReplica's clash event). */
+  onClash(listener: (roomId: string, docId: string, version: string) => boolean): () => void {
     this.clashListeners.add(listener);
     return () => this.clashListeners.delete(listener);
   }
@@ -718,7 +718,9 @@ export class MeshService {
           for (const listener of this.refusedListeners) listener(roomId, docId, code);
         },
         clash: (docId, version) => {
-          for (const listener of this.clashListeners) listener(roomId, docId, version);
+          let kept = false;
+          for (const listener of this.clashListeners) kept = listener(roomId, docId, version) || kept;
+          return kept;
         }
       });
       const own = this.ownKeys.get(roomId);

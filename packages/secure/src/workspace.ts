@@ -797,6 +797,8 @@ function reductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVers
   const out = (deviceId: string, userId: string) => takenFrom.devices.has(deviceId) || takenFrom.users.has(userId);
   const letIn = new Set<string>();
   const notLetIn = new Set<string>();
+  /** People let in through an invite that didn't count: their own invites (another device of theirs) don't either. */
+  const notLetInUsers = new Set<string>();
   prev = fork;
   for (const version of won) {
     const next = version.body.state;
@@ -808,8 +810,9 @@ function reductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVers
       const deviceId = join.body.device.id;
       const userId = next.devices[deviceId]?.user;
       if (!invite || !userId) continue;
-      const legit = !out(invite.dev, invite.by) && (invite.forUser !== undefined || legitAdmins.has(invite.by));
+      const legit = !out(invite.dev, invite.by) && !notLetInUsers.has(invite.by) && (invite.forUser !== undefined || legitAdmins.has(invite.by));
       (legit ? letIn : notLetIn).add(deviceId);
+      if (!legit && invite.forUser === undefined) notLetInUsers.add(userId);
       for (const [roomId, role] of Object.entries(grantedRooms(prev, invite))) {
         if (legit && legitRole(roomId, invite.by) === "manage") legitRoles.set(`${roomId}/${userId}`, role);
         if (next.rooms[roomId]?.members[userId] === role) handled.add(`${roomId}/${userId}`);
