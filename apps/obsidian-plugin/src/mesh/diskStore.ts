@@ -254,7 +254,7 @@ export class DiskStore implements BlobStorage {
           try {
             const raw = JSON.parse(line) as Record<string, unknown>;
             if ("marks" in raw) {
-              store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed));
+              store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed), numbers(raw.dropped));
               continue;
             }
             const env = parseEnvelope(raw);
