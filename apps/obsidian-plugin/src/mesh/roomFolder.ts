@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
-import { reconcileYTextWithDiskText } from "../crdtReconcile.js";
+import { reconcileYTextByLines } from "../crdtReconcile.js";
 
 /**
  * Keeps one room's folder in the vault and the room's shared state in step.
@@ -69,6 +69,8 @@ interface Known extends FileStat {
 
 export interface RoomFolderState {
   known: Record<string, Known>;
+  /** Recent saves of notes made here outside the editor (see RoomReplica.recentSaves), so a clash is noticed after a restart too. */
+  saves?: unknown;
 }
 
 export interface RoomFolderOptions {
@@ -253,6 +255,7 @@ export class RoomFolder {
         throw error;
       }
       for (const [id, known] of Object.entries(saved?.known ?? {})) this.known.set(id, known);
+      this.o.replica.restoreSaves(saved?.saves);
       this.started = true;
       await this.adoptLocalFiles();
       await this.materializeNow();
@@ -346,7 +349,7 @@ export class RoomFolder {
       const known = this.known.get(id);
       if (known) delete known.unstored;
     }
-    await this.o.saveState({ known: Object.fromEntries(this.known) });
+    await this.o.saveState({ known: Object.fromEntries(this.known), saves: this.o.replica.recentSaves() });
   }
 
   /**
@@ -583,12 +586,15 @@ export class RoomFolder {
     const doubtful = this.doubtful(id);
     const stat = this.o.vault.stat(path);
     if (stat && this.clashed.delete(id)) {
-      // Our save lost a clash: kept as a copy before the shared version is written.
+      // Our save lost a clash: kept as a copy before the shared version is written (a file changed again since it was
+      // last synced is settled by the rules below).
       const local = await this.readNote(path);
       const localHash = sha(local);
       if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash);
-      await this.keepAside(entry.path, local);
-      return this.write(id, entry, remote, remoteHash, localHash);
+      if (known && !doubtful && localHash === known.hash) {
+        await this.keepAside(entry.path, local);
+        return this.write(id, entry, remote, remoteHash, localHash);
+      }
     }
     if (!stat) {
       const variant = this.untrackedCaseVariant(entry.path);
@@ -600,7 +606,11 @@ export class RoomFolder {
     }
     const unchangedHere = known !== undefined && !doubtful && known.path === entry.path && known.size === stat.size && known.mtime === stat.mtime;
     if (unchangedHere) {
-      if (remoteHash === known.hash) return;
+      if (remoteHash === known.hash) {
+        // The same bytes in another blob (a writer passing on someone else's file, say): remembered, so it isn't read again.
+        if (entry.blob && entry.blob.id !== known.blob) this.remember(id, entry.path, remoteHash, { id: entry.blob.id, by: known.mine ? replica.deviceId : "" });
+        return;
+      }
       // Another version of an attachment made from an older one than the version this computer made (two people
       // changed it at once): keep ours. A version of someone else's that we merely had is just older.
       if (entry.kind === "bin" && known.mine && entry.blob && entry.blob.id !== known.blob && entry.base !== known.blob) await this.keepAside(entry.path, await this.o.vault.readBytes(path));
@@ -738,7 +748,7 @@ export class RoomFolder {
     }
     if (entry.kind === "md" && typeof local === "string") {
       if (Buffer.byteLength(local, "utf8") > MAX_NOTE_BYTES) return this.holdBack(id, entry.path, localHash);
-      const result = replica.edit(id, (doc) => reconcileYTextWithDiskText(doc.getText("content"), local, "disk"), true);
+      const result = replica.edit(id, (doc) => reconcileYTextByLines(doc.getText("content"), local, "disk"), true);
       if (result === "refused") return this.holdBack(id, entry.path, localHash);
       if (result === "queued") return;
       this.remember(id, entry.path, localHash);

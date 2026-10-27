@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { MeshNode, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
+import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
 import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
 import { MemoryVault } from "./memoryVault.js";
@@ -834,6 +834,57 @@ describe("room folder", () => {
     expect(copies).toContain(other);
   });
 
+  it("keeps one of two dates written over the same one whole, and what only one side changed", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\ntitle: Plan\nstart: 2030-01-09\nend: 2030-01-20\n---\n" });
+    link.cut();
+    // Ana's plugin moves the task by three days, Cy's to the next month (and renames it); the dates share characters.
+    const ana = "---\ntitle: Plan\nstart: 2030-01-12\nend: 2030-01-23\n---\n";
+    const cy = "---\ntitle: Plan B\nstart: 2030-02-03\nend: 2030-01-20\n---\n";
+    await a.vault.writeText("Team/Task.md", ana);
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", cy);
+    await c.folder.settled();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    const main = text(a.vault, "Team/Task.md")!;
+    expect(text(c.vault, "Team/Task.md")).toBe(main);
+    const start = a.device.id < c.device.id ? "2030-01-12" : "2030-02-03";
+    expect(main).toBe(`---\ntitle: Plan B\nstart: ${start}\nend: 2030-01-23\n---\n`);
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    expect(copies).toContain(start === "2030-01-12" ? cy : ana);
+  });
+
+  it("still notices a clash with a save made before a restart", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "---\nstart: 2030-01-09\n---\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    const ana = "---\nstart: 2030-01-12\n---\n";
+    const cy = "---\nstart: 2030-02-03\n---\n";
+    await a.vault.writeText("Team/Task.md", ana);
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", cy);
+    await c.folder.settled();
+    // Both computers restart, and meet: each has the other's save before its folder starts.
+    await a.folder.stop();
+    await c.folder.stop();
+    const restarted = [s.make(s.ana, "Team", a.vault, a), s.make(s.cy, "Team", c.vault, c)];
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    for (const pc of restarted) {
+      pc.replica.refreshKeys();
+      pc.replica.noteText(id);
+      await pc.folder.start();
+    }
+    await s.settle();
+    await s.settle();
+    const main = text(a.vault, "Team/Task.md")!;
+    expect(text(c.vault, "Team/Task.md")).toBe(main);
+    expect([ana, cy]).toContain(main);
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    expect(copies).toContain(main === ana ? cy : ana);
+  });
+
   it("keeps a new save of an attachment made while its clash copy was being written", async () => {
     const { s, a, c, link } = await pair({ "Team/img.png": new Uint8Array([1]) });
     link.cut();
@@ -876,9 +927,17 @@ describe("room folder", () => {
     await c.vault.writeText("Team/Cy.md", "from Cy\n");
     await c.vault.writeBytes("Team/pic.png", new Uint8Array([7, 7]));
     await s.settle();
-    // Cy may only read from now on; then Rae's computer catches up, from Ana's alone.
-    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.cy.userId] = "read"))]);
+    // Cy may only read from now on, and the room gets a new key; then Rae's computer catches up, from Ana's alone.
+    const k2 = newRoomKey();
+    a.node.offerVersions([
+      nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => {
+        state.rooms[s.roomId]!.members[s.cy.userId] = "read";
+        state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) });
+      })
+    ]);
     s.giveKey(a, s.rae);
+    for (const to of [s.ana, s.cy, s.rae]) a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: to.id, agree: to.agree.publicKey }, s.ana.sign));
+    a.replica.refreshKeys();
     const r = s.make(s.rae, "Team");
     s.net.link(r.node, a.node);
     await s.settle();
@@ -890,5 +949,16 @@ describe("room folder", () => {
     await s.settle();
     expect(text(r.vault, "Team/Cy.md")).toBe("from Cy\n");
     expect([...(r.vault.files.get("Team/pic.png") ?? [])]).toEqual([7, 7]);
+    // Ana's copy of the picture (under the new key) holds the same bytes: no computer reads it again when a note changes.
+    expect(a.replica.files().get([...a.replica.files()].find(([, e]) => e.path === "pic.png")![0])!.blob!.by).toBe(s.ana.id);
+    let reads = 0;
+    for (const pc of [a, c, r]) {
+      const read = pc.replica.readBlob.bind(pc.replica);
+      pc.replica.readBlob = (ref) => (reads++, read(ref));
+    }
+    await a.vault.writeText("Team/Cy.md", "from Cy\nand Ana\n");
+    await s.settle();
+    expect(text(r.vault, "Team/Cy.md")).toBe("from Cy\nand Ana\n");
+    expect(reads).toBe(0);
   });
 });

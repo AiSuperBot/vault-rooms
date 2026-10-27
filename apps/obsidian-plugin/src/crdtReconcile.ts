@@ -35,10 +35,14 @@ function isLowSurrogate(unit: number): boolean {
 
 /** Works on code points (not UTF-16 units), so an edit never splits a surrogate pair (an emoji, say) in two. */
 function lcsDiff(a: string[], b: string[]): DiffOp[] {
+  return coalesce(lcsOps(a, b));
+}
+
+/** One op per element of `a` and `b` (code points, or lines). */
+function lcsOps(a: string[], b: string[]): DiffOp[] {
   const n = a.length;
   const m = b.length;
-  if (n === 0) return m ? [{ op: "insert", text: b.join("") }] : [];
-  if (m === 0) return n ? [{ op: "delete", text: a.join("") }] : [];
+  if (n === 0 || m === 0) return [...a.map((text) => ({ op: "delete" as const, text })), ...b.map((text) => ({ op: "insert" as const, text }))];
 
   const dp: Uint32Array[] = new Array<Uint32Array>(n + 1);
   for (let i = 0; i <= n; i++) {
@@ -76,8 +80,7 @@ function lcsDiff(a: string[], b: string[]): DiffOp[] {
     ops.push({ op: "insert", text: b[j]! });
     j++;
   }
-
-  return coalesce(ops);
+  return ops;
 }
 
 function coalesce(ops: DiffOp[]): DiffOp[] {
@@ -169,5 +172,53 @@ export function reconcileYTextWithDiskText(ytext: Y.Text, diskText: string, orig
     // Y.Text's own mutators behave when called outside a transaction.
     apply();
   }
+  return true;
+}
+
+/** Lines, each with its "\n" (the last may have none). */
+function lines(text: string): string[] {
+  return text.match(/[^\n]*\n|[^\n]+$/g) ?? [];
+}
+
+/**
+ * Like reconcileYTextWithDiskText, for a whole note saved outside the editor (by another program, or a plugin writing
+ * a date): each changed line is replaced whole, its old text taken out and the new line put in right there, line after
+ * line. Two computers changing the same line at the same moment then take out exactly the same text, which is how such
+ * a clash is noticed (see RoomReplica), and each new line is tied to the line it replaced, so one line is kept and
+ * never a mix of the two.
+ */
+export function reconcileYTextByLines(ytext: Y.Text, text: string, origin: unknown): boolean {
+  const oldText = ytext.toString();
+  if (oldText === text) return false;
+  const a = lines(oldText);
+  const b = lines(text);
+  let prefix = 0;
+  while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
+  let suffix = 0;
+  while (suffix < a.length - prefix && suffix < b.length - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
+  const oldMid = a.slice(prefix, a.length - suffix);
+  const newMid = b.slice(prefix, b.length - suffix);
+  const ops = oldMid.length * newMid.length > MAX_DIFF_CELLS ? lcsOps(oldMid, []).concat(lcsOps([], newMid)) : lcsOps(oldMid, newMid);
+  const apply = (): void => {
+    let pos = a.slice(0, prefix).join("").length;
+    for (let i = 0; i < ops.length; ) {
+      if (ops[i]!.op === "equal") {
+        pos += ops[i++]!.text.length;
+        continue;
+      }
+      const gone: string[] = [];
+      const added: string[] = [];
+      for (; i < ops.length && ops[i]!.op !== "equal"; i++) (ops[i]!.op === "delete" ? gone : added).push(ops[i]!.text);
+      for (let k = 0; k < Math.max(gone.length, added.length); k++) {
+        if (k < gone.length) ytext.delete(pos, gone[k]!.length);
+        if (k < added.length) {
+          ytext.insert(pos, added[k]!);
+          pos += added[k]!.length;
+        }
+      }
+    }
+  };
+  if (ytext.doc) ytext.doc.transact(apply, origin);
+  else apply();
   return true;
 }

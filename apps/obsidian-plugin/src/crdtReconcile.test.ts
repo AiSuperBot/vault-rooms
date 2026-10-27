@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
-import { computeTextDiff, reconcileYTextWithDiskText } from "./crdtReconcile.js";
+import { computeTextDiff, reconcileYTextByLines, reconcileYTextWithDiskText } from "./crdtReconcile.js";
 
 /** Reconstructs the target text from a diff's ops, so tests can assert correctness without
  *  depending on any particular (equally-valid) minimal edit script - only that applying the script
@@ -52,6 +52,32 @@ describe("computeTextDiff", () => {
     const newText = "b".repeat(2000);
     const ops = computeTextDiff(oldText, newText);
     expect(applyDiff(ops)).toBe(newText);
+  });
+});
+
+describe("reconcileYTextByLines", () => {
+  it("turns a note into another", () => {
+    const cases = [["", "a\n"], ["a\n", ""], ["a\nb\nc\n", "a\nB\nc\n"], ["a\nb", "a\nb\nc"], ["a\nb\nc\n", "x\nb\ny\nz\n"], ["a\nb\nc\nd\n", "a\nd\n"], ["😃 a\n", "😃 b\n"]];
+    for (const [from, to] of cases) {
+      const text = new Y.Doc().getText("content");
+      text.insert(0, from!);
+      expect(reconcileYTextByLines(text, to!, null)).toBe(true);
+      expect(text.toString()).toBe(to);
+    }
+  });
+
+  it("replaces a changed line whole, so two computers changing it take out the same text", () => {
+    const base = new Y.Doc();
+    base.getText("content").insert(0, "---\nstart: 2030-01-09\n---\n");
+    const deletedBy = (to: string) => {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(base));
+      let deleted: unknown;
+      doc.once("update", (update: Uint8Array) => (deleted = Y.decodeUpdate(update).ds));
+      reconcileYTextByLines(doc.getText("content"), to, null);
+      return deleted;
+    };
+    expect(deletedBy("---\nstart: 2030-01-12\n---\n")).toEqual(deletedBy("---\nstart: 2030-02-03\n---\n"));
   });
 });
 
