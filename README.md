@@ -34,7 +34,7 @@ This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms
 - **With BRAT:** add the beta plugin `AiSuperBot/vault-rooms`.
 - **By hand:** download `main.js`, `manifest.json` and `styles.css` from the latest [release](https://github.com/AiSuperBot/vault-rooms/releases) into `<vault>/.obsidian/plugins/vault-rooms/`, then enable Vault Rooms under Community plugins.
 
-Release builds come from this repository's release workflow, with attested build provenance (`gh attestation verify main.js -R AiSuperBot/vault-rooms`).
+Each release lists the SHA-256 of its files, and the build is reproducible: building its tag with `npx pnpm@11.7.0 install` and `npx pnpm@11.7.0 build:plugin` gives the same `main.js`.
 
 This fork has the same plugin id as upstream Vault Rooms but a different, incompatible protocol: use it on every computer of the workspace.
 
