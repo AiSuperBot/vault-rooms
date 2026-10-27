@@ -8,7 +8,7 @@ import { envelopeKey, openEnvelope, sealSnapshot } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
 import { RoomReplica, type FileEntry } from "./replica.js";
-import { STORE_LIMITS } from "./store.js";
+import { EnvelopeStore, STORE_LIMITS } from "./store.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion } from "./workspace.js";
 
@@ -252,6 +252,40 @@ describe("room replica", () => {
     expect(() => s.net.pump(5_000)).not.toThrow();
     const kept = [a, c, b].map((m) => m.node.store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => envelopeKey(snapshot)).join());
     expect(new Set(kept).size).toBe(1);
+  });
+
+  it("doesn't hold a save twice when the same saves are restored on a running replica", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    s.wrapFor(s.ana);
+    a.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "a\nb\n");
+    a.replica.edit(fileId, (doc) => {
+      doc.getText("content").insert(2, "B\n");
+      doc.getText("content").delete(4, 2);
+    }, true);
+    const saved = a.replica.recentSaves();
+    expect(Object.values(saved).flat()).toHaveLength(1);
+    a.replica.restoreSaves(JSON.parse(JSON.stringify(saved)));
+    expect(a.replica.recentSaves()).toEqual(saved);
+  });
+
+  it("takes in again a snapshot it dropped on a claim alone once this computer is in the room", () => {
+    const s = setup();
+    const store = new EnvelopeStore();
+    store.isMember = () => false;
+    const ctx = { ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.cy.sign };
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "honest");
+    const fileId = randomId("f");
+    const honest = sealSnapshot(ctx, fileId, 1, { [s.cy.id]: 1 }, Y.encodeStateAsUpdate(doc));
+    const lying = sealSnapshot(ctx, fileId, 2, { [s.cy.id]: 9 }, Y.encodeStateAsUpdate(new Y.Doc()));
+    expect(store.add(honest)).toBe("added");
+    expect(store.add(lying)).toBe("added");
+    expect(store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => snapshot.seq)).toEqual([2]);
+    store.isMember = () => true;
+    store.distrustClaims(s.roomId);
+    expect(store.add(honest)).toBe("added");
   });
 
   it("passes a former writer's work on only once it waited, if not the first writer to do it", () => {

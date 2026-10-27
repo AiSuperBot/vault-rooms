@@ -657,42 +657,72 @@ export function rebaseChange(base: WorkspaceState, lost: WorkspaceState, onto: W
  *   demoted (or whose room it took) doesn't get their way through the losing branch.
  * - Revocations and removals are final; a demotion or a lower role counts only if it still holds at the end of `lost`,
  *   so taking something away and giving it back changes nothing.
- * - Each change is made only if `actor` may make it on top of the others (see authorize), one by one, so one change that
- *   can't be made (for someone the winner removed, say) doesn't stop the rest.
+ * - Grants are judged by replaying `won`: a promotion, a higher role or someone let in counts only if whoever gave it
+ *   still had the standing for it there, so what a taken-out signer's helpers granted in turn is taken back too, and
+ *   a role raised and then lowered again comes back to where it was.
+ * - Each change is made only if `actor` may make it on top of the others (see authorize), so one that can't be made
+ *   (for someone the winner removed, say) doesn't stop the rest.
  * Returns the changed state, or null when there is nothing to do.
  */
 export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVersion[], current: WorkspaceState, actor: Signer, workspaceId: string): WorkspaceState | null {
   if (lost.length === 0) return null;
+  // Each change is checked with the rule it needs, and the whole once, like any version; only if that fails (a rule
+  // not foreseen here) is each change checked against everything, one by one, which costs much more.
+  const quick = reductions(fork, lost, won, current, actor, workspaceId, false);
+  if (!quick) return null;
+  try {
+    authorize(current, quick, actor, Date.now(), workspaceId);
+    return quick;
+  } catch {
+    return reductions(fork, lost, won, current, actor, workspaceId, true);
+  }
+}
+
+const ROLE_RANK = { read: 1, write: 2, manage: 3 } as const;
+const rank = (role: Role | undefined) => (role === undefined ? 0 : ROLE_RANK[role]);
+
+function reductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVersion[], current: WorkspaceState, actor: Signer, workspaceId: string, strict: boolean): WorkspaceState | null {
   const draft = structuredClone(current);
   let changed = false;
-  const attempt = (apply: () => boolean, undo: () => void) => {
+  const admin = current.users[actor.user]?.admin === true && !current.users[actor.user]?.removed;
+  /** Make a change if this computer may: `may` and `keeps` (what it must leave intact) or, `strict`, by authorize. */
+  const attempt = (may: boolean, apply: () => boolean, keeps: () => boolean, undo: () => void) => {
+    if (!strict && !may) return;
     if (!apply()) return;
-    try {
-      authorize(current, draft, actor, Date.now(), workspaceId);
-      changed = true;
-    } catch {
-      undo();
-    }
+    let ok = true;
+    if (strict) {
+      try {
+        authorize(current, draft, actor, Date.now(), workspaceId);
+      } catch {
+        ok = false;
+      }
+    } else ok = keeps();
+    if (ok) changed = true;
+    else undo();
   };
   const revoke = (deviceId: string) => {
     const device = draft.devices[deviceId];
-    attempt(() => !!device && !device.revoked && (device.revoked = true), () => delete device!.revoked);
+    const wasAdmin = !!device && draft.users[device.user]?.admin === true;
+    attempt(admin || device?.user === actor.user, () => !!device && !device.revoked && (device.revoked = true), () => !wasAdmin || hasActiveAdmin(draft), () => delete device!.revoked);
   };
   const remove = (userId: string) => {
     const user = draft.users[userId];
-    attempt(() => !!user && !user.removed && (user.removed = true), () => delete user!.removed);
+    const managed = Object.values(draft.rooms).filter((room) => !room.deleted && room.members[userId] === "manage");
+    attempt(admin, () => !!user && !user.removed && (user.removed = true), () => (!user!.admin || hasActiveAdmin(draft)) && managed.every((room) => hasManager(draft, room)), () => delete user!.removed);
   };
   const demote = (userId: string) => {
     const user = draft.users[userId];
-    attempt(() => !!user?.admin && !(user.admin = false), () => (user!.admin = true));
+    attempt(admin, () => !!user?.admin && !(user.admin = false), () => hasActiveAdmin(draft), () => (user!.admin = true));
   };
   /** Set a member's role in a room, unless the room is gone or `unless` says the role there changed meanwhile. */
   const setRole = (roomId: string, userId: string, role: Role | undefined, unless: (now: Role | undefined) => boolean) => {
     const room = draft.rooms[roomId];
     const was = room?.members[userId];
     if (!room || room.deleted || was === role || unless(was)) return;
+    const user = draft.users[userId];
     const set = (value: Role | undefined) => (value === undefined ? delete room.members[userId] : (room.members[userId] = value));
-    attempt(() => (set(role), true), () => set(was));
+    const may = roleIn(current, roomId, actor.user) === "manage" && (role === undefined || (user !== undefined && !user.removed));
+    attempt(may, () => (set(role), true), () => was !== "manage" || hasManager(draft, room), () => set(was));
   };
   // The signer's user, if it still has the standing in `current` for a change: an admin's, a room manager's, or their own.
   const standing = (version: SignedVersion) => {
@@ -703,8 +733,10 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
 
   // What the losing branch took away, from signers that still stand: taken away here too.
   const takenFrom = { devices: new Set<string>(), users: new Set<string>(), admins: new Set<string>(), rooms: new Set<string>() };
+  /** Roles the losing branch lowered for good, `<room>/<user>` -> the lower role (see the grants below). */
+  const lowered = new Map<string, Role | undefined>();
   /** The version that last lowered something (`admin/<user>`, `room/<room>/<user>`), for what is still lower at the end. */
-  const lowered = new Map<string, SignedVersion>();
+  const lastLowered = new Map<string, SignedVersion>();
   let prev = fork;
   for (const version of lost) {
     const next = version.body.state;
@@ -721,18 +753,18 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
       takenFrom.devices.add(deviceId);
       revoke(deviceId);
     }
-    for (const [userId, user] of Object.entries(prev.users)) if (user.admin && !next.users[userId]?.admin) lowered.set(`admin/${userId}`, version);
+    for (const [userId, user] of Object.entries(prev.users)) if (user.admin && !next.users[userId]?.admin) lastLowered.set(`admin/${userId}`, version);
     for (const [roomId, room] of Object.entries(prev.rooms)) {
       for (const [userId, role] of Object.entries(room.members)) {
         const after = next.rooms[roomId]?.deleted ? undefined : next.rooms[roomId]?.members[userId];
-        if (after === undefined || !roleAtLeast(after, role)) lowered.set(`room/${roomId}/${userId}`, version);
+        if (after === undefined || !roleAtLeast(after, role)) lastLowered.set(`room/${roomId}/${userId}`, version);
       }
     }
     prev = next;
   }
   const end = lost[lost.length - 1]!.body.state;
   for (const [userId, user] of Object.entries(fork.users)) {
-    const version = lowered.get(`admin/${userId}`);
+    const version = lastLowered.get(`admin/${userId}`);
     if (!user.admin || end.users[userId]?.admin || end.users[userId]?.removed || !version || !standing(version)?.admin) continue;
     takenFrom.admins.add(userId);
     demote(userId);
@@ -740,52 +772,81 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
   for (const [roomId, room] of Object.entries(fork.rooms)) {
     for (const [userId, role] of Object.entries(room.members)) {
       const after = end.rooms[roomId]?.deleted ? undefined : end.rooms[roomId]?.members[userId];
-      const version = lowered.get(`room/${roomId}/${userId}`);
+      const version = lastLowered.get(`room/${roomId}/${userId}`);
       if ((after !== undefined && roleAtLeast(after, role)) || !version) continue;
       // Room members are changed by the room's managers (anyone may leave); a room is deleted by them or an admin.
       const signer = standing(version);
       const deleted = end.rooms[roomId]?.deleted === true;
       if (!signer || !(roleIn(current, roomId, signer.id) === "manage" || (after === undefined && signer.id === userId) || (deleted && signer.admin))) continue;
       if (role === "manage") takenFrom.rooms.add(`${roomId}/${userId}`);
+      lowered.set(`${roomId}/${userId}`, after);
       if (!deleted) setRole(roomId, userId, after, (now) => now === undefined || (after !== undefined && roleAtLeast(after, now)));
     }
   }
+  if (won.length === 0) return changed ? draft : null;
 
-  // What those signers granted at the same moment in the winning branch: taken back. People let in count as granted
-  // by whoever made the invite they used, not by whoever recorded their joining.
+  // What was granted at the same moment in the winning branch, replayed from the fork: a grant counts only if whoever
+  // made it still had the standing for it there. People let in count as granted by whoever made the invite they used,
+  // not by whoever recorded their joining.
+  const legitAdmins = new Set(Object.entries(fork.users).filter(([userId, user]) => user.admin && !user.removed && !takenFrom.admins.has(userId) && !takenFrom.users.has(userId)).map(([userId]) => userId));
+  const legitRoles = new Map<string, Role | undefined>();
+  const legitRole = (roomId: string, userId: string) => {
+    const key = `${roomId}/${userId}`;
+    return legitRoles.has(key) ? legitRoles.get(key) : lowered.has(key) ? lowered.get(key) : fork.rooms[roomId]?.members[userId];
+  };
+  const out = (deviceId: string, userId: string) => takenFrom.devices.has(deviceId) || takenFrom.users.has(userId);
+  const letIn = new Set<string>();
+  const notLetIn = new Set<string>();
   prev = fork;
   for (const version of won) {
     const next = version.body.state;
-    const joined = new Set<string>();
+    const by = prev.devices[version.body.by];
+    const signerOut = !by || out(version.body.by, by.user);
+    const handled = new Set<string>();
     for (const join of version.body.joins ?? []) {
       const invite = prev.invites[join.body.invite];
       const deviceId = join.body.device.id;
       const userId = next.devices[deviceId]?.user;
       if (!invite || !userId) continue;
-      joined.add(userId);
-      const all = takenFrom.devices.has(invite.dev) || takenFrom.users.has(invite.by);
-      if (all || (invite.forUser === undefined && takenFrom.admins.has(invite.by))) revoke(deviceId);
-      for (const [roomId, role] of Object.entries(invite.rooms)) {
-        if (!all && !takenFrom.rooms.has(`${roomId}/${invite.by}`)) continue;
-        setRole(roomId, userId, prev.rooms[roomId]?.members[userId], (now) => now !== role);
+      const legit = !out(invite.dev, invite.by) && (invite.forUser !== undefined || legitAdmins.has(invite.by));
+      (legit ? letIn : notLetIn).add(deviceId);
+      for (const [roomId, role] of Object.entries(grantedRooms(prev, invite))) {
+        if (legit && legitRole(roomId, invite.by) === "manage") legitRoles.set(`${roomId}/${userId}`, role);
+        if (next.rooms[roomId]?.members[userId] === role) handled.add(`${roomId}/${userId}`);
       }
     }
-    const signer = prev.devices[version.body.by];
-    if (signer) {
-      const all = takenFrom.devices.has(version.body.by) || takenFrom.users.has(signer.user);
-      if (all || takenFrom.admins.has(signer.user)) {
-        for (const [userId, user] of Object.entries(next.users)) if (user.admin && !prev.users[userId]?.admin && draft.users[userId]?.admin) demote(userId);
-      }
-      for (const [roomId, room] of Object.entries(next.rooms)) {
-        if (!all && !takenFrom.rooms.has(`${roomId}/${signer.user}`)) continue;
-        for (const [userId, role] of Object.entries(room.members)) {
-          const before = prev.rooms[roomId]?.members[userId];
-          if (joined.has(userId) || (before !== undefined && roleAtLeast(before, role))) continue;
-          setRole(roomId, userId, before, (now) => now !== role);
-        }
+    for (const [userId, user] of Object.entries(next.users)) {
+      const was = prev.users[userId];
+      if (user.removed || !user.admin) legitAdmins.delete(userId);
+      else if (!was?.admin && !signerOut && legitAdmins.has(by!.user)) legitAdmins.add(userId);
+    }
+    for (const roomId of keysOf(prev.rooms, next.rooms)) {
+      const before = prev.rooms[roomId];
+      const after = next.rooms[roomId];
+      if (!after || after.deleted) continue;
+      // A room made here has its maker as manager (see authorize).
+      const manages = !signerOut && (!before || legitRole(roomId, by!.user) === "manage");
+      for (const userId of keysOf(before?.members ?? {}, after.members)) {
+        const was = before?.members[userId];
+        const role = after.members[userId];
+        const key = `${roomId}/${userId}`;
+        if (was === role || handled.has(key)) continue;
+        // A lower role always holds (it can't lift what was granted unduly); a higher one only from a manager.
+        if (rank(role) < rank(was)) legitRoles.set(key, rank(role) < rank(legitRole(roomId, userId)) ? role : legitRole(roomId, userId));
+        else if (manages) legitRoles.set(key, role);
       }
     }
     prev = next;
+  }
+  const last = prev;
+  for (const [userId, user] of Object.entries(last.users)) if (user.admin && !user.removed && !legitAdmins.has(userId) && draft.users[userId]?.admin) demote(userId);
+  for (const deviceId of notLetIn) if (!letIn.has(deviceId) && draft.devices[deviceId]) revoke(deviceId);
+  for (const [roomId, room] of Object.entries(last.rooms)) {
+    if (room.deleted) continue;
+    for (const [userId, role] of Object.entries(room.members)) {
+      const legit = legitRole(roomId, userId);
+      if (rank(legit) < rank(role)) setRole(roomId, userId, legit, (now) => now !== role);
+    }
   }
   return changed ? draft : null;
 }

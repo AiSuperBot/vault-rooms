@@ -456,10 +456,9 @@ export class MeshService {
     }
     // Concurrent revocations add up: what the losing branch took away is taken away here too, by whoever may, and what
     // those it took standing from granted at the same moment is taken back (see concurrentReductions).
-    await this.commit((state) => {
-      const reduced = concurrentReductions(fork, lost, won, state, { user: this.settings.userId, device: this.settings.deviceId }, this.settings.id);
-      if (reduced) Object.assign(state, reduced);
-    }).catch((error: Error) => this.deps.log(`concurrent reductions: ${error.message}`));
+    // Worked out once, on the head the change is then made on (nothing runs in between).
+    const reduced = concurrentReductions(fork, lost, won, this.node.chain.head.body.state, { user: this.settings.userId, device: this.settings.deviceId }, this.settings.id);
+    if (reduced) await this.commit((state) => void Object.assign(state, structuredClone(reduced))).catch((error: Error) => this.deps.log(`concurrent reductions: ${error.message}`));
     if (failed.length > 0) this.deps.notify("A change you made to the workspace clashed with someone else's at the same moment and couldn't be made again. Please check it and make it again if it's still needed.");
   }
 
