@@ -15,6 +15,8 @@ Out of scope: someone controlling a member's computer while it is unlocked (they
 
 **Plugins that run code from notes.** If you use plugins that execute code written in notes (Dataview JavaScript queries, Templater user scripts and the like), anyone who can edit a room can run code on your computer through a note. Turn those features off for room folders, or don't use such plugins in a vault that shares rooms.
 
+**Invite links are secrets.** Anyone holding a link can join until it is used, withdrawn or expired: if a link leaks, withdraw it in the panel. One case stays open: someone who got in with a leaked link and was taken out again while the network was split, at the same moment as another admin's change, can come back through the other side of the split. After a split heals, check the people list.
+
 ## What is protected, and how
 
 | What | How |
