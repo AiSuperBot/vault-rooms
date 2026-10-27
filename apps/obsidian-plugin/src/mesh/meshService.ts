@@ -9,7 +9,6 @@ import {
   formatInviteLink,
   INDEX_DOC,
   JOIN_EXPIRY_SLACK_MS,
-  joinerStands,
   joinWorkspace,
   keyCommitment,
   MeshNode,
@@ -26,6 +25,7 @@ import {
   roleIn,
   RoomReplica,
   sealRoomName,
+  takenBackOut,
   WorkspaceChain,
   wrapRoomKey,
   type JoinRecord,
@@ -288,6 +288,8 @@ export class MeshService {
   async stop(): Promise<void> {
     this.stopped = true;
     this.node.stop();
+    this.adoptFirstLink?.channel.close("stopped");
+    this.adoptFirstLink = null;
     for (const timer of this.timers) clearInterval(timer as ReturnType<typeof setInterval>);
     if (this.automateTimer) clearTimeout(this.automateTimer);
     this.discovery?.stop();
@@ -399,6 +401,7 @@ export class MeshService {
   private async reapply(lost: SignedVersion[]): Promise<void> {
     const failed: string[] = [];
     const fork = this.node.chain.versionAt(lost[0]!.body.v - 1)?.body.state;
+    const winner = this.node.chain.state;
     if (!fork) return;
     for (let i = 0; i < lost.length; i++) {
       const version = lost[i]!;
@@ -411,7 +414,7 @@ export class MeshService {
       );
       try {
         await this.commit((state) => {
-          Object.assign(state, rebaseChange(base, version.body.state, state, fork));
+          Object.assign(state, rebaseChange(base, version.body.state, state, fork, winner));
           for (const [roomId, key] of keys) {
             const room = state.rooms[roomId];
             if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
@@ -430,10 +433,8 @@ export class MeshService {
     }
     // Someone the lost branch brought in and took back out isn't in the winner's record at all, and the invite that
     // brought them is open there again: it is withdrawn (by a device that may), so its link can't bring them back.
-    const end = lost[lost.length - 1]!.body.state;
     const reopened = lost
-      .flatMap((version) => version.body.joins ?? [])
-      .filter((join) => !joinerStands(end, join))
+      .flatMap((version, i) => (version.body.joins ?? []).filter((join) => takenBackOut(version.body.state, lost.slice(i + 1), join)))
       .map((join) => join.body.invite)
       .filter((inviteId) => {
         const invite = this.node.chain.state.invites[inviteId];
@@ -451,6 +452,8 @@ export class MeshService {
   discard(): void {
     this.stopped = true;
     this.node.stop();
+    this.adoptFirstLink?.channel.close("stopped");
+    this.adoptFirstLink = null;
     for (const timer of this.saveTimers.values()) clearTimeout(timer);
     this.saveTimers.clear();
     if (this.automateTimer) clearTimeout(this.automateTimer);
