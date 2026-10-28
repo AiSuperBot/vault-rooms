@@ -187,8 +187,6 @@ describe("mesh service", () => {
 
   it("makes again at once a revocation in a losing branch it didn't sign, while its signer is away", async () => {
     const ana = await started(await MeshService.create(deps("Ana6"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
-    // Joins come in below without a peer to compare the record with: as if it had been.
-    ana.node.recordCompared = true;
     const join = async (name: string, letter: string) => {
       const invite = parseInviteLink(await ana.createInvite({}));
       const device = newDevice(`u${letter.repeat(22)}`, `${name} PC`);
@@ -210,17 +208,34 @@ describe("mesh service", () => {
   });
 
   it("makes no change of its own to the record before comparing it with a member's since it started", async () => {
-    const ana = await started(await MeshService.create(deps("AnaC"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
-    const invite = parseInviteLink(await ana.createInvite({}));
+    const anaDeps = deps("AnaC");
+    const ana = await started(await MeshService.create(anaDeps, { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const address = `127.0.0.1:${ana.listeningPort}`;
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=${encodeURIComponent(address)}`);
+    const benDeps = deps("BenC");
+    const ben = await started(await MeshService.join(benDeps, { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ana.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    // Both close Obsidian; Ana's computer starts again alone, and a join comes in.
+    for (const service of [ana, ben]) {
+      await service.stop();
+      services.splice(services.indexOf(service), 1);
+    }
+    const again = await started((await MeshService.open(anaDeps))!);
+    const invite = parseInviteLink(await again.createInvite({}));
     const eve = newDevice(`u${"E".repeat(22)}`, "Eve PC");
-    ana.node.addJoin(createJoinRecord({ workspaceId: ana.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: eve.userId, name: "Eve" }, deviceName: eve.name, deviceKey: eve.sign, agreementPublicKey: eve.agree.publicKey, tlsFingerprint: eve.tls }));
-    // No member reached since it started: recording the join waits (made on an old record, it could start a branch).
+    again.node.addJoin(createJoinRecord({ workspaceId: again.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: eve.userId, name: "Eve" }, deviceName: eve.name, deviceKey: eve.sign, agreementPublicKey: eve.agree.publicKey, tlsFingerprint: eve.tls }));
+    // No member has answered since it started: recording the join waits (on an old record, it could start a branch).
     await new Promise((resolve) => setTimeout(resolve, 1_000));
-    expect(ana.node.chain.state.devices[eve.id]).toBeUndefined();
-    ana.node.recordCompared = true;
-    (ana as unknown as { automateSoon(): void }).automateSoon();
-    await until(() => ana.node.chain.state.devices[eve.id] !== undefined);
-  });
+    expect(again.node.chain.state.devices[eve.id]).toBeUndefined();
+    // Ben's computer comes back and answers: the join is recorded.
+    benDeps.settings.workspace!.peers = [`127.0.0.1:${again.listeningPort}`];
+    await started((await MeshService.open(benDeps))!);
+    await until(() => again.node.chain.state.devices[eve.id] !== undefined, 20_000);
+    // Much longer than the automation's tick since it last ran (the computer slept): it waits for an answer again.
+    (again as unknown as { lastAutomate: number }).lastAutomate = Date.now() - 300_000;
+    await (again as unknown as { automate(): Promise<void> }).automate();
+    expect(again.node.recordCompared).toBe(false);
+  }, 60_000);
 
   it("never goes online once stopped", async () => {
     const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });

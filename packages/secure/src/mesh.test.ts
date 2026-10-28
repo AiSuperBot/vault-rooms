@@ -548,42 +548,6 @@ describe("mesh", () => {
     expect(outcome).toEqual([expect.stringMatching(/join_no_invite/)]);
   });
 
-  it("sends a long record in pieces small enough for a peer that doesn't count this device as a member yet", () => {
-    const { chain, ana, cy } = setup();
-    // Ana makes many rooms: the record grows long, each version holding every room so far.
-    for (let i = 0; i < 90; i++) createRoom(chain, ana, `Room ${i}`);
-    const sent: PeerMessage[] = [];
-    const a = nodeFor(chain, ana);
-    const session = a.connect({ send: (m) => sent.push(m), close: () => {} }, cy.id);
-    session.receive({ t: "hello", ws: a.workspaceId, head: -1, recent: [] });
-    const versions = sent.filter((m): m is Extract<PeerMessage, { t: "versions" }> => m.t === "versions");
-    expect(versions.length).toBeGreaterThan(1);
-    for (const m of versions) expect(JSON.stringify(m).length).toBeLessThan(1 << 20);
-    expect(versions.flatMap((m) => m.versions)).toHaveLength(chain.length);
-  });
-
-  it("judges a branch that comes in batches as a whole, once the answer is over", () => {
-    const { chain, ana, ben, cy } = setup();
-    step(chain, ana, (state) => void (state.users[cy.userId]!.admin = true));
-    // Theirs: a change of Ana's, a revocation, and a change of Cy's; ours: the revocation alone. The first batch alone
-    // would lose; the whole branch wins.
-    const theirs = WorkspaceChain.load(chain.all());
-    step(theirs, ana, (state) => void (state.name = "Theirs"));
-    step(theirs, ana, (state) => void (state.devices[ben.id]!.revoked = true));
-    step(theirs, cy, (state) => void (state.name = "Theirs, by Cy"));
-    step(chain, ana, (state) => void (state.devices[ben.id]!.revoked = true));
-    const branch = theirs.since(theirs.head.body.v - 2);
-    expect(WorkspaceChain.load(chain.all()).offer(branch.slice(0, 1)).status).toBe("rejected");
-    expect(WorkspaceChain.load(chain.all()).offer(branch).status).toBe("replaced");
-    const a = nodeFor(chain, ana);
-    const session = a.connect({ send: () => {}, close: () => {} }, cy.id);
-    session.receive({ t: "versions", versions: branch.slice(0, 1) });
-    session.receive({ t: "versions", versions: branch.slice(1) });
-    expect(a.chain.state.name).not.toBe("Theirs, by Cy");
-    session.receive({ t: "digests", rooms: {} });
-    expect(a.chain.state.name).toBe("Theirs, by Cy");
-  });
-
   it("takes from a device that isn't a member here only versions that extend its record, and lets it go on anything else", () => {
     const { chain, ana, ben } = setup();
     // A branch made elsewhere, next to ours, that would win against it (it revokes a device).
@@ -600,7 +564,6 @@ describe("mesh", () => {
     session.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
     expect(sent.map((m) => m.t)).toEqual(["hello"]);
     session.receive({ t: "versions", versions: theirs.since(base + 1) });
-    session.receive({ t: "digests", rooms: {} });
     expect(session.isClosed).toBe(true);
     expect(a.chain.state.name).toBe("Ours");
     // Versions without a hello first, or with the first version of all among them, end the session too.
@@ -611,6 +574,11 @@ describe("mesh", () => {
     first.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
     first.receive({ t: "versions", versions: chain.all().slice(0, 2) });
     expect(first.isClosed).toBe(true);
+    // An answer that is over (its digests) without making it a member ends it as well.
+    const over = a.connect({ send: () => {}, close: () => {} }, founder().admin.id);
+    over.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
+    over.receive({ t: "digests", rooms: {} });
+    expect(over.isClosed).toBe(true);
   });
 
   it("says nothing to a device that isn't a member until it presents a join, even if it knows the workspace", () => {

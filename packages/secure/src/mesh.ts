@@ -24,6 +24,8 @@ export interface Channel {
   close(reason: string): void;
   /** Called once the other side is a member and the session is running (a transport lifts its pre-membership limits). */
   ready?(): void;
+  /** Called before that once the other side has shown it holds our record: its versions may come in large messages. */
+  widen?(): void;
 }
 
 type Recent = Array<[number, string]>;
@@ -62,15 +64,13 @@ export interface MeshEvents {
   /** A peer sent something invalid. Reported for diagnostics; never thrown at the caller. */
   rejected?(reason: string, from: string): void;
   sessions?(): void;
+  /** The record has just been compared with a member's (see MeshNode.recordCompared). */
+  compared?(): void;
 }
 
 const RECENT = 64;
 const MAX_ITEMS = 500;
-/** Versions of one answer collected at most before they go in (a longer run goes in parts). */
-const MAX_RUN = 4 * MAX_ITEMS;
 const MAX_ADDRESSES = 64;
-/** A peer not yet counted as a member reads frames of at most 1 MiB (see transport). */
-const MAX_VERSIONS_BYTES = 768 << 10;
 const MAX_BATCH_BYTES = 8 << 20;
 const PRESENCE_MEMORY = 2000;
 const PRESENCE_WINDOW_MS = 60_000;
@@ -148,12 +148,11 @@ export class MeshNode {
   addressBook: () => Array<[string, string]> = () => [];
   /** Addresses a peer told of, in form only: whoever answers there is checked when dialled. */
   onAddresses: (items: Array<[string, string]>) => void = () => {};
-  /**
-   * The record has been compared with a member's since this device started (an answer to our hello came in). Until
-   * then, changes the device would make on its own (see MeshService.automate) wait: made on an old record, they would
-   * only start a branch.
-   */
-  recordCompared = false;
+  /** No other device of the workspace was active when this node started (see recordCompared). */
+  private readonly alone: boolean;
+  /** When a member last answered our hello, and since when an answer counts (see recompare). */
+  private answeredAt = 0;
+  private answersSince = 0;
   private stopped = false;
 
   constructor(
@@ -168,10 +167,33 @@ export class MeshNode {
     this.store.isMember = (room) => this.isMemberOf(room);
     this.store.now = now;
     this.memberRooms = this.currentMemberRooms();
+    this.alone = !Object.keys(chain.state.devices).some((id) => id !== deviceId && activeDevice(chain.state, id));
   }
 
   get workspaceId(): string {
     return this.chain.workspaceId;
+  }
+
+  /**
+   * The record has been compared with a member's: one answered our hello since this node started, or since recompare
+   * (a joining device's doesn't count: it only has what we gave it), or no other device was active when it started.
+   * Until then, changes the device would make to the record on its own (see MeshService.automate) wait: made on an old
+   * record (after a time away), they would only start a branch.
+   */
+  get recordCompared(): boolean {
+    return this.alone || this.answeredAt > this.answersSince;
+  }
+
+  /** Only an answer from now on counts (see recordCompared): this device may have been away (asleep, say). */
+  recompare(): void {
+    this.answersSince = this.now();
+  }
+
+  /** @internal A member answered our hello. */
+  noteAnswer(): void {
+    const was = this.recordCompared;
+    this.answeredAt = Math.max(this.now(), this.answersSince + 1);
+    if (!was) this.events.compared?.();
   }
 
   /** The signed record plus valid joins no one has recorded yet: the membership every check uses. */
@@ -516,9 +538,8 @@ export class PeerSession {
   private budgets = new Map<string, Budget>();
   /** A hello received before the other side was a member here: answered in full once it is (see begin). */
   private earlyHello: Record<string, unknown> | null = null;
-  /** Our hello was sent and its answer hasn't ended yet: its versions are collected into `run` (see handle). */
+  /** Our hello was sent and its answer hasn't ended yet (see MeshNode.recordCompared). */
   private awaiting = false;
-  private run: SignedVersion[] = [];
 
   constructor(
     private readonly node: MeshNode,
@@ -596,15 +617,10 @@ export class PeerSession {
 
   private handle(raw: unknown): void {
     const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
-    // The answer to our hello: its versions (sent in batches) go in as one run once what follows them in an answer
-    // comes (joins, wraps, digests: it always ends with digests), so a branch is judged whole, never by its first part.
-    if (this.awaiting) {
-      if (message.t === "versions") return this.collect(message.versions);
-      if (message.t === "joins" || message.t === "wraps" || message.t === "digests") {
-        this.awaiting = false;
-        this.takeRun();
-        if (this.closed) return;
-      }
+    // An answer to our hello always ends with digests: the records have been compared (see MeshNode.recordCompared).
+    if (this.awaiting && message.t === "digests") {
+      this.awaiting = false;
+      this.node.noteAnswer();
     }
     if (!this.ready) return this.beforeMembership(message);
     switch (message.t) {
@@ -653,69 +669,32 @@ export class PeerSession {
       }
       case "hello":
         // It holds our record (one of its latest versions after the first is ours): our hello tells it what we lack,
-        // and its answer is taken in (see takeRun). To anyone else, nothing is said.
+        // and its versions may come in messages as large as members send. To anyone else, nothing is said.
         if (message.ws !== this.node.workspaceId || this.readHello(message).common < 1) return this.close("not_a_member");
         if (!this.allow("hello", 3, 30_000)) return;
         this.earlyHello = message;
-        this.awaiting = true;
+        this.channel.widen?.();
         return this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+      case "versions": {
+        // Only after such a hello, and only versions that extend our record, each message as it comes (a branch that
+        // would replace part of it comes from members alone); anything else ends the session.
+        const versions = this.earlyHello ? this.parseVersions(message.versions) : [];
+        const result = versions.length === (message.versions as unknown[]).length ? this.node.offerVersions(versions, this, true) : null;
+        if (!result || (result.status !== "appended" && result.status !== "duplicate")) return this.close("not_a_member");
+        break;
+      }
       case "joins":
         // Checked, and nothing kept for later: a made-up join for an invite we don't know yet is dropped.
         this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this, false));
-        if (activeDevice(this.node.effective(), this.remoteDevice)) return this.begin();
-        return this.close("not_a_member");
-      case "versions":
-        // Versions only as the answer to our hello.
+        break;
+      case "digests":
+        // Its answer is over, and it isn't a member: nothing more to wait for.
         return this.close("not_a_member");
       default:
         return;
     }
-  }
-
-  /** Versions of the answer to our hello, kept until the whole run has come (see handle). */
-  private collect(raw: unknown): void {
-    const versions = this.parseVersions(raw);
-    // Before membership: only versions after our first, and at most what a hello's latest versions reach.
-    if (!this.ready && (versions.length < (raw as unknown[]).length || this.run.length + versions.length > 2 * RECENT)) return this.close("not_a_member");
-    const last = this.run[this.run.length - 1];
-    if (last && versions[0] && versions[0].body.v !== last.body.v + 1) this.takeRun();
-    for (const version of versions) this.run.push(version);
-    if (this.run.length >= MAX_RUN) this.takeRun();
-  }
-
-  /**
-   * The run collected (see collect) goes in as one branch. Before membership only if it extends our record (a branch
-   * that would replace part of it comes from members alone), or the session ends; once the record names the other side,
-   * the session starts. After it, the records have been compared.
-   */
-  private takeRun(): void {
-    const run = this.run;
-    this.run = [];
-    if (this.ready) {
-      this.offer(run);
-      this.node.recordCompared = true;
-      return;
-    }
-    const result = run.length > 0 ? this.node.offerVersions(run, this, true) : null;
-    if (!result || (result.status !== "appended" && result.status !== "duplicate")) return this.close("not_a_member");
     if (activeDevice(this.node.effective(), this.remoteDevice)) this.begin();
-  }
-
-  /** Versions in messages of at most about MAX_VERSIONS_BYTES (one larger version alone): small frames until membership. */
-  private sendVersions(versions: SignedVersion[]): void {
-    let batch: SignedVersion[] = [];
-    let bytes = 0;
-    for (const version of versions) {
-      const size = utf8(JSON.stringify(version)).length;
-      if (batch.length > 0 && (bytes + size > MAX_VERSIONS_BYTES || batch.length === MAX_ITEMS)) {
-        this.send({ t: "versions", versions: batch });
-        batch = [];
-        bytes = 0;
-      }
-      batch.push(version);
-      bytes += size;
-    }
-    if (batch.length > 0) this.send({ t: "versions", versions: batch });
+    else if (message.t === "joins") this.close("not_a_member");
   }
 
   private onAddresses(raw: unknown): void {
@@ -760,11 +739,9 @@ export class PeerSession {
     // If the other side's head isn't ours, send everything after the newest version both have; a joiner (head -1)
     // gets the whole record from genesis.
     const { theirHead, theirHeadHash, common } = this.readHello(message);
-    // A member's record no newer than ours: compared (see MeshNode.recordCompared).
-    if (theirHead <= this.node.chain.head.body.v) this.node.recordCompared = true;
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
-      // In batches that fit a peer that doesn't count us as a member yet; the other side takes them in as one run.
-      this.sendVersions(theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1));
+      const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
+      for (let i = 0; i < versions.length; i += MAX_ITEMS) this.send({ t: "versions", versions: versions.slice(i, i + MAX_ITEMS) });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
