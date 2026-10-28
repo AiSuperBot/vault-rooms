@@ -6,7 +6,7 @@
   "packageManager": "pnpm@11.7.0",
   "scripts": {
     "build:plugin": "pnpm --filter @vault-rooms/obsidian-plugin build && node scripts/sync-plugin-assets.mjs && node scripts/scan-bundle.mjs",
-    "typecheck": "tsc -b",
+    "typecheck": "node scripts/check-source.mjs && tsc -b",
     "test": "vitest run"
   },
   "devDependencies": {

@@ -149,6 +149,20 @@ function overlap(a: IdRange[], b: Index): IdRange[] {
   return out;
 }
 
+/** `a` without the ids in `b`. */
+function minus(a: IdRange[], b: Index): IdRange[] {
+  const out: IdRange[] = [];
+  for (const x of a) {
+    let at = x.clock;
+    for (const part of overlap([x], b)) {
+      if (part.clock > at) out.push({ client: x.client, clock: at, length: part.clock - at });
+      at = part.clock + part.length;
+    }
+    if (at < x.clock + x.length) out.push({ client: x.client, clock: at, length: x.clock + x.length - at });
+  }
+  return out;
+}
+
 /** Whether an id (or any of `length` ids from it) is in `ranges`. */
 function member(ranges: IdRange[]): (id: Id, length?: number) => boolean {
   const index = indexOf(ranges);
@@ -186,6 +200,11 @@ function live(store: Store, range: IdRange): boolean {
 /** Whether a line is still in the note, or a line that took its place since (see withInside). */
 function stillThere(text: Y.Text, line: IdRange): boolean {
   return live(text.doc!.store, line) || spansOf(text, withInside(text, [line], true, true)).length > 0;
+}
+
+/** The losing lines that still have a rival in the note: a line whose rivals are all gone stays (never to leave none). */
+function withRivals(text: Y.Text, lines: Pending["lines"]): Pending["lines"] {
+  return lines.filter(({ to }) => to.some((winner) => stillThere(text, winner)));
 }
 
 /**
@@ -526,8 +545,7 @@ export class Clashes {
   private retry(docId: DocId, waiting: Pending): void {
     const text = this.host.text(docId);
     if (!text) return;
-    // A line whose rivals are all gone since stays (never to leave none).
-    const lines = waiting.lines.filter(({ to }) => to.some((winner) => stillThere(text, winner)));
+    const lines = withRivals(text, waiting.lines);
     if (lines.length === 0 && waiting.out.length === 0) return;
     addPending(this.takeOuts, docId, { ...waiting, lines });
     this.settle(docId);
@@ -598,9 +616,15 @@ export class Clashes {
       }
     }
     this.noteRivals(docId, rivals);
-    // A line already waiting to be taken out (for its copy) is that clash, found again: it is settled with it.
+    // A line already waiting to be taken out (for its copy) is that clash, found again: it is settled with it, and gives
+    // way to these lines too (the ones it gave way to first may be gone by then, taken out on a third computer, say).
     const waiting = this.waitingTakeOuts.get(docId)?.lines ?? [];
-    const losing = lost.filter(({ line }) => !waiting.some((one) => Y.compareIDs(one.line, line)));
+    const losing = lost.filter(({ line, to }) => {
+      const one = waiting.find((w) => Y.compareIDs(w.line, line));
+      if (!one) return true;
+      for (const winner of to) if (!one.to.some((r) => Y.compareIDs(r, winner))) one.to.push(winner);
+      return false;
+    });
     if (losing.length === 0) return;
     // A losing line goes with whatever went inside it (what was put in front of it since may be a line of its own).
     if (spansOf(text, withInside(text, this.withReplacements(docId, losing.map(({ line }) => line)), true)).length === 0) return; // settled before
@@ -697,25 +721,31 @@ export class Clashes {
     this.takeOuts.delete(docId);
     const rivals = this.rivals.get(docId) ?? [];
     this.rivals.delete(docId);
+    // Its rivals may be gone since it was found (taken out by an update that came in the same go).
+    const lines = withRivals(text, pending.lines);
+    if (lines.length === 0 && pending.out.length === 0) return;
     // With what replaced it here since, and whatever went inside it.
-    const out = [...withInside(text, this.withReplacements(docId, pending.lines.map(({ line }) => line)), true), ...withInside(text, pending.out, false)];
+    const out = [...withInside(text, this.withReplacements(docId, lines.map(({ line }) => line)), true), ...withInside(text, pending.out, false)];
+    // A copy is the note without the lines of others (with what replaced them since, and went inside them), but always
+    // with all that goes: a rival noted long ago may have been replaced by a line that loses now.
+    const copyWithout = (others: IdRange[]) => textWithout(text, minus(withInside(text, others, true, true), indexOf(out)));
     const versions = [...pending.versions];
     let { kept, extra } = pending;
     if (pending.copy) {
-      const version = textWithout(text, withInside(text, rivals, true, true));
+      const version = copyWithout(rivals);
       if (version !== textWithout(text, out)) versions.push(version);
       kept = out;
     } else if (!extra && textWithout(text, out) !== textWithout(text, overlap(out, indexOf(kept)))) {
       // Something went into what gives way while it waited for its copy, which doesn't hold it: one more copy keeps it,
       // once; what goes in after that stays in the note.
-      versions.push(textWithout(text, withInside(text, pending.lines.flatMap(({ to }) => to), true, true)));
+      versions.push(copyWithout(lines.flatMap(({ to }) => to)));
       kept = out;
       extra = true;
     }
     // Copies the owner keeps now go; it tells of the others when they are kept (see copyKept), and the rest waits.
     const waiting = versions.filter((version) => this.host.clash(docId, version) === false);
     if (waiting.length > 0 || !this.host.mayEdit()) {
-      addPending(this.waitingTakeOuts, docId, { ...pending, copy: false, versions: waiting, kept, extra });
+      addPending(this.waitingTakeOuts, docId, { ...pending, lines, copy: false, versions: waiting, kept, extra });
       return;
     }
     // Only what the copies hold.

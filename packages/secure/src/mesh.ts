@@ -675,7 +675,7 @@ export class PeerSession {
       const summary = theirs.get(doc) ?? { vv: {}, snaps: [] };
       const snaps = new Set(summary.snaps);
       for (const key of store.snapshotKeys(room, doc)) if (!snaps.has(key)) missing.push(store.snapshotByKey(room, doc, key)!);
-      missing.push(...store.missingFor(room, doc, summary.vv));
+      for (const env of store.missingFor(room, doc, summary.vv)) missing.push(env);
     }
     // Envelopes still being stored go out on their own once they are.
     this.sendBatched(missing.filter((env) => !this.node.isUnpersisted(env)));
@@ -769,7 +769,7 @@ export class JoinHandshake {
       } else if (message.t === "versions") {
         if (!Array.isArray(message.versions) || message.versions.length > MAX_ITEMS) v.bad("versions");
         if (this.versions.length + message.versions.length > MAX_JOIN_VERSIONS) fail("too_many_versions");
-        this.versions.push(...message.versions.map(parseSignedVersion));
+        for (const version of message.versions) this.versions.push(parseSignedVersion(version));
       }
       if (this.targetHead >= 0 && this.versions.length >= this.targetHead + 1) {
         const chain = WorkspaceChain.load(this.versions.slice(0, this.targetHead + 1), Date.now());
