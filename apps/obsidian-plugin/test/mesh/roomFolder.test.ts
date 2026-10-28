@@ -65,17 +65,21 @@ function setup(raeRole: "read" | "write" = "read") {
   /** A computer with this room's folder. `restart`: the same computer starting again (its stored envelopes kept). */
   const make = (device: TestDevice, folderPath: string, vault = new MemoryVault(), restart?: Pc): Pc => {
     restart?.replica.destroy();
+    // As the plugin tells the folder (see MeshService.roomActivity): an envelope stored, for its note only (an index
+    // change or an attachment: for everything), and a key that came in.
+    const changed = (env: { k: string; doc?: string }) => pcs.get(device.id)?.folder.remoteChanged(env.k === "b" ? undefined : env.doc);
     const node = restart?.node ?? new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
       envelope: (env) => {
-        const pc = pcs.get(device.id);
-        pc?.replica.receive(env);
-        pc?.folder.remoteChanged();
+        pcs.get(device.id)?.replica.receive(env);
+        changed(env);
       },
-      wraps: () => pcs.get(device.id)?.replica.refreshKeys()
+      stored: changed,
+      wraps: () => {
+        const pc = pcs.get(device.id);
+        if (pc?.replica.refreshKeys()) pc.folder.remoteChanged();
+      }
     });
     const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, {
-      index: () => pcs.get(device.id)?.folder.remoteChanged(),
-      doc: () => pcs.get(device.id)?.folder.remoteChanged(),
       clash: (docId, version) => {
         const pc = pcs.get(device.id);
         return pc && !pc.hidden ? pc.folder.noteClashed(docId, version) : false;
@@ -847,6 +851,78 @@ describe("room folder", () => {
     return { s, a, c, link };
   }
 
+  it("doesn't put back on a reader's computer a note whose history there can't be read", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "# Plan\n");
+    const r = s.make(s.rae, "Team");
+    for (const device of [s.ana, s.rae]) s.giveKey(a, device);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    const id = [...r.replica.files().keys()][0]!;
+    link.cut();
+    // As after a restart while another program holds the note's history on disk.
+    const store = r.node.store;
+    store.compact(s.roomId, id, store.envelopesOf(s.roomId, id).updates, {});
+    store.setUnreadable(s.roomId, id, true);
+    r.replica.reload(id);
+    await r.vault.writeText("Team/Plan.md", "# Plan\nmine\n");
+    await s.settle();
+    expect(text(r.vault, "Team/Plan.md")).toBe("# Plan\nmine\n");
+  });
+
+  it("looks only at the note that changed when one of many is edited elsewhere", async () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 20; i++) files[`Team/n${i}.md`] = `note ${i}\n`;
+    const { s, a, c } = await pair(files);
+    const read = new Set<string>();
+    const noteText = c.replica.noteText.bind(c.replica);
+    c.replica.noteText = (id) => {
+      read.add(id);
+      return noteText(id);
+    };
+    await a.vault.writeText("Team/n3.md", "note 3\nmore\n");
+    await s.settle();
+    expect(text(c.vault, "Team/n3.md")).toBe("note 3\nmore\n");
+    expect([...read].map((id) => c.replica.files().get(id)?.path)).toEqual(["n3.md"]);
+  });
+
+  it("leaves a note as it is while its history here can't be read, and syncs it once it can", async () => {
+    const { s, a, c, link } = await pair({ "Team/Plan.md": "# Plan\n- one\n" });
+    const id = [...c.replica.files().keys()][0]!;
+    link.cut();
+    await c.folder.stop();
+    // Cy restarts while another program holds the note's history on disk: the store opens without it.
+    const store = c.node.store;
+    const { snapshots, updates } = store.envelopesOf(s.roomId, id);
+    expect(snapshots).toHaveLength(0);
+    store.compact(s.roomId, id, updates, {});
+    store.setUnreadable(s.roomId, id, true);
+    const c2 = s.make(s.cy, "Team", c.vault, c);
+    c2.replica.refreshKeys();
+    await c2.folder.start();
+    await s.settle();
+    expect(text(c2.vault, "Team/Plan.md")).toBe("# Plan\n- one\n");
+    // An edit made here meanwhile isn't shared on what little is known of the note.
+    await c2.vault.writeText("Team/Plan.md", "# Plan\n- one\n- two\n");
+    await s.settle();
+    expect(c2.replica.noteText(id)).toBe("");
+    // The history can be read now: it is taken in, and the edit made here is shared.
+    for (const env of updates) store.add(env);
+    store.setUnreadable(s.roomId, id, false);
+    for (const env of updates) c2.replica.receive(env);
+    c2.folder.remoteChanged(id);
+    s.net.link(a.node, c2.node);
+    await s.settle();
+    expect(text(a.vault, "Team/Plan.md")).toBe("# Plan\n- one\n- two\n");
+    expect(text(c2.vault, "Team/Plan.md")).toBe("# Plan\n- one\n- two\n");
+  });
+
   it("keeps one of two values saved at the same moment in the same place, and the other as a copy", async () => {
     const { s, a, c, link } = await pair({ "Team/Task.md": "---\ndue: 2030-01-01\n---\nPlan\n" });
     link.cut();
@@ -921,6 +997,23 @@ describe("room folder", () => {
     const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
     return { notes, copies };
   }
+
+  const board = "## Todo\n- [ ] Ship release\n- [ ] Write notes\n## Done\n- [ ] Old task\n";
+  const moved = "## Todo\n- [ ] Write notes\n## Done\n- [ ] Ship release\n- [ ] Old task\n";
+
+  it("keeps a card checked off where it was rather than also the same card moved on another computer, and the move as a copy", async () => {
+    const { notes, copies } = await savedApart(board, [moved], [board.replace("- [ ] Ship", "- [x] Ship")]);
+    expect(notes).toEqual([board.replace("- [ ] Ship", "- [x] Ship"), board.replace("- [ ] Ship", "- [x] Ship")]);
+    expect(copies).toEqual(new Set([moved]));
+  });
+
+  it("keeps one card of two computers that moved it to different places, and the other place as a copy", async () => {
+    const elsewhere = "## Todo\n- [ ] Write notes\n## Done\n- [ ] Old task\n- [ ] Ship release\n";
+    const { notes, copies } = await savedApart(board, [moved], [elsewhere]);
+    expect(notes[1]).toBe(notes[0]);
+    expect([moved, elsewhere]).toContain(notes[0]);
+    expect(copies).toEqual(new Set([notes[0] === moved ? elsewhere : moved]));
+  });
 
   it("keeps one line of two computers that each changed it twice while apart", async () => {
     const { notes, copies } = await savedApart("due: 2030-01-09\n", ["due: 2030-01-10\n", "due: 2030-01-11\n"], ["due: 2030-02-01\n", "due: 2030-02-02\n"]);

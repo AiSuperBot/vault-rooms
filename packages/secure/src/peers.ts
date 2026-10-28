@@ -1,5 +1,5 @@
 import type { WorkspaceChain } from "./chain.js";
-import { createJoinRecord, type InviteLink, type JoinRecord } from "./invite.js";
+import { createJoinRecord, PEER_PATTERN, type InviteLink, type JoinRecord } from "./invite.js";
 import { applyJoins } from "./invite.js";
 import { JoinHandshake, type MeshNode, type PeerSession } from "./mesh.js";
 import { dial, verifyAcceptor, type PeerLink, type TransportConfig } from "./transport.js";
@@ -22,6 +22,8 @@ export interface PeerManagerEvents {
   connected?(device: string, link: PeerLink): void;
   disconnected?(device: string, reason: string): void;
   dialFailed?(target: string, reason: string): void;
+  /** The address book changed (see addressBook). */
+  addresses?(): void;
 }
 
 interface Seen extends Address {
@@ -43,6 +45,7 @@ const WAIT_FOR_DIAL_MS = 8_000;
 const MIN_BACKOFF_MS = 2_000;
 const MAX_BACKOFF_MS = 60_000;
 const ADDRESSES_PER_DEVICE = 4;
+const formatAddress = ({ host, port }: Address) => `${host.includes(":") ? `[${host}]` : host}:${port}`;
 
 export class PeerManager {
   private links = new Map<string, { link: PeerLink; session: PeerSession }>();
@@ -51,6 +54,10 @@ export class PeerManager {
   private backoff = new Map<string, { until: number; delay: number }>();
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopped = false;
+  /** This device's own addresses ("host:port"), told to peers with the others' (see addressBook). */
+  ownAddresses: () => string[] = () => [];
+  /** The address book as peers were last told it. */
+  private shared = "";
 
   constructor(
     private readonly node: MeshNode,
@@ -58,7 +65,10 @@ export class PeerManager {
     private readonly staticPeers: () => Address[] = () => [],
     private readonly events: PeerManagerEvents = {},
     private readonly now: () => number = Date.now
-  ) {}
+  ) {
+    node.addressBook = () => this.addressBook();
+    node.onAddresses = (items) => this.heard(items);
+  }
 
   start(): void {
     this.timer = setInterval(() => this.tick(), 3_000);
@@ -106,6 +116,39 @@ export class PeerManager {
     if (this.stopped) return;
     for (const device of this.candidates.keys()) this.maybeDial(device);
     for (const address of this.staticPeers()) this.dialAddress(address);
+    // Peers hear where the others are whenever that changes, so they can reach each other without this device.
+    const shared = JSON.stringify(this.addressBook().sort());
+    if (shared !== this.shared) {
+      this.shared = shared;
+      this.node.shareAddresses();
+      this.events.addresses?.();
+    }
+  }
+
+  /**
+   * Where devices can be reached: this device's own addresses, then per device the one that worked last and the latest
+   * announced or told of. Peers are told it (see MeshNode.addressBook); the owner keeps it, to find the others again
+   * after a restart where discovery doesn't reach (see heard).
+   */
+  addressBook(): Array<[string, string]> {
+    const out: Array<[string, string]> = this.ownAddresses().map((address) => [this.config.deviceId, address]);
+    for (const [device, candidate] of this.candidates) {
+      const seen = [...candidate.addresses].sort(([a, x], [b, y]) => Number(b === candidate.good) - Number(a === candidate.good) || y.lastSeen - x.lastSeen);
+      for (const [, address] of seen.slice(0, 2)) out.push([device, formatAddress(address)]);
+    }
+    return out;
+  }
+
+  /** Addresses peers told of, or kept from an earlier session: tried like announced ones, for members only. */
+  heard(items: unknown): void {
+    if (!Array.isArray(items)) return;
+    const members = this.node.effective();
+    for (const item of items as unknown[]) {
+      if (!Array.isArray(item) || typeof item[0] !== "string" || typeof item[1] !== "string" || !PEER_PATTERN.test(item[1])) continue;
+      const [device, address] = item as [string, string];
+      const at = address.lastIndexOf(":");
+      if (activeDevice(members, device)) this.candidate(device, address.slice(0, at).replace(/^\[|\]$/g, ""), Number(address.slice(at + 1)));
+    }
   }
 
   private inBackoff(key: string): boolean {

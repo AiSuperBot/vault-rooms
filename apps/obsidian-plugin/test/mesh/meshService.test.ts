@@ -1,3 +1,5 @@
+import { once } from "node:events";
+import { createServer } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { createJoinRecord, nextVersion, parseInviteLink } from "@vault-rooms/secure";
 import { newDevice } from "@vault-rooms/secure/testkit";
@@ -56,6 +58,53 @@ describe("mesh service", () => {
     anaReplica.noteDoc(fileId).getText("content").insert(0, "Secret plan");
     await until(() => ben.replica(roomId)?.files().has(fileId) === true && ben.replica(roomId)!.noteText(fileId) === "Secret plan");
   });
+
+  it("keeps the invitation's addresses, so a device that joined finds the others again after a restart", async () => {
+    const ana = await started(await MeshService.create(deps("AnaR"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const address = `127.0.0.1:${ana.listeningPort}`;
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=${encodeURIComponent(address)}`);
+    const benDeps = deps("BenR");
+    const ben = await started(await MeshService.join(benDeps, { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ana.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    expect(benDeps.settings.workspace!.peers).toEqual([address]);
+    await ben.stop();
+    services.splice(services.indexOf(ben), 1);
+    const again = await started((await MeshService.open(benDeps))!);
+    await until(() => again.node.connectedDevices().includes(ana.me.deviceId));
+  });
+
+  it("finds the others again after a restart, also while the device it joined through is away", async () => {
+    const ana = await started(await MeshService.create(deps("AnaH"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const address = `127.0.0.1:${ana.listeningPort}`;
+    const link = async () => (await ana.createInvite({})).replace(/p=[^&]*/, `p=${encodeURIComponent(address)}`);
+    const benDeps = deps("BenH");
+    const ben = await started(await MeshService.join(benDeps, { link: await link(), userName: "Ben", deviceName: "Ben PC" }));
+    const cy = await started(await MeshService.join(deps("CyH"), { link: await link(), userName: "Cy", deviceName: "Cy PC" }));
+    // No discovery (it may reach between services on one computer): only what they tell each other.
+    const noDiscovery = (service: MeshService) => (service as unknown as { discovery?: { stop(): void } }).discovery?.stop();
+    for (const service of [ana, ben, cy]) noDiscovery(service);
+    for (const service of [ben, cy]) service.addresses = () => [`127.0.0.1:${service.listeningPort}`];
+    // Ana's device tells each where the other is: they connect, and Ben's remembers where Cy's is.
+    await until(() => ben.node.connectedDevices().includes(cy.me.deviceId), 20_000);
+    await until(() => (benDeps.settings.workspace!.addresses ?? []).some(([device]) => device === cy.me.deviceId));
+    // Ana's device goes away, and Ben's restarts on another port (nothing answers where Cy's knew Ana's and Ben's): it
+    // finds Cy's on its own.
+    const ports = [ana.listeningPort, ben.listeningPort];
+    for (const service of [ana, ben]) {
+      await service.stop();
+      services.splice(services.indexOf(service), 1);
+    }
+    const taken = ports.map((port) => createServer().listen(port, "0.0.0.0"));
+    await Promise.all(taken.map((server) => once(server, "listening")));
+    try {
+      const again = await started((await MeshService.open(benDeps))!);
+      noDiscovery(again);
+      expect(ports).not.toContain(again.listeningPort);
+      await until(() => again.node.connectedDevices().includes(cy.me.deviceId), 20_000);
+    } finally {
+      for (const server of taken) server.close();
+    }
+  }, 60_000);
 
   it("rotates the room key when a member is removed, so new content is out of their reach", async () => {
     const ana = await started(await MeshService.create(deps("Ana2"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));

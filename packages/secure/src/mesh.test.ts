@@ -542,6 +542,19 @@ describe("mesh", () => {
     expect(outcome).toEqual([expect.stringMatching(/join_no_invite/)]);
   });
 
+  it("sends a long record in pieces small enough for a peer that doesn't count this device as a member yet", () => {
+    const { chain, ana, cy } = setup();
+    // Ana makes many rooms: the record grows long, each version holding every room so far.
+    for (let i = 0; i < 90; i++) createRoom(chain, ana, `Room ${i}`);
+    const sent: PeerMessage[] = [];
+    const a = nodeFor(chain, ana);
+    a.connect({ send: (m) => sent.push(m), close: () => {} }, cy.id).receive({ t: "hello", ws: a.workspaceId, head: -1, recent: [] });
+    const versions = sent.filter((m): m is Extract<PeerMessage, { t: "versions" }> => m.t === "versions");
+    expect(versions.length).toBeGreaterThan(1);
+    for (const m of versions) expect(JSON.stringify(m).length).toBeLessThan(1 << 20);
+    expect(versions.flatMap((m) => m.versions)).toHaveLength(chain.length);
+  });
+
   it("says nothing to a device that isn't a member until it presents a join", () => {
     const { chain, ana } = setup();
     const stranger = founder().admin;

@@ -35,6 +35,8 @@ function shuffle<T>(list: T[], rand: () => number): T[] {
 interface Line {
   text: string;
   origin: string;
+  /** Put elsewhere as it was this round (a plugin moving a card). */
+  moved?: boolean;
 }
 
 interface Pc {
@@ -114,6 +116,18 @@ async function room(count: number, clash: (pc: Pc, version: string) => boolean) 
 
 /** One save: up to three changes, each to a line of its own, with an unchanged line between any two. */
 function change(view: Line[], rand: () => number, line: () => string): void {
+  // Now and then a save moves a line instead, one not changed this round, past two lines or more (one line further is
+  // just as well the other line moved).
+  if (rand() < 0.15) {
+    const from = Math.floor(rand() * view.length);
+    const to = Math.floor(rand() * (view.length + 1));
+    const one = view[from];
+    if (one && one.text === one.origin && !one.moved && (to <= from - 2 || to >= from + 3)) {
+      view.splice(from, 1);
+      view.splice(to > from ? to - 1 : to, 0, { ...one, moved: true });
+      return;
+    }
+  }
   const picked: number[] = [];
   for (let tries = 0; tries < 6 && picked.length < 3; tries++) {
     const at = Math.floor(rand() * (view.length + 1));
@@ -125,7 +139,7 @@ function change(view: Line[], rand: () => number, line: () => string): void {
       const text = line();
       view.splice(at, 0, { text, origin: `+${text}` });
     } else if (r < 0.3) view.splice(at, 1);
-    else view[at] = { text: line(), origin: view[at]!.origin };
+    else if (!view[at]!.moved) view[at] = { text: line(), origin: view[at]!.origin };
   }
 }
 
@@ -204,14 +218,24 @@ async function run(seed: number): Promise<void> {
       }
     }
     for (const l of linesOf(start)) if (pcs.every((pc) => pc.view.some((v) => v.text === l))) expect(finalLines.has(l), `nobody changed ${l}\n${report}`).toBe(true);
+    expect(finalLines.size, `a line twice\n${report}`).toBe(linesOf(final).length);
     const gaveWay = new Set<Pc>();
+    const lowest = <T extends { pc: Pc }>(list: T[]) => list.reduce((a, b) => (b.pc.client < a.pc.client ? b : a));
     for (const origin of linesOf(start)) {
       const replaced = pcs.flatMap((pc) => pc.view.filter((v) => v.origin === origin && v.text !== origin).map((v) => ({ pc, text: v.text })));
-      if (replaced.length === 0) continue;
-      const kept = replaced.reduce((a, b) => (b.pc.client < a.pc.client ? b : a));
+      const moved = pcs.filter((pc) => pc.view.some((v) => v.origin === origin && v.moved)).map((pc) => ({ pc }));
+      // A line changed where it was stays over one moved (of several, the lowest client's); of several moves, one.
+      const kept = replaced.length > 0 ? lowest(replaced).pc : moved.length > 0 ? lowest(moved).pc : null;
       for (const { pc, text } of replaced) {
-        expect(finalLines.has(text), `${text} ${pc === kept.pc ? "should stay" : "should give way"}\n${report}`).toBe(pc === kept.pc);
-        if (pc !== kept.pc) gaveWay.add(pc);
+        expect(finalLines.has(text), `${text} ${pc === kept ? "should stay" : "should give way"}\n${report}`).toBe(pc === kept);
+        if (pc !== kept) gaveWay.add(pc);
+      }
+      if (moved.length > 0) expect(finalLines.has(origin), `${origin} moved ${replaced.length > 0 ? "should give way" : "should stay"}\n${report}`).toBe(replaced.length === 0);
+      for (const { pc } of moved) {
+        if (pc === kept) continue;
+        gaveWay.add(pc);
+        // Moved to the same place as the move that stays, it isn't lost (and its copy would be the note itself).
+        expect(finalLines.has(origin) || pc.copies.some((copy) => linesOf(copy).includes(origin)), `${pc.name} lost its move of ${origin}\n${report}`).toBe(true);
       }
     }
     for (const pc of pcs) if (!gaveWay.has(pc)) expect(pc.copies, `${pc.name} kept a copy for nothing\n${report}`).toEqual([]);

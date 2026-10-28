@@ -1,7 +1,7 @@
 import * as Y from "yjs";
 import { blobKeyOf, envelopeKey, INDEX_DOC, openEnvelope, sealBlob, sealSnapshot, sealUpdate, type DocId, type SnapshotEnvelope, type StoredEnvelope, type UpdateEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
-import { Clashes, type FileSave } from "./clashes.js";
+import { Clashes, type FileSave, type Line } from "./clashes.js";
 import { isHash, isId } from "./ids.js";
 import { keyCommitment, unwrapRoomKey, type KeyWrap } from "./keys.js";
 import type { KeyPair } from "./crypto.js";
@@ -107,8 +107,9 @@ export class RoomReplica {
   private blobRescues: Array<{ oldId: string; bytes: Uint8Array }> = [];
   private localEditAt = new Map<DocId, number>();
   private editing = false;
-  /** The edit under way is a whole-note save (see `edit`). */
+  /** The edit under way is a whole-note save (see `edit`), and the note's lines before it (to tell lines it moves). */
   private saving = false;
+  private linesBefore: Line[] | undefined;
   /** Saves of notes made here outside the editor, and what they clash with (see ReplicaEvents.clash). */
   private readonly clashes: Clashes;
   /** Documents this device passed on, with the work of former writers it covered then (see passOnOldWork). */
@@ -292,8 +293,9 @@ export class RoomReplica {
     return this.noteDoc(fileId).getText("content").toString();
   }
 
-  /** Whether everything held for a document has been decrypted into it (nothing waits for a key). */
+  /** Whether everything held for a document has been decrypted into it (nothing waits for a key, or to be read from disk). */
   isComplete(docId: DocId): boolean {
+    if (this.node.store.isUnreadable(this.roomId, docId)) return false;
     this.loadDoc(docId);
     for (const env of this.waiting.values()) if (env.doc === docId) return false;
     return true;
@@ -388,7 +390,7 @@ export class RoomReplica {
   private localUpdate(docId: DocId, update: Uint8Array): void {
     // Taking out what lost a clash is no work on the note here (see lastLocalEdit).
     if (!this.clashes.takingOut) this.localEditAt.set(docId, Date.now());
-    quietly(() => this.clashes.recordLocal(docId, update, this.saving));
+    quietly(() => this.clashes.recordLocal(docId, update, this.saving, this.linesBefore));
     try {
       this.publishLocal(docId, update);
     } catch (error) {
@@ -411,11 +413,13 @@ export class RoomReplica {
     this.refusal = null;
     this.editing = true;
     this.saving = save;
+    this.linesBefore = save ? quietly(() => this.clashes.linesBefore(docId)) : undefined;
     try {
       state.doc.transact(() => change(state.doc));
     } finally {
       this.editing = false;
       this.saving = false;
+      this.linesBefore = undefined;
     }
     if (this.refusal !== null) {
       this.reload(docId);
@@ -685,7 +689,6 @@ export class RoomReplica {
     if (snapshots.length === 0) return;
     const held = store.vv(this.roomId, docId);
     const remove = new Set<StoredEnvelope>();
-    const marks: VersionVector = {};
     const reach = (s: SnapshotEnvelope) => Object.values(s.covers).reduce((sum, clock) => sum + clock, 0);
     const ordered = [...snapshots].sort((a, b) => reach(b) - reach(a) || (envelopeKey(a) < envelopeKey(b) ? -1 : 1));
     for (const snapshot of ordered) {
@@ -704,11 +707,21 @@ export class RoomReplica {
       };
       for (const update of updates) {
         if (remove.has(update) || update.clock > (snapshot.covers[update.author] ?? 0) || update.clock > (held[update.author] ?? 0)) continue;
-        if (!contains(update)) continue;
-        remove.add(update);
-        marks[update.author] = held[update.author]!;
+        if (contains(update)) remove.add(update);
       }
       for (const other of snapshots) if (other !== snapshot && !remove.has(other) && vvDominates(snapshot.covers, other.covers) && contains(other)) remove.add(other);
+    }
+    // A mark says every update up to it is in a snapshot (a later one is refused as a duplicate, and never asked for
+    // again). So per author it only covers the updates taken out up to the first one kept, and only those go.
+    const marks: VersionVector = {};
+    const kept = new Set<string>();
+    for (const update of updates) {
+      if (update.clock > (held[update.author] ?? 0)) continue;
+      if (remove.has(update) && !kept.has(update.author)) marks[update.author] = update.clock;
+      else {
+        kept.add(update.author);
+        remove.delete(update);
+      }
     }
     if (remove.size === 0) return;
     store.compact(this.roomId, docId, [...remove], marks);

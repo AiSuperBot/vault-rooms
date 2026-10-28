@@ -32,6 +32,14 @@ export interface FileSave {
   at: number;
   deleted: IdRange[];
   inserted: InsertedRun[];
+  /** Lines it put elsewhere as they were (moved, as a plugin moving a card), each with the first character of the old. */
+  moved?: Array<{ line: IdRange; from: Id }>;
+}
+
+/** A line of a note: its text (without the line break) and its characters (with it). */
+export interface Line {
+  text: string;
+  ranges: IdRange[];
 }
 
 /** A run as an update holds it: also its text (none if taken out since). */
@@ -195,6 +203,68 @@ function live(store: Store, range: IdRange): boolean {
     clock = item.id.clock + item.length;
   }
   return false;
+}
+
+/** The lines of a note as it is now. */
+function linesOf(text: Y.Text): Line[] {
+  const lines: Line[] = [];
+  let line: Line = { text: "", ranges: [] };
+  for (const item of textItems(text)) {
+    if (item.deleted || !(item.content instanceof Y.ContentString)) continue;
+    const str = item.content.str;
+    let from = 0;
+    for (let at = str.indexOf("\n"); ; at = str.indexOf("\n", from)) {
+      const end = at < 0 ? str.length : at + 1;
+      if (end > from) {
+        line.text += str.slice(from, at < 0 ? end : at);
+        line.ranges.push({ client: item.id.client, clock: item.id.clock + from, length: end - from });
+      }
+      if (at < 0) break;
+      lines.push(line);
+      line = { text: "", ranges: [] };
+      from = end;
+    }
+  }
+  if (line.ranges.length > 0) lines.push(line);
+  return lines;
+}
+
+/** The text of a run still in the note, or null if any of it is gone. */
+function rangeText(store: Store, range: IdRange): string | null {
+  let out = "";
+  for (let clock = range.clock; clock < range.clock + range.length; ) {
+    if (Y.getState(store, range.client) <= clock) return null;
+    const item = Y.getItem(store, Y.createID(range.client, clock));
+    if (item.deleted || !(item.content instanceof Y.ContentString)) return null;
+    const end = Math.min(item.length, range.clock + range.length - item.id.clock);
+    out += item.content.str.slice(clock - item.id.clock, end);
+    clock = item.id.clock + end;
+  }
+  return out;
+}
+
+/** Lines a save put elsewhere as they were: each new line whose text is that of an old line (not blank) it took out. */
+function movesIn(before: Line[], deleted: IdRange[], inserted: Run[]): Array<{ line: IdRange; from: Id }> {
+  const index = indexOf(deleted);
+  const size = (ranges: IdRange[]) => ranges.reduce((sum, range) => sum + range.length, 0);
+  const gone = new Map<string, Id[]>();
+  for (const line of before) {
+    if (!line.text.trim() || size(overlap(line.ranges, index)) !== size(line.ranges)) continue;
+    const starts = gone.get(line.text);
+    if (starts) starts.push(line.ranges[0]!);
+    else gone.set(line.text, [line.ranges[0]!]);
+  }
+  const out: Array<{ line: IdRange; from: Id }> = [];
+  if (gone.size === 0) return out;
+  for (const run of inserted) {
+    let at = 0;
+    for (const part of run.text?.split(/(?<=\n)/) ?? []) {
+      const from = gone.get(part.endsWith("\n") ? part.slice(0, -1) : part)?.shift();
+      if (from) out.push({ line: { client: run.client, clock: run.clock + at, length: part.length }, from: { client: from.client, clock: from.clock } });
+      at += part.length;
+    }
+  }
+  return out;
 }
 
 /** Whether a line is still in the note, or a line that took its place since (see withInside). */
@@ -384,10 +454,23 @@ function validRuns(value: unknown, inserted: boolean): InsertedRun[] | null {
 }
 
 function validSave(value: unknown): FileSave | null {
-  const { at, deleted, inserted } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+  const { at, deleted, inserted, moved } = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
   const gone = validRuns(deleted, false);
   const added = validRuns(inserted, true);
-  return Number.isSafeInteger(at) && gone && added ? { at: at as number, deleted: gone.map(({ client, clock, length }) => ({ client, clock, length })), inserted: added } : null;
+  const moves = moved === undefined ? [] : validMoves(moved);
+  if (!Number.isSafeInteger(at) || !gone || !added || !moves) return null;
+  const save: FileSave = { at: at as number, deleted: gone.map(({ client, clock, length }) => ({ client, clock, length })), inserted: added };
+  if (moves.length > 0) save.moved = moves;
+  return save;
+}
+
+/** The moves of a save read back (see FileSave.moved), as they must be. */
+function validMoves(value: unknown): Array<{ line: IdRange; from: Id }> | null {
+  if (!Array.isArray(value)) return null;
+  const field = (move: unknown, name: "line" | "from") => (typeof move === "object" && move !== null ? (move as Record<string, unknown>)[name] : undefined);
+  const lines = validRuns(value.map((move) => field(move, "line")), false);
+  const from = validRuns(value.map((move) => ({ ...(field(move, "from") ?? {}), length: 1 })), false);
+  return lines && from ? lines.map(({ client, clock, length }, i) => ({ line: { client, clock, length }, from: { client: from[i]!.client, clock: from[i]!.clock } })) : null;
 }
 
 /** Add `more` to what is pending for a note (take-outs, or take-outs waiting for their copies). */
@@ -446,11 +529,13 @@ export class Clashes {
   constructor(private readonly host: ClashHost) {}
 
   /** A local change of a note: a whole-note save (`save`, see RoomReplica.edit), or text typed here. */
-  recordLocal(docId: DocId, update: Uint8Array, save: boolean): void {
+  recordLocal(docId: DocId, update: Uint8Array, save: boolean, before?: Line[]): void {
     if (!save && (docId === INDEX_DOC || this.settling)) return;
     const { deleted, inserted } = decodeRuns(update);
     if (save) {
-      if (deleted.length + inserted.length <= MAX_SAVED_RANGES) this.rememberSave(docId, { at: Date.now(), deleted, inserted: inserted.map(plain) });
+      if (deleted.length + inserted.length > MAX_SAVED_RANGES) return;
+      const moved = before ? movesIn(before, deleted, inserted) : [];
+      this.rememberSave(docId, { at: Date.now(), deleted, inserted: inserted.map(plain), ...(moved.length > 0 ? { moved } : {}) });
       return;
     }
     const typed = this.typed.get(docId) ?? { deleted: [], inserted: [] };
@@ -471,7 +556,7 @@ export class Clashes {
     const saves = [...(this.fileSaves.get(docId) ?? []), save].slice(-MAX_FILE_SAVES);
     this.fileSaves.delete(docId);
     this.fileSaves.set(docId, saves);
-    const size = (list: FileSave[]) => list.reduce((sum, one) => sum + one.deleted.length + one.inserted.length, 0);
+    const size = (list: FileSave[]) => list.reduce((sum, one) => sum + one.deleted.length + one.inserted.length + (one.moved?.length ?? 0), 0);
     let total = [...this.fileSaves.values()].reduce((sum, list) => sum + size(list), 0);
     for (const [oldest, list] of this.fileSaves) {
       if (this.fileSaves.size <= MAX_SAVED_NOTES && total <= MAX_SAVED_TOTAL) break;
@@ -479,6 +564,12 @@ export class Clashes {
       this.fileSaves.delete(oldest);
     }
     this.savesVersion++;
+  }
+
+  /** A note's lines before a save made here (see recordLocal: a line it puts elsewhere as it was is a move). */
+  linesBefore(docId: DocId): Line[] | undefined {
+    const text = this.host.text(docId);
+    return text ? linesOf(text) : undefined;
   }
 
   /** Whether saves of a note made here are remembered (its incoming updates are then checked for clashes). */
@@ -589,7 +680,7 @@ export class Clashes {
     }
     const inTheirs = member(theirs);
     const theirIndex = indexOf(theirs);
-    const lost: Array<{ line: InsertedRun; to: Run[] }> = [];
+    const lost: Array<{ line: IdRange; to: Run[] }> = [];
     const rivals: Run[] = [];
     const beaten: Run[] = [];
     const saves = this.fileSaves.get(docId) ?? [];
@@ -613,6 +704,19 @@ export class Clashes {
         for (const other of others) if (!(loses ? beaten : rivals).some((r) => Y.compareIDs(r, other))) (loses ? beaten : rivals).push(other);
         if (!loses || lost.some(({ line }) => Y.compareIDs(line, run))) continue;
         lost.push({ line: run, to: lower });
+      }
+      // A line this save moved (put elsewhere as it was, as a plugin moving a card) that the other side changed where it
+      // was, or moved too: one of them stays. The line changed where it was stays (only the computer that moved a line
+      // can tell it moved); of two moves, the lower client's. Ours gives way to it, and is kept in the copy.
+      for (const { line, from } of save.moved ?? []) {
+        if (!inTheirs(from) || lost.some((one) => Y.compareIDs(one.line, line))) continue;
+        const moved = rangeText(text.doc!.store, line);
+        if (moved === null) continue;
+        const changed = (byRight.get(key(from)) ?? []).filter((t) => t.client !== line.client);
+        const to = [...changed, ...fresh.filter((t) => t.client < line.client && t.text === moved)].filter((t) => stillThere(text, t));
+        if (to.length === 0) continue;
+        for (const other of to) if (!beaten.some((r) => Y.compareIDs(r, other))) beaten.push(other);
+        lost.push({ line, to });
       }
     }
     this.noteRivals(docId, rivals);

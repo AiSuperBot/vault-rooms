@@ -11,7 +11,11 @@ export class MemoryFiles implements Files {
     return this.data.has(path) || this.folders.has(path) || [...this.data.keys()].some((key) => key.startsWith(`${path}/`));
   }
 
+  /** Set to make reads of some paths fail (a file held by another program). */
+  failReads?: (path: string) => boolean;
+
   async read(path: string): Promise<string> {
+    if (this.failReads?.(path)) throw new Error(`EBUSY ${path}`);
     const value = this.data.get(path);
     if (value === undefined) throw new Error(`ENOENT ${path}`);
     return value;

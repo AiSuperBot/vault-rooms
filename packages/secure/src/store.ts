@@ -102,6 +102,7 @@ export class EnvelopeStore {
   private blobBytes = new Map<string, number>();
   /** Whether this device is a member of a room; set by the mesh node. */
   isMember: (room: string) => boolean = () => true;
+  private unreadable = new Set<string>();
   now: () => number = Date.now;
 
   constructor(
@@ -212,6 +213,19 @@ export class EnvelopeStore {
       entry.claimed = {};
       this.listener.docChanged?.(room, doc);
     }
+  }
+
+  /**
+   * Whether part of a document's history on this device couldn't be read yet (its file was in use, say): until it is,
+   * the document is incomplete here (see RoomReplica.isComplete), and nothing is decided on the rest of it.
+   */
+  isUnreadable(room: string, doc: DocId): boolean {
+    return this.unreadable.size > 0 && this.unreadable.has(`${room}\u0000${doc}`);
+  }
+
+  setUnreadable(room: string, doc: DocId, unreadable: boolean): void {
+    if (unreadable) this.unreadable.add(`${room}\u0000${doc}`);
+    else this.unreadable.delete(`${room}\u0000${doc}`);
   }
 
   /** A document's marks, for saving next to its envelopes. */

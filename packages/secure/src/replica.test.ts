@@ -202,6 +202,33 @@ describe("room replica", () => {
     expect(c.replica.noteText(fileId)).toBe(text.toString());
   });
 
+  it("marks as folded in only the updates a late snapshot holds, so a later update is still read back after a restart", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    for (const device of [s.ana, s.cy]) s.wrapFor(device);
+    a.replica.refreshKeys();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "first");
+    const early = Y.encodeStateAsUpdate(a.replica.noteDoc(fileId));
+    a.replica.noteDoc(fileId).getText("content").insert(5, " SECOND");
+    s.net.pump();
+    // A snapshot of the note after Ana's first update only (made earlier, sent late) comes in after both updates.
+    expect(c.node.publish(sealSnapshot({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.cy.sign }, fileId, 1, { [s.ana.id]: 1 }, early))).toBe(true);
+    s.net.pump();
+    const { marks, claimed, dropped } = a.node.store.marksOf(s.roomId, fileId);
+    expect(marks[s.ana.id]).toBe(1);
+    // Read back as after a restart: the second update is still there, and counted as held.
+    const back = new EnvelopeStore();
+    back.restoreMarks(s.roomId, fileId, marks, claimed, dropped);
+    const { snapshots, updates } = a.node.store.envelopesOf(s.roomId, fileId);
+    for (const env of [...snapshots, ...updates]) back.add(env);
+    expect(back.envelopesOf(s.roomId, fileId).updates.map((update) => update.clock)).toEqual([2]);
+    expect(back.vv(s.roomId, fileId)[s.ana.id]).toBe(2);
+  });
+
   it("a snapshot that lies about what it covers takes nothing away from members and freezes nothing", () => {
     const s = setup();
     const a = s.member(s.ana);

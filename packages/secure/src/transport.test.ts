@@ -43,6 +43,7 @@ async function peer(chain: WorkspaceChain, device: { id: string; sign: ReturnTyp
   const manager = new PeerManager(node, config, () => staticPeers);
   const server = new PeerServer(config, (link) => manager.accept(link));
   const port = await server.listen(0, "127.0.0.1");
+  manager.ownAddresses = () => [`127.0.0.1:${port}`];
   cleanups.push(() => server.close(), () => manager.stop());
   return { node, config, manager, server, port };
 }
@@ -79,6 +80,41 @@ describe("TLS transport", () => {
     await until(() => c.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
     expect(fromUtf8(openEnvelope(c.node.store.envelopesOf(w.roomId, INDEX_DOC).updates[0]!, w.key))).toBe("over TLS");
   });
+
+  it("lets in a member that joined while this device was away, once its record shows it, and they sync", async () => {
+    const w = await world();
+    // Ana's device goes away; meanwhile Ben joins (through someone else). Ana's device comes back with the old record.
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    const tlsB = await createTlsIdentity();
+    const { joiner: ben } = invite(w.chain, w.ana, { userName: "Ben", tls: tlsB.fingerprint, rooms: { [w.roomId]: "write" } });
+    // And a lot more happens meanwhile: what Ana's device lacks is far more than a frame before membership may hold.
+    for (let i = 0; i < 60; i++) createRoom(w.chain, w.ana, `Room ${i}`);
+    expect(a.node.effective().devices[ben.id]).toBeUndefined();
+    const b = await peer(w.chain, ben, tlsB, [{ host: "127.0.0.1", port: a.port }]);
+    b.manager.start();
+    await until(() => a.node.connectedDevices().includes(ben.id) && b.node.connectedDevices().includes(w.ana.id));
+    expect(a.node.effective().devices[ben.id]).toBeDefined();
+    b.node.publish(sealUpdate({ ws: w.ws, room: w.roomId, n: 1, key: w.key, author: ben.sign }, INDEX_DOC, 1, utf8("from Ben")));
+    await until(() => a.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
+  });
+
+  it("keeps the others connected when the device that brought them together goes away", async () => {
+    const w = await world();
+    const tlsB = await createTlsIdentity();
+    const { joiner: ben } = invite(w.chain, w.ana, { userName: "Ben", tls: tlsB.fingerprint, rooms: { [w.roomId]: "write" } });
+    // No discovery: Cy's and Ben's devices know only the address of Ana's, which tells each where the other is.
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    const c = await peer(w.chain, w.cy, w.tlsC, [{ host: "127.0.0.1", port: a.port }]);
+    const b = await peer(w.chain, ben, tlsB, [{ host: "127.0.0.1", port: a.port }]);
+    for (const p of [a, c, b]) p.manager.start();
+    await until(() => b.node.connectedDevices().includes(w.cy.id) && c.node.connectedDevices().includes(ben.id), 20_000);
+    expect(b.manager.addressBook()).toContainEqual([w.cy.id, `127.0.0.1:${c.port}`]);
+    // Ana's device goes away: the others go on syncing with each other.
+    a.manager.stop();
+    await a.server.close();
+    b.node.publish(sealUpdate({ ws: w.ws, room: w.roomId, n: 1, key: w.key, author: ben.sign }, INDEX_DOC, 1, utf8("without Ana")));
+    await until(() => c.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
+  }, 30_000);
 
   it("refuses a server whose certificate isn't the pinned one", async () => {
     const w = await world();

@@ -90,6 +90,39 @@ describe("disk store", () => {
     expect(reloaded.vv(w.roomId, doc)).toEqual({ [w.deviceId]: 5 });
   });
 
+  it("keeps a document whose journal can't be read incomplete, never writes over that journal, and takes it in once it can", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const doc = randomId("f");
+    for (let clock = 1; clock <= 3; clock++) store.add(sealUpdate(w.ctx, doc, clock, utf8(`u${clock}`)));
+    await disk.flush();
+    const path = docFile("m", w.roomId, doc);
+    const before = files.data.get(path)!;
+    // Another program holds the journal while the store opens again.
+    files.failReads = (p) => p === path;
+    const again = new DiskStore(files, "m");
+    const late: number[] = [];
+    again.onLateRead = (_room, _doc, envelopes) => {
+      for (const env of envelopes) if (env.k === "u") late.push(env.clock);
+    };
+    const reopened = await again.open();
+    expect(reopened.isUnreadable(w.roomId, doc)).toBe(true);
+    expect(again.unreadDocs()).toBe(1);
+    // An update comes in meanwhile (appended), and the document's journal is to be rewritten: it isn't, yet.
+    reopened.add(sealUpdate(w.ctx, doc, 4, utf8("u4")));
+    reopened.compact(w.roomId, doc, [], {});
+    await again.flush();
+    expect(files.data.get(path)!.startsWith(before)).toBe(true);
+    // It can be read again: what it holds is taken in, and the document is complete.
+    files.failReads = undefined;
+    await again.retryUnread();
+    expect(reopened.isUnreadable(w.roomId, doc)).toBe(false);
+    expect(late).toEqual([1, 2, 3]);
+    expect(reopened.vv(w.roomId, doc)).toEqual({ [w.deviceId]: 4 });
+  });
+
   it("survives a torn append, an interrupted rewrite and an interrupted swap", async () => {
     const w = world();
     const files = new MemoryFiles();

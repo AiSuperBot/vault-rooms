@@ -35,6 +35,7 @@ import {
   type PresenceEnvelope,
   type Role,
   type SignedVersion,
+  type StoredEnvelope,
   type TransportConfig,
   type WorkspaceState
 } from "@vault-rooms/secure";
@@ -51,6 +52,8 @@ export interface WorkspaceSettings {
   port: number;
   /** Peers given by address ("host:port"), for networks where discovery doesn't reach. */
   peers: string[];
+  /** Where devices of the workspace were reached or said to be, [device id, "host:port"]: found again after a restart. */
+  addresses?: Array<[string, string]>;
   /** Rooms of this vault and the folder each lives in ("hidden": its folder was deleted here, so it isn't shown). */
   rooms: Record<string, { folder: string; hidden?: true }>;
 }
@@ -94,7 +97,7 @@ export class MeshService {
   private presenceListeners = new Set<(env: PresenceEnvelope) => void>();
   private replicas = new Map<string, RoomReplica>();
   private replicaListeners = new Set<(roomId: string, replica: RoomReplica | null) => void>();
-  private activityListeners = new Set<(roomId: string) => void>();
+  private activityListeners = new Set<(roomId: string, docId?: string) => void>();
   private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
   private lostRoomListeners = new Set<(roomId: string) => void>();
   private clashListeners = new Set<(roomId: string, docId: string, version: string) => boolean>();
@@ -134,16 +137,23 @@ export class MeshService {
       this.automateSoon();
       this.emit();
     };
-    events.envelope = (env) => {
+    const take = (env: StoredEnvelope) => {
       const replica = this.replicas.get(env.room);
       if (!replica) return;
       replica.receive(env);
-      this.roomActivity(env.room);
+      this.roomActivity(env.room, env.k === "b" ? undefined : env.doc);
+    };
+    events.envelope = take;
+    // History read from disk late (in use by another program when the workspace opened): taken in like news, and the
+    // note looked at again (complete now), even if all of it came from peers meanwhile.
+    disk.onLateRead = (room, doc, envelopes) => {
+      for (const env of envelopes) this.replicas.get(room)?.receive(env);
+      this.roomActivity(room, doc);
     };
     events.presence = (env) => {
       for (const listener of this.presenceListeners) listener(env);
     };
-    events.stored = (env) => this.roomActivity(env.room);
+    events.stored = (env) => this.roomActivity(env.room, env.k === "b" ? undefined : env.doc);
     events.sessions = () => this.emit();
     events.rejected = (reason, from) => {
       this.deps.log(`refused from ${from}: ${reason}`);
@@ -190,7 +200,9 @@ export class MeshService {
     const disk = MeshService.diskFor(deps, invite.workspaceId);
     await disk.saveChain(joined.chain.all());
     await disk.saveJoins([{ join: joined.join, firstSeen: Date.now() }]);
-    deps.settings.workspace = { id: invite.workspaceId, deviceId: joined.join.body.device.id, userId: joined.join.body.user.id, certPem, port: DEFAULT_PORT, peers: input.peers ?? [], rooms: {} };
+    // The invitation's addresses too: where discovery doesn't reach, they are how this device finds the others again.
+    const peers = [...new Set([...(input.peers ?? []), ...invite.peers])];
+    deps.settings.workspace = { id: invite.workspaceId, deviceId: joined.join.body.device.id, userId: joined.join.body.user.id, certPem, port: DEFAULT_PORT, peers, rooms: {} };
     await deps.save();
     const service = (await MeshService.open(deps))!;
     service.adoptFirstLink = joined.link;
@@ -212,6 +224,11 @@ export class MeshService {
     const chain = WorkspaceChain.load(versions);
     if (chain.workspaceId !== settings.id) throw new MeshServiceError("The stored workspace record doesn't match this vault's workspace.");
     const store = await disk.open();
+    const unread = disk.unreadDocs();
+    if (unread > 0) {
+      deps.log(`${unread} documents' history couldn't be read yet`);
+      deps.notify(`Vault Rooms couldn't read the sync history of ${unread} ${unread === 1 ? "note" : "notes"} (a file in use by another program?). They are left as they are, and synced once it can be read.`);
+    }
     const events: MeshEvents = {};
     const node = new MeshNode(chain, settings.deviceId, events, store);
     const service = new MeshService(deps, node, disk, secrets, settings, events);
@@ -238,7 +255,8 @@ export class MeshService {
     this.manager = new PeerManager(this.node, config, () => this.settings.peers.map(parseAddress).filter((a): a is { host: string; port: number } => a !== null), {
       connected: () => this.emit(),
       disconnected: () => this.emit(),
-      dialFailed: (target, reason) => this.deps.log(`dial ${target}: ${reason}`)
+      dialFailed: (target, reason) => this.deps.log(`dial ${target}: ${reason}`),
+      addresses: () => this.rememberAddresses()
     });
     this.server = new PeerServer(config, (link) => this.manager?.accept(link), (reason, address) => this.deps.log(`refused ${address}: ${reason}`));
     this.port = await this.listen(this.settings.port || DEFAULT_PORT);
@@ -248,7 +266,9 @@ export class MeshService {
       await this.deps.save();
       if (this.stopped) return this.abandonStart();
     }
+    this.manager.ownAddresses = () => this.addresses();
     this.manager.start();
+    this.manager.heard(this.settings.addresses);
     if (this.adoptFirstLink) {
       this.manager.adopt(this.adoptFirstLink);
       this.adoptFirstLink = null;
@@ -335,8 +355,8 @@ export class MeshService {
     return () => this.replicaListeners.delete(listener);
   }
 
-  /** Something arrived for a room (content or a key): its folder should look again. */
-  onRoomActivity(listener: (roomId: string) => void): () => void {
+  /** Something arrived for a room (content or a key): its folder should look again (at `docId` only, if given). */
+  onRoomActivity(listener: (roomId: string, docId?: string) => void): () => void {
     this.activityListeners.add(listener);
     return () => this.activityListeners.delete(listener);
   }
@@ -359,8 +379,8 @@ export class MeshService {
     return () => this.lostRoomListeners.delete(listener);
   }
 
-  private roomActivity(roomId: string): void {
-    for (const listener of this.activityListeners) listener(roomId);
+  private roomActivity(roomId: string, docId?: string): void {
+    for (const listener of this.activityListeners) listener(roomId, docId);
   }
 
   private emit(): void {
@@ -758,6 +778,14 @@ export class MeshService {
     } finally {
       this.automating = false;
     }
+  }
+
+  /** Where the others were reached, or said to be, kept for the next start (where discovery doesn't reach). */
+  private rememberAddresses(): void {
+    const book = (this.manager?.addressBook() ?? []).filter(([device]) => device !== this.settings.deviceId).sort();
+    if (book.length === 0 || JSON.stringify(book) === JSON.stringify(this.settings.addresses ?? [])) return;
+    this.settings.addresses = book;
+    void this.deps.save();
   }
 
   private entitled(state: WorkspaceState, roomId: string, deviceId: string): boolean {
