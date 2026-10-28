@@ -20,17 +20,17 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
  *   member that joined while this device was away) is let through only to prove it is: its join record, or the
  *   record's versions (the mesh session enforces that).
  *
- * Until it has authenticated, frames are capped at 64 KiB; then, until it is a member, at 1 MiB (a record version
- * fits). Until then the connection counts against a small limit of such connections, and it must become a member
- * within 10 seconds or it is closed. Anyone on the network can generate a key, so authenticating alone earns nothing
- * more.
+ * Until it is a member, frames are capped at 64 KiB, or at 16 MiB once it has shown it holds this device's record (a
+ * message of record versions; see PeerSession). Until then the connection counts against a small limit of such
+ * connections, and it must become a member within 10 seconds or it is closed. Anyone on the network can generate a
+ * key, so authenticating alone earns nothing more.
  */
 
 const EXPORTER_LABEL = "EXPORTER-vault-rooms-peer-auth";
 const AUTH_TIMEOUT_MS = 10_000;
 const AUTH_MAX_FRAME = 64 << 10;
-/** Once authenticated, until a member: a version of the record fits (one that joined while we were away sends them). */
-const JOINING_MAX_FRAME = 1 << 20;
+/** Until a member, once it has shown it holds our record: a message of record versions (see PeerSession). */
+const PROVEN_MAX_FRAME = 16 << 20;
 const PING_EVERY_MS = 15_000;
 const SILENCE_LIMIT_MS = 45_000;
 const MAX_BUFFERED = 128 << 20;
@@ -151,7 +151,6 @@ class Wire {
   /** A joining device's link stays limited until the mesh session calls `channel.ready()` (then `onReady` runs). */
   link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void): PeerLink {
     if (!joining) this.promote();
-    else this.reader.setLimit(JOINING_MAX_FRAME);
     this.handlers = [];
     return {
       remoteDevice,
@@ -162,6 +161,9 @@ class Wire {
       channel: {
         send: (message: PeerMessage) => this.write(message),
         close: (reason: string) => this.close(reason),
+        widen: () => {
+          if (!this.promoted) this.reader.setLimit(PROVEN_MAX_FRAME);
+        },
         ready: () => {
           this.promote();
           onReady?.();

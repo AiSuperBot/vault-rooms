@@ -109,6 +109,7 @@ export class MeshService {
   private automateTimer: ReturnType<typeof setTimeout> | null = null;
   private saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private automating = false;
+  private lastAutomate = 0;
   /** Keys of rooms this device just created, handed to the replica before anyone hears of it. */
   private ownKeys = new Map<string, { n: number; key: Uint8Array }>();
   private quotaNoticeAt = new Map<string, number>();
@@ -155,6 +156,7 @@ export class MeshService {
     };
     events.stored = (env) => this.roomActivity(env.room, env.k === "b" ? undefined : env.doc);
     events.sessions = () => this.emit();
+    events.compared = () => this.automateSoon();
     events.rejected = (reason, from) => {
       this.deps.log(`refused from ${from}: ${reason}`);
       if (reason.startsWith("quota:")) this.quotaNotice(reason.slice(6));
@@ -763,6 +765,10 @@ export class MeshService {
   }
 
   private async automate(): Promise<void> {
+    // Much longer than the 30-s tick since the last run: this computer was asleep, and its record may be old again.
+    const now = Date.now();
+    if (this.lastAutomate > 0 && now - this.lastAutomate > 120_000) this.node.recompare();
+    this.lastAutomate = now;
     if (this.automating || this.stopped || !this.isMember()) return;
     this.automating = true;
     try {
