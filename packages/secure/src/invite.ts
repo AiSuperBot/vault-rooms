@@ -44,7 +44,8 @@ export interface InviteLink {
   forUser?: string;
 }
 
-const PEER_PATTERN = /^[A-Za-z0-9.-]{1,253}:\d{1,5}$|^\[[0-9A-Fa-f:.]{2,45}\]:\d{1,5}$/;
+/** "host:port" of a peer: a name or IPv4 address, or an IPv6 address in brackets. */
+export const PEER_PATTERN = /^[A-Za-z0-9.-]{1,253}:\d{1,5}$|^\[[0-9A-Fa-f:.]{2,45}\]:\d{1,5}$/;
 
 export function formatInviteLink(link: InviteLink): string {
   const params = new URLSearchParams({ mode: "join-secure", ws: link.workspaceId, i: link.inviteId, s: b64u(link.secret) });

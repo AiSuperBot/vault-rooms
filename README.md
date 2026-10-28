@@ -27,7 +27,7 @@ This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms
   New-NetFirewallRule -DisplayName "Obsidian Vault Rooms discovery" -Direction Inbound -Protocol UDP -LocalPort 47879 -RemoteAddress LocalSubnet -Profile Domain,Private -Action Allow
   ```
 
-  To limit the rules to Obsidian, add `-Program "C:\Users\<user>\AppData\Local\Programs\Obsidian\Obsidian.exe"`. If discovery can't reach across your network (multicast and broadcast blocked), list other computers by address in the plugin's settings; connections still need only TCP.
+  To limit the rules to Obsidian, add `-Program "C:\Users\<user>\AppData\Local\Programs\Obsidian\Obsidian.exe"`. If discovery can't reach across your network (multicast and broadcast blocked), list other computers by address in the plugin's settings; connections still need only TCP. One address that can be reached is enough: devices tell each other where they can be reached and remember it, and a device that joined with an invite link keeps the link's addresses.
 
 ## Install
 

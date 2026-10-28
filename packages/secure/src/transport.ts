@@ -16,17 +16,21 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
  *   authority, so Node's chain check is replaced by this exact-certificate check, in one place: `dial`.)
  * - Both sides then sign the TLS session's exported keying material together with both device ids. The signature can
  *   only verify on this very connection, so a relay in the middle can't pass someone else's authentication along.
- * - A device that isn't a member yet (joining) sends its public key along; the other side lets it through only to
- *   present its join record (the mesh session enforces that).
+ * - Every device sends its public key along (its id is the key's hash). One that isn't a member here (joining, or a
+ *   member that joined while this device was away) is let through only to prove it is: its join record, or the
+ *   record's versions (the mesh session enforces that).
  *
- * Until the other side is a member, frames are capped at 64 KiB, the connection counts against a small limit of
- * such connections, and it must become a member within 10 seconds or it is closed. Anyone on the network can
- * generate a key, so authenticating alone earns nothing more.
+ * Until it has authenticated, frames are capped at 64 KiB; then, until it is a member, at 1 MiB (a record version
+ * fits). Until then the connection counts against a small limit of such connections, and it must become a member
+ * within 10 seconds or it is closed. Anyone on the network can generate a key, so authenticating alone earns nothing
+ * more.
  */
 
 const EXPORTER_LABEL = "EXPORTER-vault-rooms-peer-auth";
 const AUTH_TIMEOUT_MS = 10_000;
 const AUTH_MAX_FRAME = 64 << 10;
+/** Once authenticated, until a member: a version of the record fits (one that joined while we were away sends them). */
+const JOINING_MAX_FRAME = 1 << 20;
 const PING_EVERY_MS = 15_000;
 const SILENCE_LIMIT_MS = 45_000;
 const MAX_BUFFERED = 128 << 20;
@@ -147,6 +151,7 @@ class Wire {
   /** A joining device's link stays limited until the mesh session calls `channel.ready()` (then `onReady` runs). */
   link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void): PeerLink {
     if (!joining) this.promote();
+    else this.reader.setLimit(JOINING_MAX_FRAME);
     this.handlers = [];
     return {
       remoteDevice,
@@ -280,7 +285,6 @@ export function dial(config: TransportConfig, host: string, port: number, expect
       const wire = new Wire(socket);
       const ekm = exportKeyingMaterial(socket);
       const tag = workspaceTag(config.workspaceId);
-      const member = activeDevice(config.membership(), config.deviceId) !== null;
       wire.onClose((reason) => fail(reason));
       wire.onMessage((raw) => {
         if (settled) return;
@@ -308,7 +312,8 @@ export function dial(config: TransportConfig, host: string, port: number, expect
         t: "auth",
         tag,
         device: config.deviceId,
-        ...(member ? {} : { key: config.deviceKey.publicKey }),
+        // Always: the other side may not know this device yet (it joined while that one was away).
+        key: config.deviceKey.publicKey,
         ...(expect ? { to: expect.device } : {}),
         sig: sign(config.deviceKey.secretKey, "peer-auth", authBytes("hello", ekm, config.deviceId, expect?.device ?? "", tag))
       });

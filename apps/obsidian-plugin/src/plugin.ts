@@ -189,9 +189,9 @@ export default class VaultRoomsPlugin extends Plugin {
         this.changed();
       }),
       svc.onReplica((roomId, replica) => void this.onReplica(roomId, replica)),
-      svc.onRoomActivity((roomId) => {
+      svc.onRoomActivity((roomId, docId) => {
         if (this.pendingMounts.has(roomId)) this.retryPendingMounts();
-        this.folders.get(roomId)?.remoteChanged();
+        this.folders.get(roomId)?.remoteChanged(docId);
       }),
       svc.onPresence((env) => this.presences.get(env.room)?.receive(env)),
       svc.onLocalRefused((roomId, docId, code) => this.onLocalRefused(roomId, docId, code)),
@@ -572,7 +572,7 @@ export default class VaultRoomsPlugin extends Plugin {
     if (!replica) return;
     if (code === "read_only") {
       replica.reload(docId);
-      this.folders.get(roomId)?.remoteChanged();
+      this.folders.get(roomId)?.remoteChanged(docId);
       return this.syncEditorsSoon();
     }
     this.folders.get(roomId)?.holdBackNote(docId);

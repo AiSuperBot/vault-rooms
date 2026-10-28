@@ -4,7 +4,8 @@ import { MAX_FORK_DEPTH, WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
 import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
-import { applyJoins, joinHash, parseJoinRecord, takenBackOut, verifyJoinRecord, type JoinRecord } from "./invite.js";
+import { isId } from "./ids.js";
+import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
@@ -43,7 +44,9 @@ export type PeerMessage =
   /** One new envelope, live. */
   | { t: "push"; env: unknown }
   /** A joining device's first message: its join record. */
-  | { t: "join"; join: unknown };
+  | { t: "join"; join: unknown }
+  /** Where devices of the workspace can be reached: [device id, "host:port"] (see MeshNode.addressBook). */
+  | { t: "addresses"; items: unknown[] };
 
 export interface MeshEvents {
   /** The workspace record changed; for "replaced", `lost` lists our versions that a winning branch replaced. */
@@ -63,6 +66,9 @@ export interface MeshEvents {
 
 const RECENT = 64;
 const MAX_ITEMS = 500;
+const MAX_ADDRESSES = 64;
+/** A peer not yet counted as a member reads frames of at most 1 MiB (see transport). */
+const MAX_VERSIONS_BYTES = 768 << 10;
 const MAX_BATCH_BYTES = 8 << 20;
 const PRESENCE_MEMORY = 2000;
 const PRESENCE_WINDOW_MS = 60_000;
@@ -133,6 +139,13 @@ export class MeshNode {
    * never lose an envelope a peer already has, and the counter it used is never handed out twice.
    */
   persist: ((env: StoredEnvelope) => Promise<void>) | null = null;
+  /**
+   * Set by the owner (see PeerManager): where devices of the workspace can be reached, told to each peer and to all of
+   * them when it changes (shareAddresses), so peers can reach each other without the one that brought them together.
+   */
+  addressBook: () => Array<[string, string]> = () => [];
+  /** Addresses a peer told of, in form only: whoever answers there is checked when dialled. */
+  onAddresses: (items: Array<[string, string]>) => void = () => {};
   private stopped = false;
 
   constructor(
@@ -463,6 +476,12 @@ export class MeshNode {
     for (const session of [...this.sessions]) session.close(reason);
   }
 
+  /** Tell every peer where the devices of the workspace can be reached (see addressBook). */
+  shareAddresses(): void {
+    const items = this.addressBook().slice(0, MAX_ADDRESSES);
+    if (items.length > 0) this.broadcast({ t: "addresses", items });
+  }
+
   private broadcast(message: PeerMessage, except?: PeerSession): void {
     for (const session of this.sessions) if (session !== except && session.ready) session.send(message);
   }
@@ -503,6 +522,8 @@ export class PeerSession {
     this.ready = true;
     this.channel.ready?.();
     this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+    const items = this.node.addressBook().slice(0, MAX_ADDRESSES);
+    if (items.length > 0) this.send({ t: "addresses", items });
   }
 
   /** Compare rooms again (envelopes refused earlier may verify now). */
@@ -555,15 +576,7 @@ export class PeerSession {
 
   private handle(raw: unknown): void {
     const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
-    if (!this.ready) {
-      if (message.t !== "join") return this.close("not_a_member");
-      const join = parseJoinRecord(message.join);
-      if (join.body.device.id !== this.remoteDevice) return this.close("join_mismatch");
-      this.node.addJoin(join, this, false);
-      if (!activeDevice(this.node.effective(), this.remoteDevice)) return this.close("not_a_member");
-      this.begin();
-      return;
-    }
+    if (!this.ready) return this.beforeMembership(message);
     switch (message.t) {
       case "hello":
         if (!this.allow("hello", 3, 30_000)) return;
@@ -585,9 +598,71 @@ export class PeerSession {
         return this.each([message.env], (item) => this.node.publish(parseEnvelope(item), this));
       case "join":
         return this.each([message.join], (join) => this.node.addJoin(parseJoinRecord(join), this));
+      case "addresses":
+        if (!this.allow("addresses", 5, 60_000)) return;
+        return this.onAddresses(message.items);
       default:
         return this.reject("unknown_message");
     }
+  }
+
+  /**
+   * The other side isn't a member here: a device joining, or a member this device doesn't know of yet (it joined while
+   * this one was away, through someone else). Only what proves membership is taken in, each checked as always: its
+   * join record, or the record's versions and joins (asked for with a hello of ours, when it counts us as a member).
+   * Anything else is let go. Once the record names it, the session starts.
+   */
+  private beforeMembership(message: Record<string, unknown>): void {
+    switch (message.t) {
+      case "join": {
+        const join = parseJoinRecord(message.join);
+        if (join.body.device.id !== this.remoteDevice) return this.close("join_mismatch");
+        this.node.addJoin(join, this, false);
+        if (!activeDevice(this.node.effective(), this.remoteDevice)) return this.close("not_a_member");
+        return this.begin();
+      }
+      case "hello":
+        // It holds our record (one of its latest versions is ours): our hello tells it what we lack. To
+        // anyone else, nothing is said.
+        if (message.ws !== this.node.workspaceId || this.readHello(message).common < 0) return this.close("not_a_member");
+        if (!this.allow("hello", 3, 30_000)) return;
+        return this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+      case "versions":
+        this.onVersions(message.versions);
+        break;
+      case "joins":
+        this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this));
+        break;
+      default:
+        return;
+    }
+    if (activeDevice(this.node.effective(), this.remoteDevice)) this.begin();
+  }
+
+  /** Versions in messages of at most about MAX_VERSIONS_BYTES (one larger version alone): small frames until membership. */
+  private sendVersions(versions: SignedVersion[]): void {
+    let batch: SignedVersion[] = [];
+    let bytes = 0;
+    for (const version of versions) {
+      const size = JSON.stringify(version).length;
+      if (batch.length > 0 && (bytes + size > MAX_VERSIONS_BYTES || batch.length === MAX_ITEMS)) {
+        this.send({ t: "versions", versions: batch });
+        batch = [];
+        bytes = 0;
+      }
+      batch.push(version);
+      bytes += size;
+    }
+    if (batch.length > 0) this.send({ t: "versions", versions: batch });
+  }
+
+  private onAddresses(raw: unknown): void {
+    if (!Array.isArray(raw) || raw.length > MAX_ADDRESSES) v.bad("addresses");
+    const items: Array<[string, string]> = [];
+    for (const item of raw) {
+      if (Array.isArray(item) && item.length === 2 && isId(item[0], "d") && typeof item[1] === "string" && PEER_PATTERN.test(item[1])) items.push([item[0], item[1]]);
+    }
+    this.node.onAddresses(items);
   }
 
   /** Handle each item of a batch; one bad item doesn't spoil the rest. */
@@ -602,12 +677,10 @@ export class PeerSession {
     }
   }
 
-  private onHello(message: Record<string, unknown>): void {
-    if (message.ws !== this.node.workspaceId) return this.close("other_workspace");
+  /** A hello's head, and the newest version both sides have (-1 if none of its latest versions is ours). */
+  private readHello(message: Record<string, unknown>): { theirHead: number; theirHeadHash?: string; common: number } {
     const theirHead = v.int(message.head, "hello.head", -1, 1e12);
     if (!Array.isArray(message.recent) || message.recent.length > RECENT) v.bad("hello.recent");
-    // The newest version both sides have. If the other side's head isn't ours, send everything after it; a joiner
-    // (head -1) gets the whole record from genesis.
     let common = -1;
     let theirHeadHash: string | undefined;
     for (const entry of message.recent as unknown[]) {
@@ -617,9 +690,16 @@ export class PeerSession {
       if (at === theirHead) theirHeadHash = hash;
       if (this.node.chain.hashAt(at) === hash) common = Math.max(common, at);
     }
+    return { theirHead, theirHeadHash, common };
+  }
+
+  private onHello(message: Record<string, unknown>): void {
+    if (message.ws !== this.node.workspaceId) return this.close("other_workspace");
+    // If the other side's head isn't ours, send everything after the newest version both have; a joiner (head -1)
+    // gets the whole record from genesis.
+    const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
-      const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
-      for (let i = 0; i < versions.length; i += MAX_ITEMS) this.send({ t: "versions", versions: versions.slice(i, i + MAX_ITEMS) });
+      this.sendVersions(theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1));
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });

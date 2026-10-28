@@ -149,6 +149,12 @@ export class RoomFolder {
   private materializeTimer: ReturnType<typeof setTimeout> | null = null;
   /** A pass is queued and hasn't started: it will see every change made until it does. */
   private passQueued = false;
+  /**
+   * What the next pass looks at: the notes changed since the last one (`dirty`), or every file (`everything`: at the
+   * start, and when the index, a key or an attachment came in). Each change to a note reaches remoteChanged with it.
+   */
+  private dirty = new Set<string>();
+  private everything = true;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private deleteTimer: ReturnType<typeof setTimeout> | null = null;
   private deletions = new Set<string>();
@@ -242,11 +248,13 @@ export class RoomFolder {
   }
 
   /** One file's trouble (locked, a folder in the way, ...) mustn't stop the others. */
-  private async safely(what: string, task: () => Promise<void>): Promise<void> {
+  private async safely(what: string, task: () => Promise<void>): Promise<boolean> {
     try {
       await task();
+      return true;
     } catch (error) {
       this.o.log(`room folder, ${what}: ${(error as Error).message}`);
+      return false;
     }
   }
 
@@ -295,8 +303,10 @@ export class RoomFolder {
     }, true);
   }
 
-  /** Call when the room index or a note changed remotely, or a key arrived. */
-  remoteChanged(): void {
+  /** Call when the room index or a note (`docId`: only that one) changed remotely, or a key arrived. */
+  remoteChanged(docId?: string): void {
+    if (docId !== undefined && docId !== INDEX_DOC) this.dirty.add(docId);
+    else this.everything = true;
     if (this.stopped || this.materializeTimer) return;
     this.materializeTimer = setTimeout(() => {
       this.materializeTimer = null;
@@ -340,7 +350,7 @@ export class RoomFolder {
     if (this.stopped) return false;
     const versions = this.toKeep.get(fileId) ?? [];
     if (!versions.includes(version)) this.toKeep.set(fileId, [...versions, version]);
-    this.remoteChanged();
+    this.remoteChanged(fileId);
     return false;
   }
 
@@ -566,12 +576,15 @@ export class RoomFolder {
 
   private async materializeNow(): Promise<void> {
     if (this.stopped || !this.started) return;
+    const { everything, dirty } = this;
+    this.everything = false;
+    this.dirty = new Set();
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     await this.keepClashCopies();
     const replica = this.o.replica;
     const desired = this.desired();
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
-    if (replica.isComplete(INDEX_DOC)) {
+    if (everything && replica.isComplete(INDEX_DOC)) {
       const entries = replica.entries();
       for (const [id, known] of [...this.known]) {
         if (entries.get(id)?.deleted) await this.safely(known.path, () => this.applyRemoval(id, known));
@@ -583,7 +596,11 @@ export class RoomFolder {
       }
       await this.safely("renames", () => this.applyRenames(desired));
     }
-    for (const [id, entry] of desired) await this.safely(entry.path, () => this.applyContent(id, entry));
+    for (const [id, entry] of desired) {
+      if (!everything && !dirty.has(id) && !this.toKeep.has(id)) continue;
+      // One that failed (a file in use, say) is tried again by the next pass.
+      if (!(await this.safely(entry.path, () => this.applyContent(id, entry)))) this.dirty.add(id);
+    }
     if (this.needsAdopt && replica.canWrite()) {
       this.needsAdopt = false;
       await this.adoptLocalFiles();
@@ -790,6 +807,8 @@ export class RoomFolder {
   /** Content changed here: put it into the shared state, or put the shared version back in a read-only room. */
   private async localChanged(id: string, entry: FileEntry, local: string | Uint8Array, localHash: string): Promise<void> {
     const replica = this.o.replica;
+    // Part of the shared note can't be read yet: nothing to merge with or put back (a pass does once it can).
+    if (entry.kind === "md" && !replica.isComplete(id)) return;
     if (!replica.canWrite()) {
       const remote = entry.kind === "md" ? normalizeNote(replica.noteText(id)) : entry.blob ? await replica.readBlob(entry.blob) : null;
       if (remote === null) return;
@@ -888,7 +907,7 @@ export class RoomFolder {
       if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) return this.remember(id, relative, hash);
       // The shared version moved on since the last sync and isn't here yet: taking this change in now would undo it, so
       // the next pass settles it like any change made on both sides (keeping a copy).
-      if (this.o.replica.canWrite() && (await this.sharedMovedOn(id, entry, known))) return this.remoteChanged();
+      if (this.o.replica.canWrite() && (await this.sharedMovedOn(id, entry, known))) return this.remoteChanged(id);
       await this.localChanged(id, entry, content, hash);
     });
   }
@@ -931,6 +950,7 @@ export class RoomFolder {
     this.known.delete(id);
     if (!this.o.replica.canWrite()) {
       this.readOnlyNotice(`You can only read this room, so "${relative}" was put back.`);
+      this.dirty.add(id);
       return this.materializeNow();
     }
     const entry = this.o.replica.files().get(id);
@@ -973,7 +993,10 @@ export class RoomFolder {
       // Moved out of the room: it leaves the room. Moved in: it joins it.
       if (id) {
         this.known.delete(id);
-        if (!this.o.replica.canWrite()) return this.materializeNow();
+        if (!this.o.replica.canWrite()) {
+          this.dirty.add(id);
+          return this.materializeNow();
+        }
         const entry = this.o.replica.files().get(id);
         if (entry) this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true }));
         this.saveSoon();

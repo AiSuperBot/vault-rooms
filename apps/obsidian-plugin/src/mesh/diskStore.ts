@@ -74,6 +74,11 @@ export class DiskStore implements BlobStorage {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private store: EnvelopeStore | null = null;
   private muted = false;
+  /** Journals that couldn't be read (in use by another program, say), by document ("room\0doc"): tried again. */
+  private unread = new Map<string, string[]>();
+  private unreadTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A journal read late (see unread): its envelopes new to the store, for the owner to take in like news. */
+  onLateRead?: (room: string, doc: string, envelopes: StoredEnvelope[]) => void;
 
   constructor(
     private readonly files: Files,
@@ -257,28 +262,89 @@ export class DiskStore implements BlobStorage {
       for (const file of (await this.files.list(roomFolder)).files) {
         const doc = idOfFileName(lastPart(file).replace(/\.jsonl(\.tmp|\.old)?$/, ""));
         if (doc !== "index" && !isId(doc, "f")) continue;
-        let text: string;
-        try {
-          text = await this.files.read(file);
-        } catch {
+        const text = await this.readJournal(file);
+        if (text !== null) {
+          this.addLines(store, room, doc, text);
           continue;
         }
-        for (const line of text.split("\n")) {
-          if (!line.trim()) continue;
-          try {
-            const raw = JSON.parse(line) as Record<string, unknown>;
-            if ("marks" in raw) {
-              store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed), numbers(raw.dropped));
-              continue;
-            }
-            const env = parseEnvelope(raw);
-            if (env.k !== "p" && env.k !== "b" && env.room === room && env.doc === doc) store.add(env);
-          } catch {
-            // a torn or foreign line
-          }
-        }
+        // Without it the document would look like it holds less than it does (empty, say), and a note would be written
+        // over with that: it stays incomplete until the journal is read (see RoomReplica.isComplete), tried again.
+        const key = `${room}\u0000${doc}`;
+        this.unread.set(key, [...(this.unread.get(key) ?? []), file]);
+        store.setUnreadable(room, doc, true);
       }
     }
+    if (this.unread.size > 0) this.retryUnreadSoon();
+  }
+
+  /** A journal's text, tried a few times (another program may hold it a moment); "" if it is gone, null if unreadable. */
+  private async readJournal(path: string): Promise<string | null> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.files.read(path);
+      } catch {
+        if (!(await this.files.exists(path).catch(() => true))) return "";
+        if (attempt === 2) return null;
+        await new Promise((resolve) => setTimeout(resolve, 100 * 4 ** attempt));
+      }
+    }
+  }
+
+  private addLines(store: EnvelopeStore, room: string, doc: string, text: string, added?: StoredEnvelope[]): void {
+    for (const line of text.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const raw = JSON.parse(line) as Record<string, unknown>;
+        if ("marks" in raw) {
+          store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed), numbers(raw.dropped));
+          continue;
+        }
+        const env = parseEnvelope(raw);
+        if (env.k !== "p" && env.k !== "b" && env.room === room && env.doc === doc && store.add(env) === "added") added?.push(env);
+      } catch {
+        // a torn or foreign line
+      }
+    }
+  }
+
+  /** Journals that couldn't be read yet. */
+  unreadDocs(): number {
+    return this.unread.size;
+  }
+
+  private retryUnreadSoon(): void {
+    if (!this.unreadTimer) this.unreadTimer = setTimeout(() => void this.retryUnread(), 5_000);
+  }
+
+  /** Read the journals that couldn't be read yet, again (on a timer; tests call it). */
+  async retryUnread(): Promise<void> {
+    this.unreadTimer = null;
+    const store = this.store;
+    for (const [key, paths] of [...this.unread]) {
+      const texts: string[] = [];
+      for (const path of paths) {
+        const text = await this.readJournal(path);
+        if (text === null) break;
+        texts.push(text);
+      }
+      if (!store || this.store !== store) return;
+      if (texts.length < paths.length) continue;
+      const [room, doc] = key.split("\u0000") as [string, string];
+      this.unread.delete(key);
+      const added: StoredEnvelope[] = [];
+      // Already on disk: not appended again.
+      this.muted = true;
+      try {
+        for (const text of texts) this.addLines(store, room, doc, text, added);
+      } finally {
+        this.muted = false;
+      }
+      store.setUnreadable(room, doc, false);
+      // Written once more as the store has it now (lines that came in meanwhile were appended, and are in it).
+      this.later(this.rewrites, key);
+      this.onLateRead?.(room, doc, added);
+    }
+    if (this.unread.size > 0 && this.store === store) this.retryUnreadSoon();
   }
 
   private async loadBlobs(store: EnvelopeStore): Promise<void> {
@@ -406,6 +472,8 @@ export class DiskStore implements BlobStorage {
     if (!store) return;
     await Promise.all([
       ...docs.map((target) => {
+        // Never written over before it is read: what it holds isn't all in the store (written once it is, see retryUnread).
+        if (this.unread.has(target)) return Promise.resolve();
         const [room, doc] = target.split("\u0000") as [string, string];
         const path = this.docPath(room, doc);
         // Taken when the rewrite runs, after the appends queued before it; appends queued after it follow it (a line
@@ -422,6 +490,8 @@ export class DiskStore implements BlobStorage {
 
   /** Wait for every write queued so far (call before shutting down). */
   async flush(): Promise<void> {
+    if (this.unreadTimer) clearTimeout(this.unreadTimer);
+    this.unreadTimer = null;
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       await this.runLater();
@@ -431,6 +501,8 @@ export class DiskStore implements BlobStorage {
 
   /** Drop writes that haven't started (a store let go of without saving; another instance may be using the files). */
   discard(): void {
+    if (this.unreadTimer) clearTimeout(this.unreadTimer);
+    this.unreadTimer = null;
     if (this.flushTimer) clearTimeout(this.flushTimer);
     this.flushTimer = null;
     this.rewrites.clear();
