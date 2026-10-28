@@ -187,6 +187,8 @@ describe("mesh service", () => {
 
   it("makes again at once a revocation in a losing branch it didn't sign, while its signer is away", async () => {
     const ana = await started(await MeshService.create(deps("Ana6"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    // Joins come in below without a peer to compare the record with: as if it had been.
+    ana.node.recordCompared = true;
     const join = async (name: string, letter: string) => {
       const invite = parseInviteLink(await ana.createInvite({}));
       const device = newDevice(`u${letter.repeat(22)}`, `${name} PC`);
@@ -205,6 +207,19 @@ describe("mesh service", () => {
     // Cy's computer is away: Ana's makes Cy's revocation again right away, leaving Mal no time to act against Cy.
     await until(() => ana.state.devices[mal.id]!.revoked === true, 2_000);
     expect(ana.state.devices[dan.id]!.revoked).toBe(true);
+  });
+
+  it("makes no change of its own to the record before comparing it with a member's since it started", async () => {
+    const ana = await started(await MeshService.create(deps("AnaC"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const invite = parseInviteLink(await ana.createInvite({}));
+    const eve = newDevice(`u${"E".repeat(22)}`, "Eve PC");
+    ana.node.addJoin(createJoinRecord({ workspaceId: ana.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: eve.userId, name: "Eve" }, deviceName: eve.name, deviceKey: eve.sign, agreementPublicKey: eve.agree.publicKey, tlsFingerprint: eve.tls }));
+    // No member reached since it started: recording the join waits (made on an old record, it could start a branch).
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(ana.node.chain.state.devices[eve.id]).toBeUndefined();
+    ana.node.recordCompared = true;
+    (ana as unknown as { automateSoon(): void }).automateSoon();
+    await until(() => ana.node.chain.state.devices[eve.id] !== undefined);
   });
 
   it("never goes online once stopped", async () => {
