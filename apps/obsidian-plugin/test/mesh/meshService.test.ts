@@ -136,6 +136,28 @@ describe("mesh service", () => {
     expect(ben.state.devices[mal.id]).toBeUndefined();
   });
 
+  it("makes again at once a revocation in a losing branch it didn't sign, while its signer is away", async () => {
+    const ana = await started(await MeshService.create(deps("Ana6"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const join = async (name: string, letter: string) => {
+      const invite = parseInviteLink(await ana.createInvite({}));
+      const device = newDevice(`u${letter.repeat(22)}`, `${name} PC`);
+      ana.node.addJoin(createJoinRecord({ workspaceId: ana.settings.id, inviteId: invite.inviteId, secret: invite.secret, user: { id: device.userId, name }, deviceName: device.name, deviceKey: device.sign, agreementPublicKey: device.agree.publicKey, tlsFingerprint: device.tls }));
+      await until(() => ana.node.chain.state.devices[device.id] !== undefined);
+      return device;
+    };
+    const cy = await join("Cy", "C");
+    const mal = await join("Mal", "M");
+    const dan = await join("Dan", "D");
+    await ana.setAdmin(cy.userId, true);
+    // Cy revokes Mal's computer while Ana revokes Dan's, and hers wins; Ana's computer had Cy's change first.
+    const parent = ana.node.chain.head;
+    expect(ana.node.offerVersions([nextVersion(ana.settings.id, parent, cy.sign, (state) => (state.devices[mal.id]!.revoked = true))]).status).toBe("appended");
+    expect(ana.node.offerVersions([nextVersion(ana.settings.id, parent, ana.secrets.sign, (state) => (state.devices[dan.id]!.revoked = true))]).status).toBe("replaced");
+    // Cy's computer is away: Ana's makes Cy's revocation again right away, leaving Mal no time to act against Cy.
+    await until(() => ana.state.devices[mal.id]!.revoked === true, 2_000);
+    expect(ana.state.devices[dan.id]!.revoked).toBe(true);
+  });
+
   it("never goes online once stopped", async () => {
     const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
     service.settings.port = 0;

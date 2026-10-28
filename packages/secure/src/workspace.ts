@@ -21,6 +21,9 @@ export function roleAtLeast(role: Role | undefined, minimum: Role): boolean {
   return role !== undefined && RANK[role] >= RANK[minimum];
 }
 
+/** A role's place in the order (none below read). */
+const rank = (role: Role | undefined) => (role === undefined ? 0 : RANK[role]);
+
 export interface UserRecord {
   name: string;
   admin: boolean;
@@ -353,7 +356,7 @@ export function verifyGenesis(genesis: SignedVersion): string {
 // ---- authorization of one step ----
 
 function sameJson(a: unknown, b: unknown): boolean {
-  return canonicalJson(a ?? null) === canonicalJson(b ?? null);
+  return a === b || canonicalJson(a ?? null) === canonicalJson(b ?? null);
 }
 
 function keysOf(...records: Record<string, unknown>[]): string[] {
@@ -666,63 +669,43 @@ export function rebaseChange(base: WorkspaceState, lost: WorkspaceState, onto: W
  */
 export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVersion[], current: WorkspaceState, actor: Signer, workspaceId: string): WorkspaceState | null {
   if (lost.length === 0) return null;
-  // Each change is checked with the rule it needs, and the whole once, like any version; only if that fails (a rule
-  // not foreseen here) is each change checked against everything, one by one, which costs much more.
-  const quick = reductions(fork, lost, won, current, actor, workspaceId, false);
-  if (!quick) return null;
-  try {
-    authorize(current, quick, actor, Date.now(), workspaceId);
-    return quick;
-  } catch {
-    return reductions(fork, lost, won, current, actor, workspaceId, true);
-  }
-}
-
-const ROLE_RANK = { read: 1, write: 2, manage: 3 } as const;
-const rank = (role: Role | undefined) => (role === undefined ? 0 : ROLE_RANK[role]);
-
-function reductions(fork: WorkspaceState, lost: SignedVersion[], won: SignedVersion[], current: WorkspaceState, actor: Signer, workspaceId: string, strict: boolean): WorkspaceState | null {
-  const draft = structuredClone(current);
+  // What a change doesn't touch stays `current`'s own (authorize, run after each change, then compares it by identity):
+  // what it touches is copied first, so `current` is never changed.
+  const draft: WorkspaceState = { ...current, users: { ...current.users }, devices: { ...current.devices }, rooms: { ...current.rooms } };
+  const own = <T>(records: Record<string, T>, from: Record<string, T>, id: string): T | undefined => {
+    if (records[id] !== undefined && records[id] === from[id]) records[id] = structuredClone(records[id]);
+    return records[id];
+  };
   let changed = false;
-  const admin = current.users[actor.user]?.admin === true && !current.users[actor.user]?.removed;
-  /** Make a change if this computer may: `may` and `keeps` (what it must leave intact) or, `strict`, by authorize. */
-  const attempt = (may: boolean, apply: () => boolean, keeps: () => boolean, undo: () => void) => {
-    if (!strict && !may) return;
-    if (!apply()) return;
-    let ok = true;
-    if (strict) {
-      try {
-        authorize(current, draft, actor, Date.now(), workspaceId);
-      } catch {
-        ok = false;
-      }
-    } else ok = keeps();
-    if (ok) changed = true;
-    else undo();
+  /** Make a change if this computer may, on top of those made so far (see authorize); otherwise it is undone. */
+  const attempt = (apply: () => void, undo: () => void) => {
+    apply();
+    try {
+      authorize(current, draft, actor, Date.now(), workspaceId);
+      changed = true;
+    } catch {
+      undo();
+    }
   };
   const revoke = (deviceId: string) => {
-    const device = draft.devices[deviceId];
-    const wasAdmin = !!device && draft.users[device.user]?.admin === true;
-    attempt(admin || device?.user === actor.user, () => !!device && !device.revoked && (device.revoked = true), () => !wasAdmin || hasActiveAdmin(draft), () => delete device!.revoked);
+    const device = draft.devices[deviceId]?.revoked ? undefined : own(draft.devices, current.devices, deviceId);
+    if (device) attempt(() => (device.revoked = true), () => delete device.revoked);
   };
   const remove = (userId: string) => {
-    const user = draft.users[userId];
-    const managed = Object.values(draft.rooms).filter((room) => !room.deleted && room.members[userId] === "manage");
-    attempt(admin, () => !!user && !user.removed && (user.removed = true), () => (!user!.admin || hasActiveAdmin(draft)) && managed.every((room) => hasManager(draft, room)), () => delete user!.removed);
+    const user = draft.users[userId]?.removed ? undefined : own(draft.users, current.users, userId);
+    if (user) attempt(() => (user.removed = true), () => delete user.removed);
   };
   const demote = (userId: string) => {
-    const user = draft.users[userId];
-    attempt(admin, () => !!user?.admin && !(user.admin = false), () => hasActiveAdmin(draft), () => (user!.admin = true));
+    const user = draft.users[userId]?.admin ? own(draft.users, current.users, userId) : undefined;
+    if (user) attempt(() => (user.admin = false), () => (user.admin = true));
   };
   /** Set a member's role in a room, unless the room is gone or `unless` says the role there changed meanwhile. */
   const setRole = (roomId: string, userId: string, role: Role | undefined, unless: (now: Role | undefined) => boolean) => {
-    const room = draft.rooms[roomId];
-    const was = room?.members[userId];
-    if (!room || room.deleted || was === role || unless(was)) return;
-    const user = draft.users[userId];
+    const was = draft.rooms[roomId]?.members[userId];
+    if (!draft.rooms[roomId] || draft.rooms[roomId]!.deleted || was === role || unless(was)) return;
+    const room = own(draft.rooms, current.rooms, roomId)!;
     const set = (value: Role | undefined) => (value === undefined ? delete room.members[userId] : (room.members[userId] = value));
-    const may = roleIn(current, roomId, actor.user) === "manage" && (role === undefined || (user !== undefined && !user.removed));
-    attempt(may, () => (set(role), true), () => was !== "manage" || hasManager(draft, room), () => set(was));
+    attempt(() => set(role), () => set(was));
   };
   // The signer's user, if it still has the standing in `current` for a change: an admin's, a room manager's, or their own.
   const standing = (version: SignedVersion) => {

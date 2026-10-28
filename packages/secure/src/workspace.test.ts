@@ -476,10 +476,26 @@ describe("devices and users", () => {
       state.rooms[roomId]!.members[e.userId] = "write";
     });
     const lost = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[b.id]!.revoked = true));
+    const before = JSON.stringify(won.body.state);
     const after = concurrentReductions(fork, [lost], [won], won.body.state, { user: a.userId, device: a.id }, chain.workspaceId)!;
     expect(after.devices[b.id]!.revoked).toBe(true);
     expect(after.users[e.userId]!.admin).toBe(false);
     expect(after.rooms[roomId]!.members[e.userId]).toBeUndefined();
+    // Worked out on a copy: the state it started from is as it was.
+    expect(JSON.stringify(won.body.state)).toBe(before);
+  });
+
+  it("makes again a member's leaving a room in a branch that lost, though they don't manage the room", () => {
+    const { chain, admin: a } = founder();
+    const { joiner: c } = invite(chain, a, { userName: "C" });
+    const { roomId } = createRoom(chain, a, "Docs", { [c.userId]: "write" });
+    const fork = chain.state;
+    // C leaves the room while A renames a computer of hers; A's change wins (A ranks higher).
+    const won = nextVersion(chain.workspaceId, chain.head, a.sign, (state) => (state.devices[a.id]!.name = "A2"));
+    const lost = nextVersion(chain.workspaceId, chain.head, c.sign, (state) => void delete state.rooms[roomId]!.members[c.userId]);
+    const after = concurrentReductions(fork, [lost], [won], won.body.state, { user: c.userId, device: c.id }, chain.workspaceId);
+    expect(after).not.toBeNull();
+    expect(after!.rooms[roomId]!.members[c.userId]).toBeUndefined();
   });
 
   /** What concurrentReductions makes on `chain`'s head, signed by `by` as MeshService.reapply does (so it must be valid). */

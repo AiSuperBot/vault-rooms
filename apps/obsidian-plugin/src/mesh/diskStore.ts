@@ -53,6 +53,7 @@ function lastPart(path: string): string {
  * What a device keeps of its workspace, under one folder of the plugin's data:
  *   chain.json, joins.json, wraps.json   replaced whole (written to .tmp, then swapped in)
  *   rooms/<room>.json                    what each room folder last synced
+ *   rooms/<room>.saves.json              saves of its notes made here outside the editor (see RoomReplica.recentSaves)
  *   docs/<room>/<doc>.jsonl              one encrypted envelope per line, appended; rewritten (with a line of marks)
  *                                        when a snapshot replaces envelopes
  *   blobs/<room>/<author>.<id>.<n>.json  one encrypted attachment version per file; gone.json lists dropped ones
@@ -115,18 +116,29 @@ export class DiskStore implements BlobStorage {
     return this.queue(path, () => this.swapIn(path, data));
   }
 
-  /** Read a whole file, recovering from a swap that was interrupted. */
-  private async readWhole(path: string): Promise<string | null> {
+  /**
+   * Read a whole file, recovering from a swap that was interrupted. `strict`: one that is there but can't be read now
+   * (locked, say) throws, rather than reading as no file.
+   */
+  private async readWhole(path: string, strict = false): Promise<string | null> {
+    let locked = false;
     for (const candidate of [path, `${path}.tmp`, `${path}.old`]) {
       if (!(await this.files.exists(candidate))) continue;
+      let text: string;
       try {
-        const text = await this.files.read(candidate);
+        text = await this.files.read(candidate);
+      } catch {
+        locked = true;
+        continue;
+      }
+      try {
         JSON.parse(text);
         return text;
       } catch {
         // A torn copy: try the next one.
       }
     }
+    if (locked && strict) throw new Error(`${lastPart(path)} can't be read now`);
     return null;
   }
 
@@ -180,17 +192,19 @@ export class DiskStore implements BlobStorage {
 
   // ---- per-room bookkeeping of the vault folder (what was last synced where) ----
 
-  private roomStatePath(roomId: string): string {
-    return `${this.root}/rooms/${fileNameOf(roomId)}.json`;
+  /** A room's file: its state (`kind` ""), or its saves (".saves"). */
+  private roomStatePath(roomId: string, kind = ""): string {
+    return `${this.root}/rooms/${fileNameOf(roomId)}${kind}.json`;
   }
 
-  async loadRoomState<T>(roomId: string): Promise<T | null> {
-    const text = await this.readWhole(this.roomStatePath(roomId));
+  /** Null if there is none; throws if it is there but can't be read (better than taking it for none). */
+  async loadRoomState<T>(roomId: string, kind = ""): Promise<T | null> {
+    const text = await this.readWhole(this.roomStatePath(roomId, kind), true);
     return text === null ? null : (JSON.parse(text) as T);
   }
 
-  saveRoomState(roomId: string, state: unknown): Promise<void> {
-    return this.writeWhole(this.roomStatePath(roomId), JSON.stringify(state));
+  saveRoomState(roomId: string, state: unknown, kind = ""): Promise<void> {
+    return this.writeWhole(this.roomStatePath(roomId, kind), JSON.stringify(state));
   }
 
   // ---- envelopes ----

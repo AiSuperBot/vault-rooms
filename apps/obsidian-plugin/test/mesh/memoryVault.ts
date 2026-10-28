@@ -5,6 +5,10 @@ export class MemoryVault implements VaultLike {
   readonly files = new Map<string, Uint8Array>();
   readonly folders = new Set<string>();
   readonly trashed: string[] = [];
+  /** Every write, in turn: the path, and the text written. */
+  readonly written: Array<{ path: string; text: string }> = [];
+  /** Reads of paths it gives a promise for wait for it first (a slow disk, say). */
+  gate?: (path: string) => Promise<void> | undefined;
   private mtimes = new Map<string, number>();
   private clock = 1;
   listener: { write?(path: string): void; delete?(path: string): void; rename?(from: string, to: string): void } = {};
@@ -20,6 +24,7 @@ export class MemoryVault implements VaultLike {
   }
 
   async readText(path: string): Promise<string> {
+    await this.gate?.(path);
     const data = this.files.get(path);
     if (!data) throw new Error(`ENOENT ${path}`);
     return Buffer.from(data).toString("utf8");
@@ -36,9 +41,14 @@ export class MemoryVault implements VaultLike {
     for (let i = 1; i < parts.length; i++) this.folders.add(parts.slice(0, i).join("/"));
     this.files.set(path, data);
     this.mtimes.set(path, ++this.clock);
+    this.written.push({ path, text: Buffer.from(data).toString("utf8") });
   }
 
+  /** Writes to paths it is true for fail (a full disk, say). */
+  failWrites?: (path: string) => boolean;
+
   async writeText(path: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
+    if (this.failWrites?.(path)) throw new Error(`ENOSPC ${path}`);
     const current = this.files.get(path);
     if (current && expected && !expected(Buffer.from(current).toString("utf8"))) return false;
     this.put(path, new Uint8Array(Buffer.from(text, "utf8")));
@@ -50,6 +60,7 @@ export class MemoryVault implements VaultLike {
   beforeGuardedWrite?: (path: string) => void;
 
   async writeBytes(path: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
+    if (this.failWrites?.(path)) throw new Error(`ENOSPC ${path}`);
     const current = this.files.get(path);
     if (current && expected) {
       this.beforeGuardedWrite?.(path);

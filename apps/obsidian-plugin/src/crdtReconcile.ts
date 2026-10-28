@@ -33,16 +33,11 @@ function isLowSurrogate(unit: number): boolean {
   return unit >= 0xdc00 && unit <= 0xdfff;
 }
 
-/** Works on code points (not UTF-16 units), so an edit never splits a surrogate pair (an emoji, say) in two. */
-function lcsDiff(a: string[], b: string[]): DiffOp[] {
-  return coalesce(lcsOps(a, b));
-}
-
-/** One op per element of `a` and `b` (code points, or lines). */
+/** One op per element of `a` and `b` (code points, or lines); past MAX_DIFF_CELLS, all of `a` out and all of `b` in. */
 function lcsOps(a: string[], b: string[]): DiffOp[] {
   const n = a.length;
   const m = b.length;
-  if (n === 0 || m === 0) return [...a.map((text) => ({ op: "delete" as const, text })), ...b.map((text) => ({ op: "insert" as const, text }))];
+  if (n === 0 || m === 0 || n * m > MAX_DIFF_CELLS) return [...a.map((text) => ({ op: "delete" as const, text })), ...b.map((text) => ({ op: "insert" as const, text }))];
 
   const dp: Uint32Array[] = new Array<Uint32Array>(n + 1);
   for (let i = 0; i <= n; i++) {
@@ -103,15 +98,10 @@ export function computeTextDiff(a: string, b: string): DiffOp[] {
   if (a === b) {
     return a ? [{ op: "equal", text: a }] : [];
   }
-  const ca = Array.from(a);
-  const cb = Array.from(b);
-  if (ca.length * cb.length > MAX_DIFF_CELLS) {
-    const ops: DiffOp[] = [];
-    if (a) ops.push({ op: "delete", text: a });
-    if (b) ops.push({ op: "insert", text: b });
-    return ops;
-  }
-  return lcsDiff(ca, cb);
+  // Too large to diff: all of `a` out and all of `b` in, whole (one op per code point would cost a lot here).
+  if (a.length * b.length > MAX_DIFF_CELLS) return [...(a ? [{ op: "delete" as const, text: a }] : []), ...(b ? [{ op: "insert" as const, text: b }] : [])];
+  // By code points (not UTF-16 units), so an edit never splits a surrogate pair (an emoji, say) in two.
+  return coalesce(lcsOps(Array.from(a), Array.from(b)));
 }
 
 /**
@@ -195,7 +185,7 @@ export function reconcileYTextByLines(ytext: Y.Text, text: string, origin: unkno
   while (suffix < a.length - prefix && suffix < b.length - prefix && a[last - suffix] === b[b.length - 1 - suffix]) suffix++;
   const oldMid = a.slice(prefix, a.length - suffix);
   const newMid = b.slice(prefix, b.length - suffix);
-  const ops = oldMid.length * newMid.length > MAX_DIFF_CELLS ? lcsOps(oldMid, []).concat(lcsOps([], newMid)) : lcsOps(oldMid, newMid);
+  const ops = lcsOps(oldMid, newMid);
   const apply = (): void => {
     // `line`: the next old line; `pos`: where it starts now (or the end of the text, past the last one).
     let line = prefix;

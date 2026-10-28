@@ -69,7 +69,7 @@ interface Known extends FileStat {
 
 export interface RoomFolderState {
   known: Record<string, Known>;
-  /** Recent saves of notes made here outside the editor (see RoomReplica.recentSaves), so a clash is noticed after a restart too. */
+  /** Saves of notes made here outside the editor, as stored here before 0.3.2 (now apart, see RoomFolderOptions.saveSaves). */
   saves?: unknown;
 }
 
@@ -90,6 +90,12 @@ export interface RoomFolderOptions {
   passed?(): void;
   loadState(): Promise<RoomFolderState | null>;
   saveState(state: RoomFolderState): Promise<void>;
+  /**
+   * Recent saves of notes made here outside the editor (see RoomReplica.recentSaves), so a clash is noticed after a
+   * restart too. Stored apart from the state: they change seldom.
+   */
+  loadSaves(): Promise<unknown>;
+  saveSaves(saves: unknown): Promise<void>;
   notify(message: string): void;
   log(message: string): void;
   now?: () => Date;
@@ -164,6 +170,12 @@ export class RoomFolder {
   private ready = false;
   private readOnlyNoticeAt = 0;
   private stopped = false;
+  /** Clash copies to keep, by file id (see noteClashed): written by the next pass, before the note itself. */
+  private toKeep = new Map<string, string[]>();
+  /** What RoomReplica.savesChanged was when the saves were last stored. */
+  private savesStored = -1;
+  /** The stored saves couldn't be read when the folder started: read again before they are stored, never written over. */
+  private savesUnread = false;
 
   constructor(private readonly o: RoomFolderOptions) {
     if (safeRoomPath(o.folder) === null) throw new Error(`"${o.folder}" can't hold a room.`);
@@ -253,7 +265,13 @@ export class RoomFolder {
         throw error;
       }
       for (const [id, known] of Object.entries(saved?.known ?? {})) this.known.set(id, known);
+      // Stored with the state before 0.3.2, apart since. Saves that can't be read only miss a clash, never lose anything.
       this.o.replica.restoreSaves(saved?.saves);
+      try {
+        this.o.replica.restoreSaves(await this.o.loadSaves());
+      } catch {
+        this.savesUnread = true;
+      }
       this.started = true;
       await this.adoptLocalFiles();
       await this.materializeNow();
@@ -313,16 +331,36 @@ export class RoomFolder {
 
   /**
    * A save of a note made here outside the editor and someone else's, made at the same moment, changed the same line,
-   * and the other's was kept (see RoomReplica): `version`, the note as it was here, is kept as a copy. Whether or not
-   * the note is open in an editor, so the version saved here is never lost.
+   * and the other's was kept, or text typed here went into a line such a save replaced (see RoomReplica): `version`, the
+   * note as it was here, is kept as a copy by the next pass, whether or not the note is open in an editor, and the
+   * replica told then (RoomReplica.copyKept). What gave way is taken out of the note only once the copy is written, so
+   * the version made here is never lost; a copy that can't be written yet is tried again by every pass.
    */
   noteClashed(fileId: string, version: string): boolean {
     if (this.stopped) return false;
-    void this.run(async () => {
-      const entry = this.o.replica.files().get(fileId);
-      if (entry?.kind === "md" && !entry.deleted) await this.keepAside(entry.path, version);
-    });
-    return true;
+    const versions = this.toKeep.get(fileId) ?? [];
+    if (!versions.includes(version)) this.toKeep.set(fileId, [...versions, version]);
+    this.remoteChanged();
+    return false;
+  }
+
+  /** Clash copies asked for (see noteClashed) are written, and the replica told, so what gave way can go. */
+  private async keepClashCopies(): Promise<void> {
+    for (const [id, versions] of [...this.toKeep]) {
+      const entry = this.o.replica.entries().get(id);
+      // One this folder doesn't write (not in the index here yet, or under a name it doesn't share, which a copy would
+      // keep) waits, both lines staying in the note; a note deleted meanwhile needs no copy.
+      if (!entry || (!entry.deleted && (entry.kind !== "md" || !this.writesHere(entry.path)))) continue;
+      for (const version of versions) {
+        await this.safely(entry.path, async () => {
+          if (!entry.deleted) await this.keepAside(entry.path, version);
+          const left = (this.toKeep.get(id) ?? []).filter((one) => one !== version);
+          if (left.length > 0) this.toKeep.set(id, left);
+          else this.toKeep.delete(id);
+          this.o.replica.copyKept(id, version);
+        });
+      }
+    }
   }
 
   /** Whether a note's local version is held back (couldn't be shared): the editor shouldn't be bound to it. */
@@ -351,7 +389,28 @@ export class RoomFolder {
       const known = this.known.get(id);
       if (known) delete known.unstored;
     }
-    await this.o.saveState({ known: Object.fromEntries(this.known), saves: this.o.replica.recentSaves() });
+    await this.o.saveState({ known: Object.fromEntries(this.known) });
+    await this.storeSaves();
+  }
+
+  /**
+   * The saves (see RoomReplica.recentSaves), stored apart and only when they changed; never over stored ones that
+   * couldn't be read (they are read first). Saves not stored only miss a clash after a restart: a failure here never
+   * stops the state being stored.
+   */
+  private async storeSaves(): Promise<void> {
+    try {
+      if (this.savesUnread) {
+        this.o.replica.restoreSaves(await this.o.loadSaves());
+        this.savesUnread = false;
+      }
+      const saves = this.o.replica.savesChanged;
+      if (saves === this.savesStored) return;
+      await this.o.saveSaves(this.o.replica.recentSaves());
+      this.savesStored = saves;
+    } catch (error) {
+      this.o.log(`room folder, saves: ${(error as Error).message}`);
+    }
   }
 
   /**
@@ -470,7 +529,7 @@ export class RoomFolder {
   private desired(): Map<string, FileEntry> {
     const groups = new Map<string, Array<[string, FileEntry]>>();
     for (const [id, entry] of this.o.replica.files()) {
-      if (!isShareable(entry.path) || this.o.inOtherRoom?.(this.vaultPath(entry.path))) continue;
+      if (!this.writesHere(entry.path)) continue;
       const key = pathKey(entry.path);
       groups.set(key, [...(groups.get(key) ?? []), [id, entry]]);
     }
@@ -495,8 +554,15 @@ export class RoomFolder {
     return out;
   }
 
+  /** Whether this folder writes a file at a room path: one of a type rooms share, not in another room's folder. */
+  private writesHere(relative: string): boolean {
+    return isShareable(relative) && !this.o.inOtherRoom?.(this.vaultPath(relative));
+  }
+
   private async materializeNow(): Promise<void> {
     if (this.stopped || !this.started) return;
+    // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
+    await this.keepClashCopies();
     const replica = this.o.replica;
     const desired = this.desired();
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
@@ -571,21 +637,24 @@ export class RoomFolder {
     if (entry.kind === "md" && this.o.isBound(id)) return;
     // A local version that couldn't be shared stays as it is, never written over (see holdBack).
     if (this.heldBack.has(id)) return;
+    // Left from a session that may have ended before what it made was stored: proven only by a matching shared copy.
+    const doubtful = this.doubtful(id);
+    /** The file is as it was when last synced (by its size and time). */
+    const unchanged = (stat: FileStat | null) => stat !== null && !doubtful && known?.path === entry.path && known.size === stat.size && known.mtime === stat.mtime;
     let remote: string | Uint8Array | null;
     if (entry.kind === "md") {
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
       if (!replica.isComplete(id) || replica.hasUnsent(id)) return;
       remote = normalizeNote(replica.noteText(id));
+      // A clash copy to keep first (asked for as the note loaded, maybe): never written with both lines meanwhile.
+      if (this.toKeep.has(id)) return;
     } else {
       // The same version as last synced, and the file untouched since: nothing to read (attachments can be large).
-      const now = this.o.vault.stat(path);
-      if (known && !this.doubtful(id) && known.path === entry.path && known.blob === entry.blob?.id && now && known.size === now.size && known.mtime === now.mtime) return;
+      if (known?.blob === entry.blob?.id && unchanged(this.o.vault.stat(path))) return;
       remote = entry.blob ? await replica.readBlob(entry.blob) : null;
     }
     if (remote === null) return; // the attachment hasn't arrived yet
     const remoteHash = sha(remote);
-    // Left from a session that may have ended before what it made was stored: proven only by a matching shared copy.
-    const doubtful = this.doubtful(id);
     const stat = this.o.vault.stat(path);
     if (!stat) {
       const variant = this.untrackedCaseVariant(entry.path);
@@ -595,7 +664,7 @@ export class RoomFolder {
       }
       return this.write(id, entry, remote, remoteHash);
     }
-    const unchangedHere = known !== undefined && !doubtful && known.path === entry.path && known.size === stat.size && known.mtime === stat.mtime;
+    const unchangedHere = known !== undefined && unchanged(stat);
     if (unchangedHere) {
       if (remoteHash === known.hash) {
         // The same bytes in another blob (a writer passing on someone else's file, say): remembered, so it isn't read again.

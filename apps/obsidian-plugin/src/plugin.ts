@@ -439,6 +439,8 @@ export default class VaultRoomsPlugin extends Plugin {
       },
       loadState: () => svc.disk.loadRoomState<RoomFolderState>(roomId),
       saveState: (state) => svc.disk.saveRoomState(roomId, state),
+      loadSaves: () => svc.disk.loadRoomState(roomId, ".saves"),
+      saveSaves: (saves) => svc.disk.saveRoomState(roomId, saves, ".saves"),
       notify: (message) => new Notice(message, 8000),
       log: (message) => console.debug(`Vault Rooms: ${message}`)
     });
