@@ -85,6 +85,7 @@ describe("TLS transport", () => {
     const w = await world();
     // Ana's device goes away; meanwhile Ben joins (through someone else). Ana's device comes back with the old record.
     const a = await peer(w.chain, w.ana, w.tlsA);
+    a.node.publish(sealUpdate({ ws: w.ws, room: w.roomId, n: 1, key: w.key, author: w.ana.sign }, INDEX_DOC, 1, utf8("from Ana, while away")));
     const tlsB = await createTlsIdentity();
     const { joiner: ben } = invite(w.chain, w.ana, { userName: "Ben", tls: tlsB.fingerprint, rooms: { [w.roomId]: "write" } });
     // And a lot more happens meanwhile: what Ana's device lacks is far more than a frame before membership may hold.
@@ -95,7 +96,30 @@ describe("TLS transport", () => {
     await until(() => a.node.connectedDevices().includes(ben.id) && b.node.connectedDevices().includes(w.ana.id));
     expect(a.node.effective().devices[ben.id]).toBeDefined();
     b.node.publish(sealUpdate({ ws: w.ws, room: w.roomId, n: 1, key: w.key, author: ben.sign }, INDEX_DOC, 1, utf8("from Ben")));
-    await until(() => a.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
+    // Each gets what the other wrote: Ben's device what Ana's wrote while away too.
+    await until(() => a.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 2 && b.node.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 2);
+  });
+
+  it("turns away a computer that was revoked, at once, and never dials a port that can't be", async () => {
+    const w = await world();
+    const before = WorkspaceChain.load(w.chain.all());
+    step(w.chain, w.ana, (state) => void (state.devices[w.cy.id]!.revoked = true));
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    const reasons: string[] = [];
+    const server = new PeerServer(a.config, () => reasons.push("accepted!"), (reason) => reasons.push(reason));
+    const port = await server.listen(0, "127.0.0.1");
+    cleanups.push(() => server.close());
+    // Cy's computer doesn't know it was revoked yet.
+    const cy: TransportConfig = { workspaceId: w.ws, deviceId: w.cy.id, deviceKey: w.cy.sign, tls: w.tlsC, membership: () => before.state };
+    await expect(dial(cy, "127.0.0.1", port, { device: w.ana.id, fingerprint: w.tlsA.fingerprint })).rejects.toThrow();
+    await until(() => reasons.length > 0);
+    expect(reasons).toEqual(["revoked"]);
+    await expect(dial(a.config, "127.0.0.1", 99999)).rejects.toThrow("bad_port");
+    // An address with such a port, told of a member, isn't taken.
+    const other = await world();
+    const o = await peer(other.chain, other.ana, other.tlsA);
+    o.manager.heard([[other.cy.id, "127.0.0.1:99999"]]);
+    expect(o.manager.addressBook().some(([device]) => device === other.cy.id)).toBe(false);
   });
 
   it("keeps the others connected when the device that brought them together goes away", async () => {

@@ -147,7 +147,8 @@ export class PeerManager {
       if (!Array.isArray(item) || typeof item[0] !== "string" || typeof item[1] !== "string" || !PEER_PATTERN.test(item[1])) continue;
       const [device, address] = item as [string, string];
       const at = address.lastIndexOf(":");
-      if (activeDevice(members, device)) this.candidate(device, address.slice(0, at).replace(/^\[|\]$/g, ""), Number(address.slice(at + 1)));
+      const port = Number(address.slice(at + 1));
+      if (port >= 1 && port <= 65535 && activeDevice(members, device)) this.candidate(device, address.slice(0, at).replace(/^\[|\]$/g, ""), port);
     }
   }
 

@@ -216,6 +216,10 @@ describe("mesh", () => {
     const session = a.connect({ send: () => {}, close: () => {} }, stranger.id);
     // A made-up join for an invite nobody issued: refused, and not kept for later.
     const fake = createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Eve" }, deviceName: "Eve", deviceKey: stranger.sign, agreementPublicKey: stranger.agree.publicKey, tlsFingerprint: stranger.tls });
+    // Nor are other joins it passes on.
+    const other = founder().admin;
+    session.receive({ t: "joins", joins: [createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Mal" }, deviceName: "Mal", deviceKey: other.sign, agreementPublicKey: other.agree.publicKey, tlsFingerprint: other.tls })] });
+    expect(a.joinEntries()).toEqual([]);
     session.receive({ t: "join", join: fake });
     expect(session.isClosed).toBe(true);
     expect(a.joinEntries()).toEqual([]);
@@ -548,14 +552,39 @@ describe("mesh", () => {
     for (let i = 0; i < 90; i++) createRoom(chain, ana, `Room ${i}`);
     const sent: PeerMessage[] = [];
     const a = nodeFor(chain, ana);
-    a.connect({ send: (m) => sent.push(m), close: () => {} }, cy.id).receive({ t: "hello", ws: a.workspaceId, head: -1, recent: [] });
+    const session = a.connect({ send: (m) => sent.push(m), close: () => {} }, cy.id);
+    session.receive({ t: "hello", ws: a.workspaceId, head: -1, recent: [] });
     const versions = sent.filter((m): m is Extract<PeerMessage, { t: "versions" }> => m.t === "versions");
     expect(versions.length).toBeGreaterThan(1);
     for (const m of versions) expect(JSON.stringify(m).length).toBeLessThan(1 << 20);
     expect(versions.flatMap((m) => m.versions)).toHaveLength(chain.length);
+    // A peer with versions of its own past the newest both have (a branch) gets ours in one piece, to judge it whole.
+    sent.length = 0;
+    session.receive({ t: "hello", ws: a.workspaceId, head: 50, recent: [[10, chain.hashAt(10)!], [50, "A".repeat(43)]] });
+    expect(sent.filter((m) => m.t === "versions")).toHaveLength(1);
   });
 
-  it("says nothing to a device that isn't a member until it presents a join", () => {
+  it("takes from a device that isn't a member here only versions that extend its record, and lets it go on anything else", () => {
+    const { chain, ana, ben } = setup();
+    // A branch made elsewhere, next to ours, that would win against it (it revokes a device).
+    const theirs = WorkspaceChain.load(chain.all());
+    step(theirs, ana, (state) => void (state.devices[ben.id]!.revoked = true));
+    step(chain, ana, (state) => void (state.name = "Ours"));
+    const check = WorkspaceChain.load(chain.all());
+    expect(check.offer(theirs.since(theirs.head.body.v)).status).toBe("replaced");
+    const a = nodeFor(chain, ana);
+    const sent: PeerMessage[] = [];
+    const session = a.connect({ send: (m) => sent.push(m), close: () => {} }, founder().admin.id);
+    // It holds our record up to where the branches part: it hears our hello, then sends its branch.
+    const base = theirs.head.body.v - 1;
+    session.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
+    expect(sent.map((m) => m.t)).toEqual(["hello"]);
+    session.receive({ t: "versions", versions: theirs.since(base + 1) });
+    expect(session.isClosed).toBe(true);
+    expect(a.chain.state.name).toBe("Ours");
+  });
+
+  it("says nothing to a device that isn't a member until it presents a join, even if it knows the workspace", () => {
     const { chain, ana } = setup();
     const stranger = founder().admin;
     const sent: PeerMessage[] = [];
@@ -564,7 +593,10 @@ describe("mesh", () => {
     expect(sent).toEqual([]);
     session.receive({ t: "hello", ws: a.workspaceId, head: 0, recent: [] });
     expect(session.isClosed).toBe(true);
+    // Knowing the workspace id (the first version's hash) proves nothing either.
+    const again = a.connect({ send: (m) => sent.push(m), close: () => {} }, stranger.id);
+    again.receive({ t: "hello", ws: a.workspaceId, head: 0, recent: [[0, chain.hashAt(0)!]] });
+    expect(again.isClosed).toBe(true);
     expect(sent).toEqual([]);
-    expect(randomId("r")).toBeTruthy();
   });
 });
