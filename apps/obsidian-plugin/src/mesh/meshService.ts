@@ -768,9 +768,13 @@ export class MeshService {
     try {
       this.syncReplicas();
       this.ensureWraps();
-      await this.rotateWhereNeeded();
-      await this.recordJoins();
-      await this.withdrawExpiredInvites();
+      // Changes to the record wait until it has been compared with a member's since this device started: made on an
+      // old record (an invite used meanwhile, say), they would only start a branch of their own.
+      if (this.node.recordCompared) {
+        await this.rotateWhereNeeded();
+        await this.recordJoins();
+        await this.withdrawExpiredInvites();
+      }
       this.collectBlobs();
       this.passOnOldWork();
     } catch (error) {

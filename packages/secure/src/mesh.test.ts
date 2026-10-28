@@ -216,9 +216,11 @@ describe("mesh", () => {
     const session = a.connect({ send: () => {}, close: () => {} }, stranger.id);
     // A made-up join for an invite nobody issued: refused, and not kept for later.
     const fake = createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Eve" }, deviceName: "Eve", deviceKey: stranger.sign, agreementPublicKey: stranger.agree.publicKey, tlsFingerprint: stranger.tls });
-    // Nor are other joins it passes on.
+    // Nor are other joins it passes on, and the session ends.
     const other = founder().admin;
-    session.receive({ t: "joins", joins: [createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Mal" }, deviceName: "Mal", deviceKey: other.sign, agreementPublicKey: other.agree.publicKey, tlsFingerprint: other.tls })] });
+    const passing = a.connect({ send: () => {}, close: () => {} }, other.id);
+    passing.receive({ t: "joins", joins: [createJoinRecord({ workspaceId: ws, inviteId: randomId("i"), secret: randomBytes(32), user: { id: randomId("u"), name: "Mal" }, deviceName: "Mal", deviceKey: other.sign, agreementPublicKey: other.agree.publicKey, tlsFingerprint: other.tls })] });
+    expect(passing.isClosed).toBe(true);
     expect(a.joinEntries()).toEqual([]);
     session.receive({ t: "join", join: fake });
     expect(session.isClosed).toBe(true);
@@ -558,10 +560,28 @@ describe("mesh", () => {
     expect(versions.length).toBeGreaterThan(1);
     for (const m of versions) expect(JSON.stringify(m).length).toBeLessThan(1 << 20);
     expect(versions.flatMap((m) => m.versions)).toHaveLength(chain.length);
-    // A peer with versions of its own past the newest both have (a branch) gets ours in one piece, to judge it whole.
-    sent.length = 0;
-    session.receive({ t: "hello", ws: a.workspaceId, head: 50, recent: [[10, chain.hashAt(10)!], [50, "A".repeat(43)]] });
-    expect(sent.filter((m) => m.t === "versions")).toHaveLength(1);
+  });
+
+  it("judges a branch that comes in batches as a whole, once the answer is over", () => {
+    const { chain, ana, ben, cy } = setup();
+    step(chain, ana, (state) => void (state.users[cy.userId]!.admin = true));
+    // Theirs: a change of Ana's, a revocation, and a change of Cy's; ours: the revocation alone. The first batch alone
+    // would lose; the whole branch wins.
+    const theirs = WorkspaceChain.load(chain.all());
+    step(theirs, ana, (state) => void (state.name = "Theirs"));
+    step(theirs, ana, (state) => void (state.devices[ben.id]!.revoked = true));
+    step(theirs, cy, (state) => void (state.name = "Theirs, by Cy"));
+    step(chain, ana, (state) => void (state.devices[ben.id]!.revoked = true));
+    const branch = theirs.since(theirs.head.body.v - 2);
+    expect(WorkspaceChain.load(chain.all()).offer(branch.slice(0, 1)).status).toBe("rejected");
+    expect(WorkspaceChain.load(chain.all()).offer(branch).status).toBe("replaced");
+    const a = nodeFor(chain, ana);
+    const session = a.connect({ send: () => {}, close: () => {} }, cy.id);
+    session.receive({ t: "versions", versions: branch.slice(0, 1) });
+    session.receive({ t: "versions", versions: branch.slice(1) });
+    expect(a.chain.state.name).not.toBe("Theirs, by Cy");
+    session.receive({ t: "digests", rooms: {} });
+    expect(a.chain.state.name).toBe("Theirs, by Cy");
   });
 
   it("takes from a device that isn't a member here only versions that extend its record, and lets it go on anything else", () => {
@@ -580,8 +600,17 @@ describe("mesh", () => {
     session.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
     expect(sent.map((m) => m.t)).toEqual(["hello"]);
     session.receive({ t: "versions", versions: theirs.since(base + 1) });
+    session.receive({ t: "digests", rooms: {} });
     expect(session.isClosed).toBe(true);
     expect(a.chain.state.name).toBe("Ours");
+    // Versions without a hello first, or with the first version of all among them, end the session too.
+    const unasked = a.connect({ send: () => {}, close: () => {} }, founder().admin.id);
+    unasked.receive({ t: "versions", versions: chain.since(chain.head.body.v) });
+    expect(unasked.isClosed).toBe(true);
+    const first = a.connect({ send: () => {}, close: () => {} }, founder().admin.id);
+    first.receive({ t: "hello", ws: a.workspaceId, head: base, recent: [[base, theirs.hashAt(base)!]] });
+    first.receive({ t: "versions", versions: chain.all().slice(0, 2) });
+    expect(first.isClosed).toBe(true);
   });
 
   it("says nothing to a device that isn't a member until it presents a join, even if it knows the workspace", () => {
