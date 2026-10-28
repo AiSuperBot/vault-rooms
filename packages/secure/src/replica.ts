@@ -386,7 +386,8 @@ export class RoomReplica {
   }
 
   private localUpdate(docId: DocId, update: Uint8Array): void {
-    this.localEditAt.set(docId, Date.now());
+    // Taking out what lost a clash is no work on the note here (see lastLocalEdit).
+    if (!this.clashes.takingOut) this.localEditAt.set(docId, Date.now());
     quietly(() => this.clashes.recordLocal(docId, update, this.saving));
     try {
       this.publishLocal(docId, update);

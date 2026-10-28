@@ -43,18 +43,21 @@ interface Run extends InsertedRun {
 
 /** What to take out of a note, and the copies its owner keeps first (see Clashes.settle). */
 interface Pending {
-  /** Lines that gave way: taken out with whatever went inside them since (see withInside). */
-  lines: IdRange[];
+  /**
+   * Lines that gave way, each with the lines it gave way to (`to`): taken out, with what replaced them here since and
+   * whatever went inside them, while one of those is still there (never to leave none).
+   */
+  lines: Array<{ line: IdRange; to: IdRange[] }>;
   /** Other text to take out (typed into a line a save replaced), with whatever went inside it since. */
   out: IdRange[];
   /** A line saved here gave way: the note without the lines it competed with is kept as a copy first. */
   copy: boolean;
   /** Copies to keep first. */
   versions: string[];
-  /** The lines that won: if none is left when a waiting take-out goes ahead, nothing is taken out. */
-  winners: IdRange[];
-  /** What was to be taken out when the copies were made: anything more (typed into it since) needs a copy of its own. */
+  /** What the copies hold (what was to be taken out when they were made): only that is ever taken out. */
   kept: IdRange[];
+  /** One more copy was asked for, of what went into it while it waited: only once (someone may go on typing there). */
+  extra: boolean;
 }
 
 const MAX_FILE_SAVES = 20;
@@ -379,8 +382,8 @@ function addPending(map: Map<DocId, Pending>, docId: DocId, more: Pending): void
           out: [...was.out, ...more.out],
           copy: was.copy || more.copy,
           versions: [...was.versions, ...more.versions.filter((version) => !was.versions.includes(version))],
-          winners: [...was.winners, ...more.winners],
-          kept: [...was.kept, ...more.kept]
+          kept: [...was.kept, ...more.kept],
+          extra: was.extra || more.extra
         }
       : more
   );
@@ -523,10 +526,16 @@ export class Clashes {
   private retry(docId: DocId, waiting: Pending): void {
     const text = this.host.text(docId);
     if (!text) return;
-    // The line it gave way to is gone since: it stays (never to leave none).
-    if (waiting.winners.length > 0 && !waiting.winners.some((winner) => stillThere(text, winner))) return;
-    addPending(this.takeOuts, docId, waiting);
+    // A line whose rivals are all gone since stays (never to leave none).
+    const lines = waiting.lines.filter(({ to }) => to.some((winner) => stillThere(text, winner)));
+    if (lines.length === 0 && waiting.out.length === 0) return;
+    addPending(this.takeOuts, docId, { ...waiting, lines });
     this.settle(docId);
+  }
+
+  /** A take-out of what lost a clash is being made (not a change made here by someone). */
+  get takingOut(): boolean {
+    return this.settling;
   }
 
   /**
@@ -562,10 +571,9 @@ export class Clashes {
     }
     const inTheirs = member(theirs);
     const theirIndex = indexOf(theirs);
-    const lost: InsertedRun[] = [];
+    const lost: Array<{ line: InsertedRun; to: Run[] }> = [];
     const rivals: Run[] = [];
     const beaten: Run[] = [];
-    const winners: Run[] = [];
     const saves = this.fileSaves.get(docId) ?? [];
     // How far it reaches per writer of the text it holds.
     const reach = new Map<number, number>();
@@ -585,20 +593,19 @@ export class Clashes {
         const loses = lower.length > 0;
         // The lines a line of ours lost to count against the copy only if that clash isn't settled yet (see below).
         for (const other of others) if (!(loses ? beaten : rivals).some((r) => Y.compareIDs(r, other))) (loses ? beaten : rivals).push(other);
-        if (!loses || lost.some((l) => Y.compareIDs(l, run))) continue;
-        lost.push(run);
-        for (const winner of lower) winners.push(winner);
+        if (!loses || lost.some(({ line }) => Y.compareIDs(line, run))) continue;
+        lost.push({ line: run, to: lower });
       }
     }
     this.noteRivals(docId, rivals);
     // A line already waiting to be taken out (for its copy) is that clash, found again: it is settled with it.
     const waiting = this.waitingTakeOuts.get(docId)?.lines ?? [];
-    const losing = lost.filter((run) => !waiting.some((line) => Y.compareIDs(line, run)));
+    const losing = lost.filter(({ line }) => !waiting.some((one) => Y.compareIDs(one.line, line)));
     if (losing.length === 0) return;
     // A losing line goes with whatever went inside it (what was put in front of it since may be a line of its own).
-    if (spansOf(text, withInside(text, this.withReplacements(docId, losing), true)).length === 0) return; // settled before
+    if (spansOf(text, withInside(text, this.withReplacements(docId, losing.map(({ line }) => line)), true)).length === 0) return; // settled before
     this.noteRivals(docId, beaten);
-    this.takeOut(docId, { lines: losing, out: [], copy: true, versions: [], winners, kept: [] });
+    this.takeOut(docId, { lines: losing, out: [], copy: true, versions: [], kept: [], extra: false });
   }
 
   /** `lines` saved here, and those this computer put in place of one of them later (with a save that took it out). */
@@ -675,7 +682,8 @@ export class Clashes {
   takeOutTyped(docId: DocId, found: { version: string; strays: IdRange[] }): void {
     const text = this.host.text(docId);
     if (!text) return;
-    this.takeOut(docId, { lines: [], out: found.strays, copy: false, versions: found.version === textWithout(text, found.strays) ? [] : [found.version], winners: [], kept: [] });
+    // Its copy, the note as it was before that update, holds all of it.
+    this.takeOut(docId, { lines: [], out: found.strays, copy: false, versions: found.version === textWithout(text, found.strays) ? [] : [found.version], kept: found.strays, extra: false });
   }
 
   /**
@@ -690,22 +698,28 @@ export class Clashes {
     const rivals = this.rivals.get(docId) ?? [];
     this.rivals.delete(docId);
     // With what replaced it here since, and whatever went inside it.
-    const out = [...withInside(text, this.withReplacements(docId, pending.lines), true), ...withInside(text, pending.out, false)];
+    const out = [...withInside(text, this.withReplacements(docId, pending.lines.map(({ line }) => line)), true), ...withInside(text, pending.out, false)];
     const versions = [...pending.versions];
+    let { kept, extra } = pending;
     if (pending.copy) {
       const version = textWithout(text, withInside(text, rivals, true, true));
       if (version !== textWithout(text, out)) versions.push(version);
-    } else if (pending.kept.length > 0 && textWithout(text, out) !== textWithout(text, overlap(out, indexOf(pending.kept)))) {
-      // Something went into what gives way while it waited for its copy, which doesn't hold it: one more copy keeps it.
-      versions.push(textWithout(text, withInside(text, pending.winners, true, true)));
+      kept = out;
+    } else if (!extra && textWithout(text, out) !== textWithout(text, overlap(out, indexOf(kept)))) {
+      // Something went into what gives way while it waited for its copy, which doesn't hold it: one more copy keeps it,
+      // once; what goes in after that stays in the note.
+      versions.push(textWithout(text, withInside(text, pending.lines.flatMap(({ to }) => to), true, true)));
+      kept = out;
+      extra = true;
     }
     // Copies the owner keeps now go; it tells of the others when they are kept (see copyKept), and the rest waits.
     const waiting = versions.filter((version) => this.host.clash(docId, version) === false);
     if (waiting.length > 0 || !this.host.mayEdit()) {
-      addPending(this.waitingTakeOuts, docId, { ...pending, copy: false, versions: waiting, kept: out });
+      addPending(this.waitingTakeOuts, docId, { ...pending, copy: false, versions: waiting, kept, extra });
       return;
     }
-    const spans = spansOf(text, out);
+    // Only what the copies hold.
+    const spans = spansOf(text, overlap(out, indexOf(kept)));
     if (spans.length === 0) return;
     // Marked while it runs: a refused edit rebuilds the note, which must not find the same clash and try again.
     this.unsettled.add(docId);

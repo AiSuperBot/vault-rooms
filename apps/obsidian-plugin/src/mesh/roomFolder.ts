@@ -348,12 +348,17 @@ export class RoomFolder {
   private async keepClashCopies(): Promise<void> {
     for (const [id, versions] of [...this.toKeep]) {
       const entry = this.o.replica.entries().get(id);
+      // A note deleted meanwhile needs no copy, and nothing is taken out of it (asked again if it comes back).
+      if (entry?.deleted) {
+        this.toKeep.delete(id);
+        continue;
+      }
       // One this folder doesn't write (not in the index here yet, or under a name it doesn't share, which a copy would
-      // keep) waits, both lines staying in the note; a note deleted meanwhile needs no copy.
-      if (!entry || (!entry.deleted && (entry.kind !== "md" || !this.writesHere(entry.path)))) continue;
+      // keep) waits, both lines staying in the note.
+      if (entry?.kind !== "md" || !this.writesHere(entry.path)) continue;
       for (const version of versions) {
         await this.safely(entry.path, async () => {
-          if (!entry.deleted) await this.keepAside(entry.path, version);
+          await this.keepAside(entry.path, version);
           const left = (this.toKeep.get(id) ?? []).filter((one) => one !== version);
           if (left.length > 0) this.toKeep.set(id, left);
           else this.toKeep.delete(id);
