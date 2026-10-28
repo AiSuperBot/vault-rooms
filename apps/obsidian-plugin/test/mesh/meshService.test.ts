@@ -235,6 +235,8 @@ describe("mesh service", () => {
     (again as unknown as { lastAutomate: number }).lastAutomate = Date.now() - 300_000;
     await (again as unknown as { automate(): Promise<void> }).automate();
     expect(again.node.recordCompared).toBe(false);
+    // Asked again, Ben's computer answers.
+    await until(() => again.node.recordCompared);
   }, 60_000);
 
   it("never goes online once stopped", async () => {
