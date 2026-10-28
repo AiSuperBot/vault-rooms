@@ -268,8 +268,9 @@ describe("room replica", () => {
   async function clashing(apart?: (a: Member, c: Member, fileId: string) => void) {
     const s = setup();
     const keep = { now: false };
+    const asked: string[] = [];
     const copies: string[] = [];
-    const clash = (_doc: string, version: string) => keep.now && copies.push(version) > 0;
+    const clash = (_doc: string, version: string) => asked.push(version) > 0 && keep.now && copies.push(version) > 0;
     const a = s.member(s.ana, { clash });
     const c = s.member(s.cy, { clash });
     for (const device of [s.ana, s.cy]) s.wrapFor(device);
@@ -295,7 +296,7 @@ describe("room replica", () => {
     await quiet(s);
     const [winner, loser] = a.replica.noteDoc(fileId).clientID < c.replica.noteDoc(fileId).clientID ? [a, c] : [c, a];
     const dues = (m: Member) => m.replica.noteText(fileId).split("\n").filter((line) => line.startsWith("due"));
-    return { s, a, c, fileId, winner, loser, keep, copies, save, dues };
+    return { s, a, c, fileId, winner, loser, keep, asked, copies, save, dues };
   }
 
   it("leaves a clash in the note while nobody can keep the copy, and settles it when the saves are restored", async () => {
@@ -373,6 +374,85 @@ describe("room replica", () => {
     expect(a.replica.noteText(fileId)).toBe(`${winner === a ? "due: 2" : "due: 3"}\nbody\n`);
     expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
     expect(copies).toContain("due: 4\nbody\n");
+  });
+
+  it("keeps at most one more copy of what goes into a losing line while it waits, and leaves the rest in the note", async () => {
+    const { s, a, c, fileId, winner, loser, asked } = await clashing();
+    expect(asked).toHaveLength(1);
+    const losing = loser === a ? "due: 2" : "due: 3";
+    const type = (what: string) => {
+      const text = winner.replica.noteDoc(fileId).getText("content");
+      text.insert(text.toString().indexOf(losing) + losing.length, what);
+      s.net.pump();
+    };
+    // Someone goes on typing into the losing line while its copies are being written.
+    type("x");
+    loser.replica.copyKept(fileId, asked[0]!);
+    await quiet(s);
+    expect(asked).toHaveLength(2);
+    type("y");
+    loser.replica.copyKept(fileId, asked[1]!);
+    await quiet(s);
+    // No third copy: the line goes with what the copies hold, and the "y" typed after stays.
+    expect(asked).toHaveLength(2);
+    expect(asked[1]).toContain(`${losing}x\n`);
+    expect(a.replica.noteText(fileId).replace("y", "")).toBe(`${winner === a ? "due: 2" : "due: 3"}\nbody\n`);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+  });
+
+  it("doesn't count taking out what lost a clash as work on the note here", async () => {
+    const { s, fileId, loser, keep, dues } = await clashing();
+    const before = loser.replica.lastLocalEdit(fileId);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    keep.now = true;
+    loser.replica.retryTakeOuts();
+    await quiet(s);
+    expect(dues(loser)).toHaveLength(1);
+    expect(loser.replica.lastLocalEdit(fileId)).toBe(before);
+  });
+
+  it("takes out of two losing lines only the one whose rival is still there", async () => {
+    const s = setup();
+    let keep = false;
+    const clash = () => keep;
+    const a = s.member(s.ana, { clash });
+    const c = s.member(s.cy, { clash });
+    for (const device of [s.ana, s.cy]) s.wrapFor(device);
+    a.replica.refreshKeys();
+    let link = s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Task.md", "due: 1\nstatus: x\nbody\n");
+    s.net.pump();
+    c.replica.noteText(fileId);
+    link.cut();
+    // Each computer's plugin rewrites both lines at once.
+    const save = (m: Member, due: string, status: string) =>
+      m.replica.edit(fileId, (doc) => {
+        const text = doc.getText("content");
+        for (const [from, to] of [["due: 1\n", due], ["status: x\n", status]] as const) {
+          const at = text.toString().indexOf(from);
+          text.insert(at, to);
+          text.delete(at + to.length, from.length);
+        }
+      }, true);
+    save(a, "due: 2\n", "status: ana\n");
+    save(c, "due: 3\n", "status: cy\n");
+    link = s.net.link(a.node, c.node);
+    await quiet(s);
+    // Both lines of the computer that gives way wait for its copy; meanwhile someone deletes the winning "due" line.
+    const [winner, loser] = a.replica.noteDoc(fileId).clientID < c.replica.noteDoc(fileId).clientID ? [a, c] : [c, a];
+    const due = winner === a ? "due: 2\n" : "due: 3\n";
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.delete(text.toString().indexOf(due), due.length);
+    s.net.pump();
+    keep = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    // The losing "due" line stays (nothing is left of its rival), the losing "status" line goes.
+    const [loserDue, winnerStatus] = loser === a ? ["due: 2", "status: cy"] : ["due: 3", "status: ana"];
+    expect(a.replica.noteText(fileId)).toBe(`${loserDue}\n${winnerStatus}\nbody\n`);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
   });
 
   it("doesn't ask for a second copy of a waiting clash it finds again", async () => {
