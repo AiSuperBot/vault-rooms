@@ -148,8 +148,8 @@ export class MeshNode {
   addressBook: () => Array<[string, string]> = () => [];
   /** Addresses a peer told of, in form only: whoever answers there is checked when dialled. */
   onAddresses: (items: Array<[string, string]>) => void = () => {};
-  /** No other device of the workspace was active when this node started (see recordCompared). */
-  private readonly alone: boolean;
+  /** The record listed no other active device when this node started, and it hasn't been away since (see recompare). */
+  private alone: boolean;
   /** When a member last answered our hello, and since when an answer counts (see recompare). */
   private answeredAt = 0;
   private answersSince = 0;
@@ -167,7 +167,7 @@ export class MeshNode {
     this.store.isMember = (room) => this.isMemberOf(room);
     this.store.now = now;
     this.memberRooms = this.currentMemberRooms();
-    this.alone = !Object.keys(chain.state.devices).some((id) => id !== deviceId && activeDevice(chain.state, id));
+    this.alone = !this.othersActive();
   }
 
   get workspaceId(): string {
@@ -175,22 +175,31 @@ export class MeshNode {
   }
 
   /**
-   * The record has been compared with a member's: one answered our hello since this node started, or since recompare
-   * (a joining device's doesn't count: it only has what we gave it), or no other device was active when it started.
-   * Until then, changes the device would make to the record on its own (see MeshService.automate) wait: made on an old
-   * record (after a time away), they would only start a branch.
+   * The record has been compared with a member's: a device the signed record lists answered our hello since this node
+   * started, or since recompare (a device joining through us doesn't count: it only has what we gave it). Or there is no
+   * one to compare with: the record lists no other active device, or listed none when this node started (the devices
+   * listed since joined through this one) and it hasn't been away since. Until then, changes the device would make to
+   * the record on its own (see MeshService.automate) wait: made on an old record, they would only start a branch.
    */
   get recordCompared(): boolean {
-    return this.alone || this.answeredAt > this.answersSince;
+    return this.answeredAt > this.answersSince || this.alone || !this.othersActive();
   }
 
-  /** Only an answer from now on counts (see recordCompared): this device may have been away (asleep, say). */
+  private othersActive(): boolean {
+    const state = this.chain.state;
+    return Object.keys(state.devices).some((id) => id !== this.deviceId && activeDevice(state, id));
+  }
+
+  /** Only answers from now on count (see recordCompared), and every peer is asked again: this device may have been away. */
   recompare(): void {
+    this.alone = false;
     this.answersSince = this.now();
+    for (const session of this.sessions) session.askAgain();
   }
 
-  /** @internal A member answered our hello. */
-  noteAnswer(): void {
+  /** @internal `from` answered our hello. */
+  noteAnswer(from: string): void {
+    if (!activeDevice(this.chain.state, from)) return;
     const was = this.recordCompared;
     this.answeredAt = Math.max(this.now(), this.answersSince + 1);
     if (!was) this.events.compared?.();
@@ -567,6 +576,13 @@ export class PeerSession {
     if (early) this.onHello(early);
   }
 
+  /** @internal Ask again where the other side's record stands: its answer counts anew (see MeshNode.recompare). */
+  askAgain(): void {
+    if (!this.ready) return;
+    this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+    this.awaiting = true;
+  }
+
   /** Compare rooms again (envelopes refused earlier may verify now). */
   resync(): void {
     if (this.ready) this.sendDigests();
@@ -620,7 +636,7 @@ export class PeerSession {
     // An answer to our hello always ends with digests: the records have been compared (see MeshNode.recordCompared).
     if (this.awaiting && message.t === "digests") {
       this.awaiting = false;
-      this.node.noteAnswer();
+      this.node.noteAnswer(this.remoteDevice);
     }
     if (!this.ready) return this.beforeMembership(message);
     switch (message.t) {

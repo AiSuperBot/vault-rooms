@@ -548,6 +548,43 @@ describe("mesh", () => {
     expect(outcome).toEqual([expect.stringMatching(/join_no_invite/)]);
   });
 
+  it("counts its record as compared once a device the record lists answers, or when it lists no other, and asks again after a time away", () => {
+    const { chain, ana, ben, cy } = setup();
+    // A device joining through this one (its join not recorded yet) only has the record it got here: it doesn't count.
+    const pending = invite(chain, ana, { fold: false });
+    const a = nodeFor(chain, ana);
+    expect(a.addJoin(pending.join)).toBe(true);
+    expect(a.recordCompared).toBe(false);
+    const joiner = a.connect({ send: () => {}, close: () => {} }, pending.joiner.id);
+    joiner.receive({ t: "digests", rooms: {} });
+    expect(a.recordCompared).toBe(false);
+    // A member's answer to our hello counts.
+    const sent: PeerMessage[] = [];
+    const session = a.connect({ send: (m) => sent.push(m), close: () => {} }, cy.id);
+    session.receive({ t: "digests", rooms: {} });
+    expect(a.recordCompared).toBe(true);
+    // After a time away it doesn't, until the member answers the hello it is sent again.
+    sent.length = 0;
+    a.recompare();
+    expect(a.recordCompared).toBe(false);
+    expect(sent.map((m) => m.t)).toEqual(["hello"]);
+    session.receive({ t: "digests", rooms: {} });
+    expect(a.recordCompared).toBe(true);
+    // A device whose record lists no other active device has nothing to wait for (another device's revoked, say).
+    const b = nodeFor(chain, ana);
+    expect(b.recordCompared).toBe(false);
+    for (const device of [ben, cy]) step(b.chain, ana, (state) => void (state.devices[device.id]!.revoked = true));
+    expect(b.recordCompared).toBe(true);
+    // Nor has one that was alone when it started, with only those that joined through it since; until it was away.
+    const alone = founder();
+    const c = nodeFor(alone.chain, alone.admin);
+    expect(c.recordCompared).toBe(true);
+    invite(c.chain, alone.admin, { userName: "Newcomer" });
+    expect(c.recordCompared).toBe(true);
+    c.recompare();
+    expect(c.recordCompared).toBe(false);
+  });
+
   it("takes from a device that isn't a member here only versions that extend its record, and lets it go on anything else", () => {
     const { chain, ana, ben } = setup();
     // A branch made elsewhere, next to ours, that would win against it (it revokes a device).
