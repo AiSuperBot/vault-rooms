@@ -12,8 +12,13 @@ interface Pc {
   replica: RoomReplica;
   vault: MemoryVault;
   folder: RoomFolder;
+  folderPath: string;
+  /** The room's folder is hidden (see hide): clashes reach no folder, as with the plugin. */
+  hidden: boolean;
   notices: string[];
-  saved: { state: RoomFolderState | null };
+  saved: { state: RoomFolderState | null; saves: unknown };
+  /** The stored saves can't be read, or written (a locked file, say). */
+  savesLocked?: "read" | "write";
   bound: Set<string>;
   gone: string[];
 }
@@ -25,12 +30,40 @@ function setup(raeRole: "read" | "write" = "read") {
   const { roomId, key } = createRoom(chain, ana, "Team", { [cy.userId]: "write", [rae.userId]: raeRole });
   const net = new Network();
   const pcs = new Map<string, Pc>();
+  /** A computer's room folder, on its replica. */
+  const folderOf = (pc: Pc): RoomFolder => {
+    const folder = new RoomFolder({
+      folder: pc.folderPath,
+      replica: pc.replica,
+      vault: pc.vault,
+      deviceName: pc.device.name,
+      isBound: (id) => pc.bound.has(id),
+      folderGone: () => void pc.gone.push(pc.folderPath),
+      loadState: async () => pc.saved.state,
+      saveState: async (state) => {
+        pc.saved.state = structuredClone(state);
+      },
+      loadSaves: async () => {
+        if (pc.savesLocked === "read") throw new Error("EBUSY");
+        return pc.saved.saves;
+      },
+      saveSaves: async (saves) => {
+        if (pc.savesLocked === "write") throw new Error("EBUSY");
+        pc.saved.saves = structuredClone(saves);
+      },
+      notify: (message) => pc.notices.push(message),
+      log: () => {},
+      now: () => new Date("2026-10-26T12:30:00Z")
+    });
+    pc.vault.listener = {
+      write: (path) => void folder.onLocalWrite(path),
+      delete: (path) => void folder.onLocalDelete(path),
+      rename: (from, to) => void folder.onLocalRename(from, to)
+    };
+    return folder;
+  };
   /** A computer with this room's folder. `restart`: the same computer starting again (its stored envelopes kept). */
   const make = (device: TestDevice, folderPath: string, vault = new MemoryVault(), restart?: Pc): Pc => {
-    const notices: string[] = [];
-    const saved: { state: RoomFolderState | null } = { state: restart?.saved.state ?? null };
-    const bound = new Set<string>();
-    const gone: string[] = [];
     restart?.replica.destroy();
     const node = restart?.node ?? new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
       envelope: (env) => {
@@ -43,31 +76,27 @@ function setup(raeRole: "read" | "write" = "read") {
     const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, {
       index: () => pcs.get(device.id)?.folder.remoteChanged(),
       doc: () => pcs.get(device.id)?.folder.remoteChanged(),
-      clash: (docId, version) => pcs.get(device.id)?.folder.noteClashed(docId, version)
+      clash: (docId, version) => {
+        const pc = pcs.get(device.id);
+        return pc && !pc.hidden ? pc.folder.noteClashed(docId, version) : false;
+      }
     });
-    const folder = new RoomFolder({
-      folder: folderPath,
-      replica,
-      vault,
-      deviceName: device.name,
-      isBound: (id) => bound.has(id),
-      folderGone: () => void gone.push(folderPath),
-      loadState: async () => saved.state,
-      saveState: async (state) => {
-        saved.state = structuredClone(state);
-      },
-      notify: (message) => notices.push(message),
-      log: () => {},
-      now: () => new Date("2026-10-26T12:30:00Z")
-    });
-    vault.listener = {
-      write: (path) => void folder.onLocalWrite(path),
-      delete: (path) => void folder.onLocalDelete(path),
-      rename: (from, to) => void folder.onLocalRename(from, to)
-    };
-    const pc = { device, node, replica, vault, folder, notices, saved, bound, gone };
+    const saved = { state: restart?.saved.state ?? null, saves: restart?.saved.saves ?? null };
+    const pc: Pc = { device, node, replica, vault, folderPath, hidden: false, notices: [], saved, bound: new Set(), gone: [], folder: undefined as unknown as RoomFolder };
+    pc.folder = folderOf(pc);
     pcs.set(device.id, pc);
     return pc;
+  };
+  /** Hide a computer's room folder (being moved, say): it stops, and clashes reach no folder until it is shown again. */
+  const hide = async (pc: Pc) => {
+    pc.hidden = true;
+    await pc.folder.stop();
+  };
+  /** Show it again: a new folder on the same replica. */
+  const show = async (pc: Pc) => {
+    pc.folder = folderOf(pc);
+    pc.hidden = false;
+    await pc.folder.start();
   };
   const giveKey = (from: Pc, to: TestDevice) => from.node.addWrap(wrapRoomKey(ws, roomId, 1, key, { id: to.id, agree: to.agree.publicKey }, ana.sign));
   /** Run until the network and every folder are quiet. */
@@ -77,7 +106,7 @@ function setup(raeRole: "read" | "write" = "read") {
       for (const pc of pcs.values()) await pc.folder.settled();
     }
   };
-  return { ws, ana, cy, rae, roomId, key, net, make, giveKey, settle };
+  return { ws, ana, cy, rae, roomId, key, net, make, giveKey, settle, hide, show };
 }
 
 const text = (vault: MemoryVault, path: string) => vault.text(path);
@@ -700,6 +729,8 @@ describe("room folder", () => {
       isBound: () => false,
       loadState: () => Promise.reject(new Error("locked")),
       saveState: async () => void saves++,
+      loadSaves: async () => null,
+      saveSaves: async () => void saves++,
       notify: (message) => a.notices.push(message),
       log: () => {}
     });
@@ -1197,7 +1228,7 @@ describe("room folder", () => {
     await s.settle();
     await s.settle();
     const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
-    return { notes: [a, c].map((pc) => pc.replica.noteText(id)), copies };
+    return { notes: [a, c].map((pc) => pc.replica.noteText(id)), copies, clients: [a, c].map((pc) => pc.replica.noteDoc(id).clientID) };
   }
 
   it("keeps a line added above a line a plugin rewrote at the same moment", async () => {
@@ -1233,6 +1264,202 @@ describe("room folder", () => {
     expect(notes[1]).toBe(notes[0]);
     expect(["# Log\n- one\n- from Ana\n- from Cy", "# Log\n- one\n- from Cy\n- from Ana"]).toContain(notes[0]);
     expect(copies.size).toBe(0);
+  });
+
+  it("keeps both of two lines added at the same moment to the end of a note with a final line break", async () => {
+    const { notes, copies } = await savedApart("# Log\n- one\n", ["# Log\n- one\n- from Ana\n"], ["# Log\n- one\n- from Cy\n"]);
+    expect(notes[1]).toBe(notes[0]);
+    expect(["# Log\n- one\n- from Ana\n- from Cy\n", "# Log\n- one\n- from Cy\n- from Ana\n"]).toContain(notes[0]);
+    expect(copies.size).toBe(0);
+  });
+
+  it("never leaves what was typed at the start of a line a plugin rewrote at the start of the next line", async () => {
+    // Which of the two goes first depends on random client ids: tried several times.
+    for (let round = 0; round < 8; round++) {
+      const { notes, copies, clients } = await typedApart("---\ndue: 2030-01-01\n---\n", "---\ndue: 2030-02-02\n---\n", (text) => text.insert(text.toString().indexOf("due"), "\t"));
+      expect(notes[1]).toBe(notes[0]);
+      // Yjs puts the tab first if its client id is the lower: then it stays in front of the saved line. Otherwise it
+      // would go to the start of the line after: it is taken out again, and kept in a copy.
+      if (clients[1]! < clients[0]!) {
+        expect(notes[0]).toBe("---\n\tdue: 2030-02-02\n---\n");
+        expect(copies.size).toBe(0);
+      } else {
+        expect(notes[0]).toBe("---\ndue: 2030-02-02\n---\n");
+        expect(copies).toEqual(new Set(["---\n\tdue: 2030-01-01\n---\n"]));
+      }
+    }
+  });
+
+  it("leaves text typed after the line above alone when that line is joined to a line a plugin rewrote", async () => {
+    // Which of the two goes first depends on random client ids: tried several times.
+    for (let round = 0; round < 8; round++) {
+      const { notes, copies } = await typedApart("foo\ndue: 2030-01-01\nend\n", "foo\ndue: 2030-02-02\nend\n", (text) => {
+        text.insert(3, " bar");
+        // The line break before "due" goes: the two lines are joined.
+        text.delete(7, 1);
+      });
+      expect(notes).toEqual(["foo bardue: 2030-02-02\nend\n", "foo bardue: 2030-02-02\nend\n"]);
+      expect(copies.size).toBe(0);
+    }
+  });
+
+  it("doesn't take a losing line out before its copy is written", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "due: 2030-01-09\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "due: 2030-01-12\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "due: 2030-02-03\n");
+    await c.folder.settled();
+    // No copy can be written for now (the disk is full, say).
+    for (const pc of [a, c]) pc.vault.failWrites = (path) => path.includes("(conflict");
+    s.net.link(a.node, c.node);
+    await s.settle();
+    await s.settle();
+    // Nothing gave way: both dates are still in the note, everywhere.
+    const dues = (note: string) => note.split("\n").filter((line) => line.startsWith("due"));
+    for (const pc of [a, c]) expect(dues(pc.replica.noteText(id))).toHaveLength(2);
+    // Copies can be written again: the next pass writes it, and the clash is settled.
+    for (const pc of [a, c]) {
+      pc.vault.failWrites = undefined;
+      pc.folder.remoteChanged();
+    }
+    await s.settle();
+    await s.settle();
+    const note = a.replica.noteText(id);
+    expect(c.replica.noteText(id)).toBe(note);
+    expect(dues(note)).toHaveLength(1);
+    const copies = [a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path)));
+    expect(new Set(copies)).toEqual(new Set([note.includes("01-12") ? "due: 2030-02-03\n" : "due: 2030-01-12\n"]));
+  });
+
+  it("doesn't write a note to disk while its clash copy is being written", async () => {
+    const { s, a, c } = await pair({ "Team/Task.md": "due: 1\n", "Team/Other.md": "other\n" });
+    const id = [...a.replica.files()].find(([, entry]) => entry.path === "Task.md")![0];
+    // Ana's folder is busy (reading another note, slowly) when someone else's change of the note comes in.
+    let open!: () => void;
+    const slow = new Promise<void>((resolve) => (open = resolve));
+    a.vault.gate = (path) => (path === "Team/Other.md" ? slow : undefined);
+    void a.folder.onLocalWrite("Team/Other.md");
+    await c.vault.writeText("Team/Task.md", "due: 2\n");
+    await c.folder.settled();
+    s.net.pump();
+    const done = a.folder.settled();
+    // A pass waits now; then a clash copy of the note is to be written.
+    expect(a.folder.noteClashed(id, "due: mine\n")).toBe(false);
+    const from = a.vault.written.length;
+    open();
+    await done;
+    await a.folder.settled();
+    const written = a.vault.written.slice(from).map(({ path }) => path);
+    const copy = written.findIndex((path) => path.includes("(conflict"));
+    expect(copy).toBeGreaterThanOrEqual(0);
+    expect(written.indexOf("Team/Task.md")).toBeGreaterThan(copy);
+    expect(text(a.vault, "Team/Task.md")).toBe("due: 2\n");
+  });
+
+  it("never writes a clash copy under a name the folder doesn't share", async () => {
+    const { a } = await pair({ "Team/Task.md": "due: 1\n" });
+    const id = [...a.replica.files().keys()][0]!;
+    // A writer renames the note's entry to a name that could run something, then makes it clash.
+    a.replica.editIndex((files) => files.set(id, { ...files.get(id)!, path: "Task.bat" }));
+    expect(a.folder.noteClashed(id, "@echo off\n")).toBe(false);
+    await a.folder.settled();
+    expect([...a.vault.files.keys()].filter((path) => !path.endsWith(".md"))).toEqual([]);
+  });
+
+  it("writes one copy of a clash when the room's folder is hidden and shown again while it waits", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "due: 2030-01-09\n" });
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "due: 2030-01-12\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "due: 2030-02-03\n");
+    await c.folder.settled();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    // The clash is found; before its copy is written, the folders are hidden, and shown again.
+    for (const pc of [a, c]) await s.hide(pc);
+    for (const pc of [a, c]) await s.show(pc);
+    await s.settle();
+    await s.settle();
+    for (const vault of [a.vault, c.vault]) expect([...vault.files.keys()].filter((path) => path.includes("(conflict"))).toHaveLength(1);
+    expect(text(c.vault, "Team/Task.md")).toBe(text(a.vault, "Team/Task.md"));
+  });
+
+  it("never writes a note with both lines of a clash found as it loads after a restart", async () => {
+    const { s, a, c, link } = await pair({ "Team/Task.md": "due: 2030-01-09\n" });
+    link.cut();
+    await a.vault.writeText("Team/Task.md", "due: 2030-01-12\n");
+    await a.folder.settled();
+    await c.vault.writeText("Team/Task.md", "due: 2030-02-03\n");
+    await c.folder.settled();
+    // Both stop, and start again with the other's save already in.
+    for (const pc of [a, c]) await pc.folder.stop();
+    const pcs = [s.make(s.ana, "Team", a.vault, a), s.make(s.cy, "Team", c.vault, c)];
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    const from = [a.vault.written.length, c.vault.written.length];
+    for (const pc of pcs) {
+      pc.replica.refreshKeys();
+      await pc.folder.start();
+    }
+    await s.settle();
+    await s.settle();
+    // The computer whose line gave way (the other shows both lines until it sees that) never wrote the note with both.
+    const loser = text(a.vault, "Team/Task.md")!.includes("01-12") ? 1 : 0;
+    const vault = [a.vault, c.vault][loser]!;
+    for (const { path, text: written } of vault.written.slice(from[loser])) {
+      if (path === "Team/Task.md") expect(written.split("\n").filter((line) => line.startsWith("due"))).toHaveLength(1);
+    }
+  });
+
+  it("stores what was synced even when its saves can't be read or written, and never writes the saves over", async () => {
+    const { s, a } = await pair({ "Team/Task.md": "due: 1\n" });
+    await a.vault.writeText("Team/Task.md", "due: 22\n");
+    await a.folder.settled();
+    await a.folder.stop();
+    const saves = a.saved.saves;
+    expect(Object.keys(saves as object)).toHaveLength(1);
+    // Ana's saves file can't be written for a while: what was synced is stored all the same.
+    a.savesLocked = "write";
+    const again = s.make(s.ana, "Team", a.vault, a);
+    again.savesLocked = "write";
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await again.vault.writeText("Team/Task.md", "due: 333\n");
+    await again.folder.settled();
+    await again.folder.stop();
+    expect(Object.values(again.saved.state!.known).map((known) => known.size)).toEqual([9]);
+    // Then it can't be read when Obsidian starts: the saves in it are never written over.
+    const last = s.make(s.ana, "Team", again.vault, again);
+    last.savesLocked = "read";
+    last.replica.refreshKeys();
+    await last.folder.start();
+    await last.vault.writeText("Team/Task.md", "due: 4444\n");
+    await last.folder.settled();
+    await last.folder.stop();
+    expect(last.saved.saves).toBe(saves);
+  });
+
+  it("stores the saves of notes again only when they change", async () => {
+    const { s, a, c } = await pair({ "Team/Task.md": "due: 1\n" });
+    // What was synced is stored a moment after it changes.
+    const stored = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await a.folder.settled();
+      return a.saved.saves;
+    };
+    const first = await stored();
+    expect(first).toEqual({});
+    // Someone else's change is written here: what was synced is stored again, the saves aren't.
+    await c.vault.writeText("Team/Task.md", "due: 2\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Task.md")).toBe("due: 2\n");
+    expect(await stored()).toBe(first);
+    // A save made here changes them.
+    await a.vault.writeText("Team/Task.md", "due: 3\n");
+    await s.settle();
+    expect(Object.keys((await stored()) as object)).toHaveLength(1);
   });
 
   it("still notices a clash with a save made before a restart", async () => {
@@ -1324,7 +1551,7 @@ describe("room folder", () => {
     r.replica.refreshKeys();
     await r.folder.start();
     await s.settle();
-    a.replica.passOnOldWork((author) => author === s.ana.id);
+    await a.replica.passOnOldWork(true, (author) => author === s.ana.id);
     await s.settle();
     await s.settle();
     expect(text(r.vault, "Team/Cy.md")).toBe("from Cy\n");

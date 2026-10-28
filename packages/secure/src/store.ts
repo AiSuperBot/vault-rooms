@@ -277,6 +277,12 @@ export class EnvelopeStore {
     return max;
   }
 
+  /** The authors of a document's envelopes held here (with repeats). */
+  authorsOf(room: string, doc: DocId): string[] {
+    const entry = this.docsByRoom.get(room)?.get(doc);
+    return entry ? [...entry.updates.keys(), ...[...entry.snapshots.values()].map((snapshot) => snapshot.author)] : [];
+  }
+
   /** Everything held for a document: snapshots, then updates in clock order per author. */
   envelopesOf(room: string, doc: DocId): { snapshots: SnapshotEnvelope[]; updates: UpdateEnvelope[] } {
     const entry = this.docsByRoom.get(room)?.get(doc);

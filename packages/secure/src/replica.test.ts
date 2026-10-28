@@ -254,11 +254,22 @@ describe("room replica", () => {
     expect(new Set(kept).size).toBe(1);
   });
 
-  it("leaves a clash in the note while nobody can keep the copy, and settles it when the saves are restored", async () => {
+  /** Let the network, and what waits for a microtask, run. */
+  async function quiet(s: ReturnType<typeof setup>) {
+    s.net.pump();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    s.net.pump();
+  }
+
+  /**
+   * Ana and Cy, apart, each save the first line of a note ("due: 1") whole to a value of their own (as a plugin's write
+   * is taken in, see reconcileYTextByLines), and `apart` runs then too; then they meet. Copies are kept while `keep.now`.
+   */
+  async function clashing(apart?: (a: Member, c: Member, fileId: string) => void) {
     const s = setup();
-    let keep = false;
+    const keep = { now: false };
     const copies: string[] = [];
-    const clash = (_doc: string, version: string) => (keep ? copies.push(version) > 0 : false);
+    const clash = (_doc: string, version: string) => keep.now && copies.push(version) > 0;
     const a = s.member(s.ana, { clash });
     const c = s.member(s.cy, { clash });
     for (const device of [s.ana, s.cy]) s.wrapFor(device);
@@ -270,39 +281,118 @@ describe("room replica", () => {
     s.net.pump();
     expect(c.replica.noteText(fileId)).toBe("due: 1\nbody\n");
     link.cut();
-    // Each saves the first line whole, as a plugin's write is taken in (see reconcileYTextByLines).
-    const save = (m: Member, line: string) =>
+    const save = (m: Member, from: string, to: string) =>
       m.replica.edit(fileId, (doc) => {
         const text = doc.getText("content");
-        text.insert(0, line);
-        text.delete(line.length, "due: 1\n".length);
+        const at = text.toString().indexOf(from);
+        text.insert(at, to);
+        text.delete(at + to.length, from.length);
       }, true);
-    save(a, "due: 2\n");
-    save(c, "due: 3\n");
+    save(a, "due: 1\n", "due: 2\n");
+    save(c, "due: 1\n", "due: 3\n");
+    apart?.(a, c, fileId);
     link = s.net.link(a.node, c.node);
-    s.net.pump();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    s.net.pump();
-    // Nobody could keep a copy (the room's folder away, say): both lines stay.
+    await quiet(s);
+    const [winner, loser] = a.replica.noteDoc(fileId).clientID < c.replica.noteDoc(fileId).clientID ? [a, c] : [c, a];
     const dues = (m: Member) => m.replica.noteText(fileId).split("\n").filter((line) => line.startsWith("due"));
+    return { s, a, c, fileId, winner, loser, keep, copies, save, dues };
+  }
+
+  it("leaves a clash in the note while nobody can keep the copy, and settles it when the saves are restored", async () => {
+    const { s, a, c, fileId, keep, copies, dues } = await clashing();
+    // Nobody could keep a copy (the room's folder away, say): both lines stay.
     expect(dues(a)).toHaveLength(2);
     expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
     // The folder is back: its saves are restored, and the clash is settled, with a copy.
-    keep = true;
+    keep.now = true;
     for (const m of [a, c]) m.replica.restoreSaves(JSON.parse(JSON.stringify(m.replica.recentSaves())));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    s.net.pump();
+    await quiet(s);
     expect(dues(a)).toHaveLength(1);
     expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
-    expect(copies).toHaveLength(1);
-    expect(copies[0]).toBe(`${dues(a)[0] === "due: 2" ? "due: 3" : "due: 2"}\nbody\n`);
+    expect(copies).toEqual([`${dues(a)[0] === "due: 2" ? "due: 3" : "due: 2"}\nbody\n`]);
   });
 
   it("leaves a waiting clash alone once the line it gave way to is gone", async () => {
+    const { s, a, c, fileId, winner, loser, keep, copies } = await clashing();
+    // Nobody can keep a copy, so the losing line waits. Meanwhile the winning line is deleted.
+    const kept = winner === a ? "due: 2\n" : "due: 3\n";
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.delete(text.toString().indexOf(kept), kept.length);
+    s.net.pump();
+    keep.now = true;
+    for (const m of [a, c]) m.replica.restoreSaves(JSON.parse(JSON.stringify(m.replica.recentSaves())));
+    await quiet(s);
+    // The losing line stays: never to leave none.
+    expect(loser.replica.noteText(fileId)).toBe(`${winner === a ? "due: 3" : "due: 2"}\nbody\n`);
+    expect(winner.replica.noteText(fileId)).toBe(loser.replica.noteText(fileId));
+    expect(copies).toEqual([]);
+  });
+
+  it("takes out of a losing line that waited for its copy what was typed meanwhile in front of what went into it", async () => {
+    // Each types into its own line before they meet: "x" after its first character.
+    const { s, a, c, fileId, winner, loser, keep } = await clashing((a, c, fileId) => {
+      for (const m of [a, c]) m.replica.noteDoc(fileId).getText("content").insert(1, "x");
+    });
+    // The losing line waits for its copy, its "x" with it. Meanwhile "y" is typed right in front of that "x".
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.insert(text.toString().indexOf(loser === a ? "dxue: 2" : "dxue: 3") + 1, "y");
+    s.net.pump();
+    // The copy is kept now: what waited for it goes.
+    keep.now = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    // The losing line goes whole, with all that went into it: nothing of it is left behind.
+    expect(a.replica.noteText(fileId)).toBe(`${winner === a ? "dxue: 2" : "dxue: 3"}\nbody\n`);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+  });
+
+  it("keeps in one more copy what was typed into a losing line while it waited for its copy", async () => {
+    const { s, a, c, fileId, winner, loser, keep, copies } = await clashing();
+    // While the losing line waits for its copy, someone adds to it.
+    const losing = loser === a ? "due: 2" : "due: 3";
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.insert(text.toString().indexOf(losing) + losing.length, " (moved)");
+    s.net.pump();
+    keep.now = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    expect(a.replica.noteText(fileId)).toBe(`${winner === a ? "due: 2" : "due: 3"}\nbody\n`);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+    // What was added goes with the line, and is kept in a copy too.
+    expect(copies.some((copy) => copy.includes(`${losing} (moved)\n`))).toBe(true);
+  });
+
+  it("takes out with a losing line that waited for its copy the line saved here in its place meanwhile", async () => {
+    const { s, a, c, fileId, winner, loser, keep, copies, save } = await clashing();
+    // While its copy waits, the losing computer's plugin writes its own line again.
+    save(loser, loser === a ? "due: 2\n" : "due: 3\n", "due: 4\n");
+    s.net.pump();
+    keep.now = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    expect(a.replica.noteText(fileId)).toBe(`${winner === a ? "due: 2" : "due: 3"}\nbody\n`);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+    expect(copies).toContain("due: 4\nbody\n");
+  });
+
+  it("doesn't ask for a second copy of a waiting clash it finds again", async () => {
+    const { s, a, c, fileId, winner, loser, keep, copies } = await clashing();
+    // Someone adds to the note, and the losing computer rebuilds it (after an edit it couldn't share, say).
+    const text = winner.replica.noteDoc(fileId).getText("content");
+    text.insert(text.length, "more\n");
+    s.net.pump();
+    loser.replica.reload(fileId);
+    keep.now = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    expect(loser.replica.noteText(fileId).split("\n").filter((line) => line.startsWith("due"))).toHaveLength(1);
+    expect(copies).toHaveLength(1);
+  });
+
+  it("keeps the copy of a losing line as it was when the note holds something other than text", async () => {
     const s = setup();
-    let keep = false;
     const copies: string[] = [];
-    const clash = (_doc: string, version: string) => (keep ? copies.push(version) > 0 : false);
+    const clash = (_doc: string, version: string) => copies.push(version) > 0;
     const a = s.member(s.ana, { clash });
     const c = s.member(s.cy, { clash });
     for (const device of [s.ana, s.cy]) s.wrapFor(device);
@@ -310,35 +400,57 @@ describe("room replica", () => {
     let link = s.net.link(a.node, c.node);
     s.net.pump();
     c.replica.refreshKeys();
-    const fileId = addNote(a.replica, "Task.md", "due: 1\nbody\n");
+    const fileId = addNote(a.replica, "Task.md", "old: 1\nbody\n");
+    // Another program's client put an embed in front of the text.
+    a.replica.noteDoc(fileId).getText("content").insertEmbed(0, { image: "x" });
     s.net.pump();
     c.replica.noteText(fileId);
     link.cut();
     const save = (m: Member, line: string) =>
       m.replica.edit(fileId, (doc) => {
         const text = doc.getText("content");
-        text.insert(0, line);
-        text.delete(line.length, "due: 1\n".length);
+        text.insert(1, line);
+        text.delete(1 + line.length, "old: 1\n".length);
       }, true);
-    save(a, "due: 2\n");
-    save(c, "due: 3\n");
+    save(a, "aaa: 2\n");
+    save(c, "zzz: 3\n");
     link = s.net.link(a.node, c.node);
+    await quiet(s);
+    expect(copies).toHaveLength(1);
+    expect(["aaa: 2\nbody\n", "zzz: 3\nbody\n"]).toContain(copies[0]);
+  });
+
+  it("never lets working out clashes stop an edit being shared, or an update going in", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    for (const device of [s.ana, s.cy]) s.wrapFor(device);
+    a.replica.refreshKeys();
+    s.net.link(a.node, c.node);
     s.net.pump();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    // Nobody can keep a copy, so the losing line waits. Meanwhile the winning line is deleted.
-    const [winner, loser] = a.replica.noteDoc(fileId).clientID < c.replica.noteDoc(fileId).clientID ? [a, c] : [c, a];
-    const kept = winner === a ? "due: 2\n" : "due: 3\n";
-    const text = winner.replica.noteDoc(fileId).getText("content");
-    text.delete(text.toString().indexOf(kept), kept.length);
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "hello\n");
     s.net.pump();
-    keep = true;
-    for (const m of [a, c]) m.replica.restoreSaves(JSON.parse(JSON.stringify(m.replica.recentSaves())));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(c.replica.noteText(fileId)).toBe("hello\n");
+    // Something goes wrong working out clashes (a huge edit, say).
+    const broken = () => {
+      throw new RangeError("Maximum call stack size exceeded");
+    };
+    for (const m of [a, c]) Object.assign((m.replica as unknown as { clashes: object }).clashes, { recordLocal: broken, typedClash: broken, check: broken, hasSaves: () => true });
+    a.replica.noteDoc(fileId).getText("content").insert(5, " world");
     s.net.pump();
-    // The losing line stays: never to leave none.
-    expect(loser.replica.noteText(fileId)).toBe(`${winner === a ? "due: 3" : "due: 2"}\nbody\n`);
-    expect(winner.replica.noteText(fileId)).toBe(loser.replica.noteText(fileId));
-    expect(copies).toEqual([]);
+    expect(c.replica.noteText(fileId)).toBe("hello world\n");
+  });
+
+  it("ignores saves read back that Yjs couldn't have made", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    s.wrapFor(s.ana);
+    a.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "a\n");
+    a.replica.noteText(fileId);
+    a.replica.restoreSaves({ [fileId]: [{ at: Date.now(), deleted: [], inserted: [{ client: 4242, clock: 0, length: 0, right: null }] }] });
+    expect(a.replica.recentSaves()).toEqual({});
   });
 
   it("doesn't hold a save twice when the same saves are restored on a running replica", () => {
@@ -375,15 +487,15 @@ describe("room replica", () => {
     expect(store.add(honest)).toBe("added");
   });
 
-  it("passes a former writer's work on only once it waited, if not the first writer to do it", () => {
+  it("passes a former writer's work on only once it waited, if not the first writer to do it", async () => {
     const { s, a, b } = triangle();
     const fileId = addNote(b.replica, "Ben.md", "Ben's work\n");
     s.net.pump();
     a.replica.noteText(fileId);
     const snapshots = () => a.node.store.envelopesOf(s.roomId, fileId).snapshots.length;
-    a.replica.passOnOldWork((author) => author !== s.ben.id, false);
+    await a.replica.passOnOldWork(false, (author) => author !== s.ben.id);
     expect(snapshots()).toBe(0);
-    a.replica.passOnOldWork((author) => author !== s.ben.id, true);
+    await a.replica.passOnOldWork(true, (author) => author !== s.ben.id);
     expect(snapshots()).toBe(1);
   });
 
@@ -398,22 +510,72 @@ describe("room replica", () => {
     const limit = STORE_LIMITS.memberBlobBytes;
     STORE_LIMITS.memberBlobBytes = 0;
     try {
-      for (let run = 0; run < 3; run++) {
-        a.replica.passOnOldWork((author) => author !== s.ben.id);
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
+      for (let run = 0; run < 3; run++) await a.replica.passOnOldWork(true, (author) => author !== s.ben.id);
     } finally {
       STORE_LIMITS.memberBlobBytes = limit;
     }
     expect(reads).toBe(1);
   });
 
-  it("never lets the snapshot of someone who may no longer write push out a writer's", () => {
-    // Device ids are random, and which of two equal snapshots stays depends on them: tried several times.
-    for (let round = 0; round < 8; round++) passedOnToLatePeer();
+  it("passes on one document and one file at a time, with a turn for the app in between", async () => {
+    const { s, a, b } = triangle();
+    const ids = Array.from({ length: 25 }, (_, i) => addNote(b.replica, `Ben ${i}.md`, `work ${i}\n`));
+    for (let i = 0; i < 3; i++) {
+      const blob = b.replica.putBlob(utf8(`picture ${i}`));
+      b.replica.editIndex((files) => files.set(randomId("f"), { path: `pic ${i}.png`, kind: "bin", blob }));
+    }
+    s.net.pump();
+    for (const id of ids) a.replica.noteText(id);
+    let reading = 0;
+    let most = 0;
+    const read = a.replica.readBlob.bind(a.replica);
+    a.replica.readBlob = async (ref) => {
+      most = Math.max(most, ++reading);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return await read(ref);
+      } finally {
+        reading--;
+      }
+    };
+    const passed = () => ids.filter((id) => a.node.store.envelopesOf(s.roomId, id).snapshots.some((snapshot) => snapshot.author === s.ana.id)).length;
+    const writes = (author: string) => author !== s.ben.id;
+    const going = a.replica.passOnOldWork(true, writes);
+    // Nothing yet: it goes on in turns of its own.
+    expect(passed()).toBe(0);
+    await going;
+    expect(passed()).toBe(25);
+    expect(most).toBe(1);
+    expect([...a.replica.files().values()].filter((entry) => entry.blob?.by === s.ana.id)).toHaveLength(3);
   });
 
-  function passedOnToLatePeer() {
+  it("doesn't try again and again to pass on what it can't", async () => {
+    const { s, a, b } = triangle();
+    const fileId = addNote(b.replica, "Ben.md", "Ben's work\n");
+    const blob = b.replica.putBlob(utf8("Ben's picture"));
+    b.replica.editIndex((files) => files.set(randomId("f"), { path: "pic.png", kind: "bin", blob }));
+    s.net.pump();
+    a.replica.noteText(fileId);
+    // The note can't be snapshotted (too large, say), and the index takes no new version of the picture (it is full).
+    let snapshots = 0;
+    let reads = 0;
+    const snapshot = a.replica.snapshot.bind(a.replica);
+    a.replica.snapshot = (docId, always) => (docId === fileId ? (snapshots++, null) : snapshot(docId, always));
+    const read = a.replica.readBlob.bind(a.replica);
+    a.replica.readBlob = (ref) => (reads++, read(ref));
+    const editIndex = a.replica.editIndex.bind(a.replica);
+    a.replica.editIndex = (change) => (reads > 0 ? "refused" : editIndex(change));
+    for (let run = 0; run < 3; run++) await a.replica.passOnOldWork(true, (author) => author !== s.ben.id);
+    expect(snapshots).toBe(1);
+    expect(reads).toBe(1);
+  });
+
+  it("never lets the snapshot of someone who may no longer write push out a writer's", async () => {
+    // Device ids are random, and which of two equal snapshots stays depends on them: tried several times.
+    for (let round = 0; round < 8; round++) await passedOnToLatePeer();
+  });
+
+  async function passedOnToLatePeer() {
     const { s, a, c, b } = triangle();
     const fileId = addNote(b.replica, "Ben.md", "Ben's work\n");
     s.net.pump();
@@ -424,7 +586,7 @@ describe("room replica", () => {
     const revoked = nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.devices[s.ben.id]!.revoked = true));
     for (const m of [a, c]) m.node.offerVersions([revoked]);
     const writes = (author: string) => author !== s.ben.id;
-    a.replica.passOnOldWork(writes);
+    await a.replica.passOnOldWork(true, writes);
     s.net.pump();
     for (const m of [a, c]) expect(m.node.store.envelopesOf(s.roomId, fileId).snapshots.map((snapshot) => snapshot.author)).toEqual([s.ana.id]);
     // Rae's computer catches up later, from Cy's alone.

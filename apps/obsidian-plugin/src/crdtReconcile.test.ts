@@ -16,6 +16,15 @@ function applyDiff(ops: ReturnType<typeof computeTextDiff>): string {
 }
 
 describe("computeTextDiff", () => {
+  it("takes two texts too large to compare as one change, cheaply", () => {
+    const a = "a".repeat(2_000);
+    const b = "b".repeat(2_000);
+    expect(computeTextDiff(a, b)).toEqual([
+      { op: "delete", text: a },
+      { op: "insert", text: b }
+    ]);
+  });
+
   it("returns no ops for identical strings (except a single equal op for non-empty text)", () => {
     expect(computeTextDiff("", "")).toEqual([]);
     expect(computeTextDiff("same", "same")).toEqual([{ op: "equal", text: "same" }]);

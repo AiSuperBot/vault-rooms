@@ -455,7 +455,9 @@ export class MeshService {
       }).catch((error: Error) => this.deps.log(`withdraw reopened invites: ${error.message}`));
     }
     // Concurrent revocations add up: what the losing branch took away is taken away here too, by whoever may, and what
-    // those it took standing from granted at the same moment is taken back (see concurrentReductions).
+    // those it took standing from granted at the same moment is taken back (see concurrentReductions). Every computer
+    // that may does it at once (the same change from several settles like any race): one that waited would leave
+    // someone being revoked time to take the revoker's standing first.
     // Worked out once, on the head the change is then made on (nothing runs in between).
     const reduced = concurrentReductions(fork, lost, won, this.node.chain.head.body.state, { user: this.settings.userId, device: this.settings.deviceId }, this.settings.id);
     if (reduced) await this.commit((state) => void Object.assign(state, structuredClone(reduced))).catch((error: Error) => this.deps.log(`concurrent reductions: ${error.message}`));
@@ -834,12 +836,7 @@ export class MeshService {
       const commit = room.epochs[n - 1]!.commit;
       const stale = this.node.savedWraps().some((w) => w.body.room === roomId && w.body.n === n && w.body.commit === commit && !this.entitled(state, roomId, w.body.to));
       if (!stale || !replica.keyFor(n)) continue;
-      const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
-      const writers = Object.entries(state.devices)
-        .filter(([deviceId, device]) => online.has(deviceId) && activeDevice(state, deviceId) && roleAtLeast(roleIn(state, roomId, device.user), "write"))
-        .map(([deviceId]) => deviceId)
-        .sort();
-      if (writers[0] !== this.settings.deviceId) continue;
+      if (!this.leads(replica)) continue;
       const key = newRoomKey();
       await this.commit((next) => {
         next.rooms[roomId]!.epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) });
@@ -877,19 +874,15 @@ export class MeshService {
 
   /**
    * Work of people who may no longer write in a room is passed on by the writers holding it (RoomReplica.passOnOldWork):
-   * the lowest device id among the room's writers that are online, the others only if it is still there a while later.
+   * the one that leads, the others only if it is still there a while later.
    */
   private passOnOldWork(): void {
-    const state = this.state;
-    const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
-    for (const [roomId, replica] of this.replicas) {
-      const writes = (deviceId: string) => {
-        const device = activeDevice(state, deviceId);
-        return device !== null && roleAtLeast(roleIn(state, roomId, device.user), "write");
-      };
-      const lead = Object.keys(state.devices).filter((deviceId) => online.has(deviceId) && writes(deviceId)).sort()[0] === this.settings.deviceId;
-      replica.passOnOldWork(writes, lead);
-    }
+    for (const replica of this.replicas.values()) void replica.passOnOldWork(this.leads(replica));
+  }
+
+  /** Whether this device has the lowest id among a room's writers that are online now (one of them acts for them all). */
+  private leads(replica: RoomReplica): boolean {
+    return [...this.connectedDevices(), this.settings.deviceId].filter((deviceId) => replica.writes(deviceId)).sort()[0] === this.settings.deviceId;
   }
 
   /**
