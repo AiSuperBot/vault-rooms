@@ -72,7 +72,8 @@ export class WorkspaceChain {
    * is the hash of our version `branch[0].body.v - 1`). With `now` (this peer's clock), a version dated more than
    * MAX_CLOCK_SKEW_MS after it is refused for now, so no one can push the record's time far into the future.
    */
-  offer(branch: SignedVersion[], now?: number): OfferResult {
+  /** `appendOnly`: only versions that extend this chain; a branch that would replace part of it is refused unchecked. */
+  offer(branch: SignedVersion[], now?: number, appendOnly = false): OfferResult {
     if (branch.length === 0) return { status: "duplicate" };
     const start = branch[0]!.body.v;
     if (start < 1) return { status: "rejected", reason: "genesis" };
@@ -85,6 +86,7 @@ export class WorkspaceChain {
     while (same < branch.length && this.hashes[start + same] === hashes[same]) same++;
     if (same === branch.length) return { status: "duplicate" };
     const divergeAt = start + same;
+    if (appendOnly && divergeAt < this.versions.length) return { status: "rejected", reason: "fork" };
     const theirs = branch.slice(same);
     const theirHashes = hashes.slice(same);
     let parent = this.versions[divergeAt - 1]!;

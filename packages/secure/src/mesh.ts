@@ -302,8 +302,9 @@ export class MeshNode {
 
   // ---- adding things (made here or received) ----
 
-  offerVersions(versions: SignedVersion[], from?: PeerSession): OfferResult {
-    const result = this.chain.offer(versions, this.now());
+  /** `appendOnly`: from a device that isn't a member here, only versions that extend our record are taken. */
+  offerVersions(versions: SignedVersion[], from?: PeerSession, appendOnly = false): OfferResult {
+    const result = this.chain.offer(versions, this.now(), appendOnly);
     if (result.status === "replaced") {
       // Joins recorded in versions that lost wait again, until an admin or the invite's creator records them again;
       // not someone the lost branch itself took back out.
@@ -505,6 +506,8 @@ export class PeerSession {
   ready = false;
   private closed = false;
   private budgets = new Map<string, Budget>();
+  /** A hello received before the other side was a member here: answered in full once it is (see begin). */
+  private earlyHello: Record<string, unknown> | null = null;
 
   constructor(
     private readonly node: MeshNode,
@@ -524,6 +527,10 @@ export class PeerSession {
     this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
     const items = this.node.addressBook().slice(0, MAX_ADDRESSES);
     if (items.length > 0) this.send({ t: "addresses", items });
+    // A hello it sent before it was let in is answered now, as any hello is (with what it lacks, and our rooms).
+    const early = this.earlyHello;
+    this.earlyHello = null;
+    if (early) this.onHello(early);
   }
 
   /** Compare rooms again (envelopes refused earlier may verify now). */
@@ -582,7 +589,7 @@ export class PeerSession {
         if (!this.allow("hello", 3, 30_000)) return;
         return this.onHello(message);
       case "versions":
-        return this.onVersions(message.versions);
+        return void this.onVersions(message.versions);
       case "joins":
         return this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this));
       case "wraps":
@@ -622,16 +629,22 @@ export class PeerSession {
         return this.begin();
       }
       case "hello":
-        // It holds our record (one of its latest versions is ours): our hello tells it what we lack. To
-        // anyone else, nothing is said.
-        if (message.ws !== this.node.workspaceId || this.readHello(message).common < 0) return this.close("not_a_member");
+        // It holds our record (one of its latest versions after the first is ours): our hello tells it what we lack.
+        // To anyone else, nothing is said.
+        if (message.ws !== this.node.workspaceId || this.readHello(message).common < 1) return this.close("not_a_member");
         if (!this.allow("hello", 3, 30_000)) return;
+        this.earlyHello = message;
         return this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
-      case "versions":
-        this.onVersions(message.versions);
+      case "versions": {
+        // Only versions that extend our record: a branch that would replace it comes from members alone. Anything
+        // else (versions that don't check out, or a branch) ends the session.
+        const result = this.onVersions(message.versions, true);
+        if (result && result.status !== "appended" && result.status !== "duplicate") return this.close("not_a_member");
         break;
+      }
       case "joins":
-        this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this));
+        // Checked, and nothing kept for later: a made-up join for an invite we don't know yet is dropped.
+        this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this, false));
         break;
       default:
         return;
@@ -644,7 +657,7 @@ export class PeerSession {
     let batch: SignedVersion[] = [];
     let bytes = 0;
     for (const version of versions) {
-      const size = JSON.stringify(version).length;
+      const size = utf8(JSON.stringify(version)).length;
       if (batch.length > 0 && (bytes + size > MAX_VERSIONS_BYTES || batch.length === MAX_ITEMS)) {
         this.send({ t: "versions", versions: batch });
         batch = [];
@@ -699,7 +712,11 @@ export class PeerSession {
     // gets the whole record from genesis.
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
-      this.sendVersions(theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1));
+      const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
+      // In batches that fit a peer that doesn't count us as a member yet, unless it may have versions of its own past
+      // the newest both have: a branch is judged against the whole of the other one, so it goes in one piece.
+      if (theirHead === -1 || theirHead === common) this.sendVersions(versions);
+      else for (let i = 0; i < versions.length; i += MAX_ITEMS) this.send({ t: "versions", versions: versions.slice(i, i + MAX_ITEMS) });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
@@ -708,12 +725,13 @@ export class PeerSession {
     this.sendDigests();
   }
 
-  private onVersions(raw: unknown): void {
+  private onVersions(raw: unknown, appendOnly = false): OfferResult | undefined {
     if (!Array.isArray(raw) || raw.length === 0 || raw.length > MAX_ITEMS) v.bad("versions");
     const versions = raw.map(parseSignedVersion).filter((version) => version.body.v > 0);
-    if (versions.length === 0) return;
-    const result = this.node.offerVersions(versions, this);
+    if (versions.length === 0) return undefined;
+    const result = this.node.offerVersions(versions, this, appendOnly);
     if (result.status === "rejected" && result.reason !== "loses") this.reject(`versions:${result.reason}`);
+    return result;
   }
 
   /** Every room of the record that isn't deleted: peers relay rooms they aren't in, as ciphertext. */

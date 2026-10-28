@@ -230,7 +230,10 @@ export class PeerServer {
         if (message.t !== "auth" || message.tag !== workspaceTag(this.config.workspaceId)) return finish("auth_workspace");
         const device = v.id(message.device, "auth.device", "d");
         if (message.to !== undefined && message.to !== this.config.deviceId) return finish("auth_wrong_peer");
-        const member = activeDevice(this.config.membership(), device);
+        const state = this.config.membership();
+        const member = activeDevice(state, device);
+        // A device the record lists but no longer counts (revoked, or its user removed) can never be let in again.
+        if (!member && state.devices[device]) return finish("revoked");
         const key = member ? member.sign : v.b64(message.key, "auth.key", 32);
         if (!member && deviceIdFor(key) !== device) return finish("auth_key");
         const ekm = exportKeyingMaterial(socket);
@@ -264,6 +267,7 @@ export class PeerServer {
  * in `unverifiedAcceptor`, to be checked with `verifyAcceptor` once the record has been fetched.
  */
 export function dial(config: TransportConfig, host: string, port: number, expect?: { device: string; fingerprint: string }): Promise<PeerLink> {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return Promise.reject(new Error("bad_port"));
   return new Promise((resolve, reject) => {
     let settled = false;
     const fail = (reason: string) => {
