@@ -1214,21 +1214,26 @@ describe("room folder", () => {
     expect(copies).toEqual(new Set(dates.filter((date) => date !== kept).map((date) => `---\ndue: ${date}\n---\nPlan\nNext line stays\n`)));
   });
 
-  /** Ana's plugin writes `saved` while Cy types into the note (`typing`, on Cy's computer); then they meet. */
-  async function typedApart(base: string, saved: string, typing: (text: Y.Text) => void) {
+  /**
+   * Ana's plugin writes `saved` while Cy types into the note (`typing`, on Cy's computer); then they meet. `typerLower`:
+   * Cy's Yjs client id is the lower one (text put in at the same place at once is ordered by client id).
+   */
+  async function typedApart(base: string, saved: string, typing: (text: Y.Text) => void, typerLower?: boolean) {
     const { s, a, c, link } = await pair({ "Team/Task.md": base });
     const id = [...a.replica.files().keys()][0]!;
     link.cut();
+    if (typerLower !== undefined) a.replica.reload(id).clientID = typerLower ? 2 : 1;
     await a.vault.writeText("Team/Task.md", saved);
     await a.folder.settled();
     c.bound.add(id);
-    const doc = c.replica.noteDoc(id);
+    const doc = typerLower === undefined ? c.replica.noteDoc(id) : c.replica.reload(id);
+    if (typerLower !== undefined) doc.clientID = typerLower ? 1 : 2;
     typing(doc.getText("content"));
     s.net.link(a.node, c.node);
     await s.settle();
     await s.settle();
     const copies = new Set([a.vault, c.vault].flatMap((vault) => [...vault.files.keys()].filter((path) => path.includes("(conflict")).map((path) => text(vault, path))));
-    return { notes: [a, c].map((pc) => pc.replica.noteText(id)), copies, clients: [a, c].map((pc) => pc.replica.noteDoc(id).clientID) };
+    return { notes: [a, c].map((pc) => pc.replica.noteText(id)), copies };
   }
 
   it("keeps a line added above a line a plugin rewrote at the same moment", async () => {
@@ -1274,13 +1279,12 @@ describe("room folder", () => {
   });
 
   it("never leaves what was typed at the start of a line a plugin rewrote at the start of the next line", async () => {
-    // Which of the two goes first depends on random client ids: tried several times.
-    for (let round = 0; round < 8; round++) {
-      const { notes, copies, clients } = await typedApart("---\ndue: 2030-01-01\n---\n", "---\ndue: 2030-02-02\n---\n", (text) => text.insert(text.toString().indexOf("due"), "\t"));
+    for (const typerLower of [true, false]) {
+      const { notes, copies } = await typedApart("---\ndue: 2030-01-01\n---\n", "---\ndue: 2030-02-02\n---\n", (text) => text.insert(text.toString().indexOf("due"), "\t"), typerLower);
       expect(notes[1]).toBe(notes[0]);
       // Yjs puts the tab first if its client id is the lower: then it stays in front of the saved line. Otherwise it
       // would go to the start of the line after: it is taken out again, and kept in a copy.
-      if (clients[1]! < clients[0]!) {
+      if (typerLower) {
         expect(notes[0]).toBe("---\n\tdue: 2030-02-02\n---\n");
         expect(copies.size).toBe(0);
       } else {
@@ -1291,13 +1295,12 @@ describe("room folder", () => {
   });
 
   it("leaves text typed after the line above alone when that line is joined to a line a plugin rewrote", async () => {
-    // Which of the two goes first depends on random client ids: tried several times.
-    for (let round = 0; round < 8; round++) {
+    for (const typerLower of [true, false]) {
       const { notes, copies } = await typedApart("foo\ndue: 2030-01-01\nend\n", "foo\ndue: 2030-02-02\nend\n", (text) => {
         text.insert(3, " bar");
         // The line break before "due" goes: the two lines are joined.
         text.delete(7, 1);
-      });
+      }, typerLower);
       expect(notes).toEqual(["foo bardue: 2030-02-02\nend\n", "foo bardue: 2030-02-02\nend\n"]);
       expect(copies.size).toBe(0);
     }

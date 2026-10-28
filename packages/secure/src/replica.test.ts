@@ -455,6 +455,78 @@ describe("room replica", () => {
     expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
   });
 
+  it("gives way to a lower line that comes while its line waits for a copy, also once the line it gave way to first is gone", async () => {
+    const s = setup();
+    step(s.chain, s.ana, (state) => void (state.rooms[s.roomId]!.members[s.ben.userId] = "write"));
+    const asked: string[] = [];
+    const a = s.member(s.ana, { clash: () => true });
+    const c = s.member(s.cy, { clash: () => true });
+    const b = s.member(s.ben, { clash: (_doc, version) => asked.push(version) < 0 });
+    for (const device of [s.ana, s.cy, s.ben]) s.wrapFor(device);
+    const links = [s.net.link(a.node, c.node), s.net.link(c.node, b.node), s.net.link(a.node, b.node)];
+    s.net.pump();
+    for (const m of [a, c, b]) m.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Task.md", "due: 1\nbody\n");
+    s.net.pump();
+    for (const link of links) link.cut();
+    // Ana's client is the lowest, then Cy's, then Ben's. Each of their plugins writes its own date.
+    [a, c, b].forEach((m, i) => {
+      m.replica.reload(fileId).clientID = i + 1;
+      m.replica.edit(fileId, (doc) => {
+        const text = doc.getText("content");
+        text.insert(0, `due: ${i + 2}\n`);
+        text.delete(7, 7);
+      }, true);
+    });
+    // Ben meets Cy, and his line waits for its copy; then Cy meets Ana, and gives way to her line (keeping its copy).
+    s.net.link(b.node, c.node);
+    await quiet(s);
+    s.net.link(c.node, a.node);
+    await quiet(s);
+    expect(c.replica.noteText(fileId)).toBe("due: 2\ndue: 4\nbody\n");
+    // Ben's copy is kept: his line goes, giving way to Ana's, though Cy's is gone.
+    expect(asked).toHaveLength(1);
+    b.replica.copyKept(fileId, asked[0]!);
+    await quiet(s);
+    for (const m of [a, c, b]) expect(m.replica.noteText(fileId)).toBe("due: 2\nbody\n");
+  });
+
+  it("takes nothing out, and asks for no copy, when the line it lost to went in the same go", async () => {
+    for (const keepAtOnce of [true, false]) {
+      const s = setup();
+      const asked: string[] = [];
+      const clash = (_doc: string, version: string) => asked.push(version) > 0 && keepAtOnce;
+      const a = s.member(s.ana, { clash });
+      const c = s.member(s.cy, { clash });
+      for (const device of [s.ana, s.cy]) s.wrapFor(device);
+      a.replica.refreshKeys();
+      const link = s.net.link(a.node, c.node);
+      s.net.pump();
+      c.replica.refreshKeys();
+      const fileId = addNote(a.replica, "Task.md", "due: 1\nbody\n");
+      s.net.pump();
+      c.replica.noteText(fileId);
+      link.cut();
+      // Ana's client is the lower. Her plugin writes a date and then takes the line out; Cy's writes another date.
+      a.replica.reload(fileId).clientID = 1;
+      c.replica.reload(fileId).clientID = 2;
+      a.replica.edit(fileId, (doc) => {
+        doc.getText("content").insert(0, "due: 2\n");
+        doc.getText("content").delete(7, 7);
+      }, true);
+      a.replica.edit(fileId, (doc) => doc.getText("content").delete(0, 7), true);
+      c.replica.edit(fileId, (doc) => {
+        doc.getText("content").insert(0, "due: 3\n");
+        doc.getText("content").delete(7, 7);
+      }, true);
+      s.net.link(a.node, c.node);
+      await quiet(s);
+      // Both of Ana's saves come in before Cy's clash is settled: Cy's date stays, the only one left.
+      for (const m of [a, c]) expect(m.replica.noteText(fileId)).toBe("due: 3\nbody\n");
+      expect(asked).toEqual([]);
+    }
+  });
+
   it("doesn't ask for a second copy of a waiting clash it finds again", async () => {
     const { s, a, c, fileId, winner, loser, keep, copies } = await clashing();
     // Someone adds to the note, and the losing computer rebuilds it (after an edit it couldn't share, say).

@@ -103,8 +103,8 @@ export class WorkspaceChain {
 
     const ours = this.versions.slice(divergeAt);
     if (ours.length === 0) {
-      this.versions.push(...theirs);
-      this.hashes.push(...theirHashes);
+      for (const version of theirs) this.versions.push(version);
+      for (const hash of theirHashes) this.hashes.push(hash);
       return { status: "appended", count: theirs.length };
     }
     // A conflict reaching far back is refused: only a long partition with admins busy on both sides produces one
