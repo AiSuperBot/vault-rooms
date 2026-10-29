@@ -79,7 +79,11 @@ export class MemoryVault implements VaultLike {
     return true;
   }
 
+  /** Moves of paths this is true for fail (a file another program holds open). */
+  failMoves?: (from: string) => boolean;
+
   async rename(from: string, to: string): Promise<void> {
+    if (this.failMoves?.(from)) throw new Error(`EBUSY ${from}`);
     const data = this.files.get(from);
     if (!data) throw new Error(`ENOENT ${from}`);
     if (this.files.has(to)) throw new Error(`EEXIST ${to}`);

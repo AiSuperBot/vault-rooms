@@ -2238,3 +2238,74 @@ describe("room folder, retries and renames", () => {
     expect([...c.vault.files.get("Team/a.pdf")!]).toEqual([2]);
   }, 20_000);
 });
+
+describe("room folder, blocked renames", () => {
+  /** Cy renames plan.pdf away and draft.pdf to its name, while Ana's plan.pdf can't be moved (open in another program). */
+  async function blocked() {
+    const { s, a, c } = await pair();
+    await c.vault.writeBytes("Team/plan.pdf", new Uint8Array([1]));
+    await c.vault.writeBytes("Team/draft.pdf", new Uint8Array([2]));
+    await s.settle();
+    a.vault.failMoves = (path) => path === "Team/plan.pdf";
+    a.vault.failTrash = (path) => path === "Team/plan.pdf";
+    await c.vault.rename("Team/plan.pdf", "Team/plan v1.pdf");
+    await s.settle();
+    await c.vault.rename("Team/draft.pdf", "Team/plan.pdf");
+    await s.settle();
+    return { s, a, c };
+  }
+  const bytes = (vault: MemoryVault, path: string) => [...(vault.files.get(path) ?? [])];
+
+  it("never writes a new file over one whose rename is blocked, nor takes it for the renamed one", async () => {
+    const { s, a, c } = await blocked();
+    await c.vault.writeBytes("Team/draft.pdf", new Uint8Array([3]));
+    await s.settle();
+    expect(bytes(a.vault, "Team/draft.pdf")).toEqual([2]);
+    a.vault.failMoves = a.vault.failTrash = undefined;
+    await until(() => bytes(a.vault, "Team/draft.pdf")[0] === 3);
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect(bytes(pc.vault, "Team/plan v1.pdf")).toEqual([1]);
+      expect(bytes(pc.vault, "Team/plan.pdf")).toEqual([2]);
+      expect(bytes(pc.vault, "Team/draft.pdf")).toEqual([3]);
+    }
+  }, 20_000);
+
+  it("takes a change made to a file whose rename is blocked from its new name, once it is there", async () => {
+    const { s, a, c } = await blocked();
+    await a.vault.writeBytes("Team/draft.pdf", new Uint8Array([2, 9]));
+    await s.settle();
+    a.vault.failMoves = a.vault.failTrash = undefined;
+    a.folder.retryNow();
+    for (let i = 0; i < 20 && bytes(c.vault, "Team/plan.pdf").length !== 2; i++) {
+      await s.settle();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(bytes(c.vault, "Team/plan.pdf")).toEqual([2, 9]);
+    expect(bytes(c.vault, "Team/plan v1.pdf")).toEqual([1]);
+    // Moved, not left behind under its old name (to come back for everyone as a new file).
+    expect(a.vault.files.has("Team/draft.pdf")).toBe(false);
+    expect([...c.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["plan v1.pdf", "plan.pdf"]);
+  }, 20_000);
+
+  it("keeps telling of a local file that can't be taken in, whatever else syncs", async () => {
+    const { s, a, c } = await pair();
+    a.vault.failReads = (path) => path === "Team/scan.pdf";
+    await a.vault.writeBytes("Team/scan.pdf", new Uint8Array([1, 2, 3]));
+    await s.settle();
+    a.folder.retryNow();
+    await s.settle();
+    expect(a.folder.health().failing).toContain("scan.pdf");
+    await c.vault.writeText("Team/New.md", "from Cy\n");
+    await s.settle();
+    expect(a.folder.health().failing).toContain("scan.pdf");
+  });
+
+  it("doesn't read a new local file too large to share", async () => {
+    const { s, a } = await pair();
+    a.vault.failReads = (path) => path === "Team/recording.mp4";
+    await a.vault.writeBytes("Team/recording.mp4", new Uint8Array(33 << 20));
+    await s.settle();
+    expect(a.notices.some((message) => message.includes("recording.mp4") && message.includes("too large"))).toBe(true);
+  });
+});
