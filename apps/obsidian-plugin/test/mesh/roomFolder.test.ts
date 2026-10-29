@@ -2190,3 +2190,51 @@ describe("room folder, retries", () => {
     expect(a.notices.filter((message) => message.includes("can't be renamed"))).toEqual([]);
   });
 });
+
+describe("room folder, retries and renames", () => {
+  it("backs off retrying a write that keeps failing, even while other notes change", async () => {
+    const { s, a, c } = await pair({ "n0.md": "note\n" });
+    let attempts = 0;
+    a.vault.failWrites = (path) => path === "Team/Locked.md" && ++attempts > 0;
+    await c.vault.writeText("Team/Locked.md", "from Cy\n");
+    await s.settle();
+    // Cy keeps typing in another note meanwhile: those passes go fine, and mustn't make the retries come sooner.
+    const start = Date.now();
+    for (let i = 0; Date.now() - start < 4_500; i++) {
+      await c.vault.writeText("Team/n0.md", `note ${i}\n`);
+      await s.settle();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    expect(attempts).toBeLessThanOrEqual(3);
+  }, 20_000);
+
+  it("doesn't read a local file too large to share", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/kickoff.mp4", new Uint8Array(33 << 20));
+    a.vault.failReads = (path) => path === "Team/kickoff.mp4";
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    expect(a.folder.health().failing).toEqual([]);
+    expect(a.notices.some((message) => message.includes("kickoff.mp4") && message.includes("too large"))).toBe(true);
+  });
+
+  it("never takes another file for one whose rename here is blocked", async () => {
+    const { s, a, c } = await pair();
+    await c.vault.writeBytes("Team/a.pdf", new Uint8Array([1]));
+    await c.vault.writeBytes("Team/b.pdf", new Uint8Array([2]));
+    await s.settle();
+    // Ana has a.pdf open in a program that won't let it be moved or trashed when Cy replaces it with b.pdf.
+    a.vault.failTrash = (path) => path === "Team/a.pdf";
+    await c.vault.trash("Team/a.pdf");
+    await s.settle();
+    await c.vault.rename("Team/b.pdf", "Team/a.pdf");
+    await s.settle();
+    expect([...c.vault.files.get("Team/a.pdf")!]).toEqual([2]);
+    a.vault.failTrash = undefined;
+    await until(() => a.vault.files.get("Team/a.pdf")?.[0] === 2);
+    expect([...c.vault.files.get("Team/a.pdf")!]).toEqual([2]);
+  }, 20_000);
+});

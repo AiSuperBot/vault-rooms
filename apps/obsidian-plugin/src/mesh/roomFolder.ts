@@ -199,8 +199,9 @@ export class RoomFolder {
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryIn = RETRY_FIRST_MS;
   private retryIds = new Set<string>();
-  /** A removal or rename failed: the retry is a full pass. */
+  /** A removal or rename failed: the retry is a full pass. Taking in local files failed: the retry tries again. */
   private retryAll = false;
+  private retryAdopt = false;
   /** Versions of files kept as conflict copies since they were last synced, by path key: kept once (see keepAside). */
   private keptAside = new Map<string, { hash: string; name: string }>();
   /** Work that failed and isn't done yet (by file path, or "renames"): what went wrong. See health. */
@@ -336,7 +337,8 @@ export class RoomFolder {
     this.retryTimer = null;
     this.retryIn = RETRY_FIRST_MS;
     this.retryIds.clear();
-    this.retryAll = false;
+    if (this.retryAdopt) this.needsAdopt = true;
+    this.retryAll = this.retryAdopt = false;
     this.everything = true;
     // Held-back files too: looked at afresh (shared now if they can be, held back again if not).
     if (this.heldBack.size > 0) {
@@ -735,13 +737,14 @@ export class RoomFolder {
     if (this.needsAdopt && replica.canWrite()) {
       this.needsAdopt = false;
       if (!(await this.adoptLocalFiles())) {
-        this.needsAdopt = true;
+        this.retryAdopt = true;
         done = false;
       }
     }
     // Work that failed is tried again by itself, soon at first and less often while it keeps failing.
-    if (done) this.retryIn = RETRY_FIRST_MS;
-    else this.retrySoon();
+    // Back to the first delay only once nothing waits to be tried again (other passes may well go fine meanwhile).
+    if (!done) this.retrySoon();
+    else if (!this.retryTimer) this.retryIn = RETRY_FIRST_MS;
     // A whole pass without trouble: whatever failed before (for a file gone since, say) isn't failing any more.
     if (done && everything && this.failing.size > 0) {
       this.failing.clear();
@@ -759,7 +762,8 @@ export class RoomFolder {
       for (const id of this.retryIds) this.dirty.add(id);
       this.retryIds.clear();
       if (this.retryAll) this.everything = true;
-      this.retryAll = false;
+      if (this.retryAdopt) this.needsAdopt = true;
+      this.retryAll = this.retryAdopt = false;
       this.queuePass();
     }, this.retryIn);
     this.retryIn = Math.min(this.retryIn * 2, RETRY_MAX_MS);
@@ -825,6 +829,9 @@ export class RoomFolder {
     if (entry.kind === "md" && this.o.isBound(id)) return;
     // A local version that couldn't be shared stays as it is, never written over (see holdBack).
     if (this.heldBack.has(id)) return;
+    // Not under its new name here yet (another file in the way couldn't be moved or trashed): what is at the new name
+    // isn't this file, and is never taken for it. The renames are tried again.
+    if (known && known.path !== entry.path && this.o.vault.stat(this.vaultPath(known.path))) return;
     // Left from a session that may have ended before what it made was stored: proven only by a matching shared copy.
     const doubtful = this.doubtful(id);
     /** The file is as it was when last synced (by its size and time). */
@@ -953,6 +960,9 @@ export class RoomFolder {
     if (!isShareable(relative)) return this.notShared(relative, "type");
     const replica = this.o.replica;
     const path = this.vaultPath(relative);
+    // Too large to share whatever it holds: not even read (it may be huge). A note's line endings can halve it at most.
+    const size = this.o.vault.stat(path)?.size ?? 0;
+    if (isMarkdownPath(relative) ? size > 2 * MAX_NOTE_BYTES : size + 16 > MAX_BYTES.b) return this.notShared(relative, "size");
     const id = randomId("f");
     if (isMarkdownPath(relative)) {
       const text = await this.readNote(path);
