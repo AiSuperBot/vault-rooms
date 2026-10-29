@@ -376,20 +376,12 @@ export class DiskStore implements BlobStorage {
   /** Resolves once an envelope is on disk (see MeshNode.persist). */
   persisted(env: StoredEnvelope): Promise<void> {
     const key = envelopeKey(env);
-    const pending = this.pendingWrites.get(key);
-    if (pending) return pending;
-    if (!this.failedWrites.has(key)) return Promise.resolve();
-    // A write that failed (a full disk, say) is made again.
-    const path = env.k === "b" ? this.blobPath(env) : this.docPath(env.room, env.doc);
-    const written =
-      env.k === "b"
-        ? this.queue(path, () => this.swapIn(path, JSON.stringify(env)))
-        : this.queue(path, async () => {
-            await this.ensureFolder(path);
-            await this.files.append(path, `\n${JSON.stringify(env)}`);
-          });
-    this.track(env, written);
-    return written;
+    if (!this.pendingWrites.has(key) && this.failedWrites.has(key)) {
+      // A write that failed (a full disk, say) is made again: a line goes with the others of its log waiting to be written.
+      if (env.k === "b") this.put(env);
+      else this.append(env);
+    }
+    return this.pendingWrites.get(key) ?? Promise.resolve();
   }
 
   private track(env: StoredEnvelope, written: Promise<void>): void {
@@ -407,7 +399,11 @@ export class DiskStore implements BlobStorage {
   }
 
   private onAdded(env: UpdateEnvelope | SnapshotEnvelope): void {
-    if (this.muted) return;
+    if (!this.muted) this.append(env);
+  }
+
+  /** Append an envelope to its document's log, in one write with the others waiting for it. */
+  private append(env: UpdateEnvelope | SnapshotEnvelope): void {
     const path = this.docPath(env.room, env.doc);
     const lines = this.pendingLines.get(path);
     if (lines) {

@@ -55,7 +55,10 @@ export interface MeshEvents {
   chain?(result: OfferResult): void;
   /** A new room envelope was stored (from a peer or published here). */
   envelope?(env: StoredEnvelope): void;
-  /** An envelope made here is now safely stored (and on its way to peers). */
+  /**
+   * An envelope made here is now safely stored (and on its way to peers), or the last of those received for a document
+   * that were waiting to be.
+   */
   stored?(env: StoredEnvelope): void;
   presence?(env: PresenceEnvelope): void;
   wraps?(): void;
@@ -141,7 +144,7 @@ export class MeshNode {
   /**
    * Set by the owner: resolves once an envelope is safely on disk. One made here is sent only then, so a crash can never
    * lose an envelope a peer already has, and the counter it used is never handed out twice. One received is passed on at
-   * once (its author has it), and stored again until it is.
+   * once (its author has it), and stored again until it is (an attachment isn't, see publish).
    */
   persist: ((env: StoredEnvelope) => Promise<void>) | null = null;
   /**
@@ -421,7 +424,9 @@ export class MeshNode {
     this.events.envelope?.(env);
     const mine = !from && env.author === this.deviceId;
     if (!mine || !this.persist) this.broadcast({ t: "push", env }, from);
-    if (!this.persist) return true;
+    // An attachment received isn't held in memory to be stored again (it can be large): should storing it fail, it is
+    // missing here until Obsidian starts again, and then a peer sends it again.
+    if (!this.persist || (!mine && env.k === "b")) return true;
     const key = envelopeKey(env);
     const doc = `${env.room}/${env.k === "b" ? "b" : env.doc}/`;
     if (mine) this.unpersisted.add(key);
@@ -433,8 +438,10 @@ export class MeshNode {
         () => {
           if (!mine) {
             const left = this.unstoredReceived.get(doc)! - 1;
-            if (left > 0) this.unstoredReceived.set(doc, left);
-            else this.unstoredReceived.delete(doc);
+            if (left > 0) return void this.unstoredReceived.set(doc, left);
+            this.unstoredReceived.delete(doc);
+            // All that came for the document is stored now: the owner may count on it (see RoomFolder).
+            if (!this.stopped) this.events.stored?.(env);
             return;
           }
           this.unpersisted.delete(key);

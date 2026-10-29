@@ -60,8 +60,8 @@ interface Known extends FileStat {
   /** That blob was made on this computer (so another version made from an older one means a real clash). */
   mine?: true;
   /**
-   * Remembered while what this computer made for it wasn't safely stored yet ("entry": its new index entry, which no one
-   * else has then), or only what it received for its note ("received"). If Obsidian stopped before it was, the shared
+   * Remembered while what this computer made for it wasn't safely stored yet, or still waited for the room's newest key
+   * ("entry": its new index entry, which no one else has then), or only what it received for its note ("received"). If Obsidian stopped before it was, the shared
    * state here may lack it: such a file isn't taken as "unchanged here" until the shared version matches it, and a new
    * entry that never got stored is made again.
    */
@@ -398,12 +398,13 @@ export class RoomFolder {
   }
 
   private async saveNow(): Promise<void> {
-    // Stored meanwhile: no longer in doubt.
+    // Stored meanwhile: no longer in doubt, or less (only what it received).
     for (const [id, pending] of this.unstoredNow) {
-      if (this.unstored(pending)) continue;
-      this.unstoredNow.delete(id);
+      const unstored = this.unstored(pending);
+      if (!unstored) this.unstoredNow.delete(id);
       const known = this.known.get(id);
-      if (known) delete known.unstored;
+      if (known && unstored) known.unstored = unstored;
+      else if (known) delete known.unstored;
     }
     await this.o.saveState({ known: Object.fromEntries(this.known) });
     await this.storeSaves();
@@ -460,10 +461,14 @@ export class RoomFolder {
   /** The file's mark while something for it isn't safely stored yet (see Known.unstored), else undefined. */
   private unstored(pending: Pending): Known["unstored"] {
     const replica = this.o.replica;
+    const docs = [...pending.docs];
     const keys = [...pending.keys];
     if (pending.index) keys.push(replica.ownUpdateKey(INDEX_DOC) ?? "");
-    if (replica.hasUnstored([...pending.docs], keys) || (pending.index && replica.hasUnsent(INDEX_DOC))) return pending.created ? "entry" : true;
-    return replica.hasUnstoredReceived([...pending.docs]) ? "received" : undefined;
+    // Edits waiting for the room's newest key are held in memory only.
+    const unsent = docs.some((doc) => replica.hasUnsent(doc)) || (pending.index && replica.hasUnsent(INDEX_DOC));
+    if (unsent || replica.hasUnstored(docs, keys)) return pending.created ? "entry" : true;
+    // A note's content is its own document; an attachment's version is named in the room's index.
+    return replica.hasUnstoredReceived(docs.length > 0 ? docs : [INDEX_DOC]) ? "received" : undefined;
   }
 
   /** Tell the user once about something (per subject). */

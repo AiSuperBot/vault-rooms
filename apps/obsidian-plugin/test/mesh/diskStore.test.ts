@@ -170,6 +170,24 @@ describe("disk store", () => {
     expect(lines(await files.read(docFile("m", w.roomId, env.doc)))).toHaveLength(1);
   });
 
+  it("writes again the envelopes of a log whose write failed in one append", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const doc = randomId("f");
+    const envs = [1, 2, 3].map((clock) => sealUpdate(w.ctx, doc, clock, utf8(`edit ${clock}`)));
+    files.failNextWriteTo = ".jsonl";
+    for (const env of envs) store.add(env);
+    await expect(disk.persisted(envs[0]!)).rejects.toThrow("disk full");
+    let appends = 0;
+    const append = files.append.bind(files);
+    files.append = (path, data) => (appends++, append(path, data));
+    await Promise.all(envs.map((env) => disk.persisted(env)));
+    expect(appends).toBe(1);
+    expect(lines(await files.read(docFile("m", w.roomId, doc)))).toHaveLength(3);
+  });
+
   it("keeps the old record if writing the new one fails", async () => {
     const w = world();
     const files = new MemoryFiles();

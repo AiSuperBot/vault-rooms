@@ -156,6 +156,21 @@ describe("mesh service", () => {
     expect(await keyAfterCrash(ana.node.chain.all().find((version) => version.body.state.rooms[roomId]?.epochs.length === 3)!, 3)).toBe(true);
   }, 30_000);
 
+  it("leaves out a key replacement once another change has replaced the key meanwhile", async () => {
+    const ana = await started(await MeshService.create(deps("AnaQ"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const roomId = await ana.createRoom("Plans");
+    const link = (await ana.createInvite({ [roomId]: "write" })).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const cy = await started(await MeshService.join(deps("CyQ"), { link, userName: "Cy", deviceName: "Cy PC" }));
+    await until(() => cy.replica(roomId)?.keyFor(1) !== undefined);
+    // Ana's automation is held, so the two replacements below, made at once, are the only ones.
+    const automation = ana as unknown as { automating: boolean; rotateWhereNeeded(): Promise<void> };
+    automation.automating = true;
+    await ana.revokeDevice(cy.me.deviceId);
+    await Promise.all([automation.rotateWhereNeeded(), automation.rotateWhereNeeded()]);
+    expect(ana.state.rooms[roomId]!.epochs).toHaveLength(2);
+    automation.automating = false;
+  });
+
   it("keeps the key of a room whose creation lost a race to someone ranking higher", async () => {
     const ana = await started(await MeshService.create(deps("Ana3"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
     await ana.setRoomCreation("members");
@@ -281,6 +296,26 @@ describe("mesh service", () => {
     await service.stop();
     await service.start();
     expect(service.listeningPort).toBe(0);
+  });
+
+  it("makes no change once stopped, even one whose new key was being stored as it stopped", async () => {
+    const d = deps("Closing");
+    const service = await MeshService.create(d, { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" });
+    // Storing the new room key takes a while, and Obsidian closes meanwhile.
+    const files = d.files as MemoryFiles;
+    const write = files.write.bind(files);
+    let release: (() => void) | undefined;
+    files.write = async (path, data) => {
+      if (path.includes("wraps") && !release) await new Promise<void>((resolve) => (release = resolve));
+      return write(path, data);
+    };
+    const creating = service.createRoom("Plans");
+    await until(() => release !== undefined);
+    const stopping = service.stop();
+    release!();
+    await expect(creating).rejects.toThrow(/closing/);
+    await stopping;
+    expect(service.state.rooms).toEqual({});
   });
 
   it("refuses to open when this device's keys are missing (a copied vault), and can still be left", async () => {

@@ -529,6 +529,27 @@ describe("mesh", () => {
     }
   });
 
+  it("doesn't hold an attachment it received in memory to store it again", async () => {
+    vi.useFakeTimers();
+    try {
+      const { chain, ws, ana, cy, roomId, key } = setup();
+      const net = new Network();
+      const a = nodeFor(chain, ana);
+      const c = nodeFor(chain, cy);
+      let tries = 0;
+      c.persist = () => (tries++, Promise.reject(new Error("disk full")));
+      net.link(a, c);
+      net.pump();
+      a.publish(sealBlob({ ws, room: roomId, n: 1, key, author: ana.sign }, utf8("a large scan")));
+      net.pump();
+      await vi.advanceTimersByTimeAsync(600_000);
+      expect(c.store.blobKeys(roomId)).toHaveLength(1);
+      expect(tries).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("passes on more small file versions than fit in one message", async () => {
     const { chain, ws, ana, cy, roomId, key } = setup();
     const net = new Network();
