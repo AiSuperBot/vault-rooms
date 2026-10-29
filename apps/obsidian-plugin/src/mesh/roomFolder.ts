@@ -60,10 +60,10 @@ interface Known extends FileStat {
   /** That blob was made on this computer (so another version made from an older one means a real clash). */
   mine?: true;
   /**
-   * Remembered while what this computer made for it wasn't safely stored yet, or still waited for the room's newest key
-   * ("entry": its new index entry, which no one else has then), or only what it received for its note ("received"). If Obsidian stopped before it was, the shared
-   * state here may lack it: such a file isn't taken as "unchanged here" until the shared version matches it, and a new
-   * entry that never got stored is made again.
+   * Remembered while what this computer made for it wasn't safely stored yet ("entry": its new index entry, which no one
+   * else has then), or only what it received ("received": a note's edits; for an attachment, the room's index, which names
+   * its version). If Obsidian stopped before it was, the shared state here may lack it: such a file isn't taken as
+   * "unchanged here" until the shared version matches it, and a new entry that never got stored is made again.
    */
   unstored?: true | "entry" | "received";
 }
@@ -464,9 +464,7 @@ export class RoomFolder {
     const docs = [...pending.docs];
     const keys = [...pending.keys];
     if (pending.index) keys.push(replica.ownUpdateKey(INDEX_DOC) ?? "");
-    // Edits waiting for the room's newest key are held in memory only.
-    const unsent = docs.some((doc) => replica.hasUnsent(doc)) || (pending.index && replica.hasUnsent(INDEX_DOC));
-    if (unsent || replica.hasUnstored(docs, keys)) return pending.created ? "entry" : true;
+    if (replica.hasUnstored(docs, keys) || (pending.index && replica.hasUnsent(INDEX_DOC))) return pending.created ? "entry" : true;
     // A note's content is its own document; an attachment's version is named in the room's index.
     return replica.hasUnstoredReceived(docs.length > 0 ? docs : [INDEX_DOC]) ? "received" : undefined;
   }
@@ -916,8 +914,13 @@ export class RoomFolder {
       const held = this.heldBack.get(id);
       if (held !== undefined && held !== hash && this.heldBack.delete(id)) this.o.heldBackChanged?.();
       if (hash === known.hash) return this.remember(id, relative, hash, known.blob ? { id: known.blob, by: known.mine ? this.o.replica.deviceId : "" } : undefined);
-      // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk.
-      if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) return this.remember(id, relative, hash);
+      // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk. Not
+      // while its edits wait for the room's newest key (held in memory only, and maybe refused then): they still count as
+      // changed here, should Obsidian stop before they are shared.
+      if (entry.kind === "md" && this.o.isBound(id) && this.o.replica.canWrite()) {
+        if (!this.o.replica.hasUnsent(id)) this.remember(id, relative, hash);
+        return;
+      }
       // The shared version moved on since the last sync and isn't here yet: taking this change in now would undo it, so
       // the next pass settles it like any change made on both sides (keeping a copy).
       if (this.o.replica.canWrite() && (await this.sharedMovedOn(id, entry, known))) return this.remoteChanged(id);
