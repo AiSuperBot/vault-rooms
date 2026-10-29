@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import * as tls from "node:tls";
-import { concatBytes, fromUtf8, utf8 } from "./bytes.js";
+import { b64u, concatBytes, fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { newSigningKeyPair, sign } from "./crypto.js";
 import { makeAnnouncement, readAnnouncement } from "./discovery.js";
@@ -226,6 +226,36 @@ describe("TLS transport", () => {
     manager.adopt(firstLink as PeerLink);
     await until(() => d.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
     expect(a.node.effective().devices[join.body.device.id]).toBeDefined();
+  });
+
+  it("closes the connection of a join attempt that fails, and joins through the next peer", async () => {
+    const w = await world();
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
+    step(w.chain, w.ana, (state) => (state.invites[fresh.inviteId] = fresh.record));
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    // A peer that authenticates, then answers the join for another workspace.
+    let closed = false;
+    const sockets: tls.TLSSocket[] = [];
+    const wrong = tls.createServer({ key: w.tlsC.keyPem, cert: w.tlsC.certPem, minVersion: "TLSv1.3" }, (socket) => {
+      sockets.push(socket);
+      let seen = 0;
+      socket.on("data", () => {
+        if (++seen === 1) socket.write(encodeFrame({ t: "auth_ok", device: w.cy.id, sig: b64u(new Uint8Array(64)) }));
+        else socket.write(encodeFrame({ t: "hello", ws: `w${"x".repeat(43)}`, head: 0 }));
+      });
+      socket.on("close", () => (closed = true));
+    });
+    await new Promise<void>((resolve) => wrong.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((resolve) => wrong.close(resolve));
+    });
+    const peers = [`127.0.0.1:${(wrong.address() as { port: number }).port}`, `127.0.0.1:${a.port}`];
+    const link = parseInviteLink(formatInviteLink({ workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers }));
+    const joined = await joinWorkspace({ invite: link, userName: "Dee", deviceName: "Dee PC", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") });
+    cleanups.push(() => joined.link.channel.close("done"));
+    expect(joined.chain.workspaceId).toBe(w.ws);
+    await until(() => closed, 2000);
   });
 
   it("won't join through a peer that isn't part of the workspace the link names", async () => {

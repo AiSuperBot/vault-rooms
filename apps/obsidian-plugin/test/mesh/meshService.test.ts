@@ -1,7 +1,7 @@
 import { once } from "node:events";
 import { createServer } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { createJoinRecord, nextVersion, parseInviteLink } from "@vault-rooms/secure";
+import { createJoinRecord, keyCommitment, newRoomKey, nextVersion, parseInviteLink, type WorkspaceState } from "@vault-rooms/secure";
 import { newDevice } from "@vault-rooms/secure/testkit";
 import { MeshService, type MeshDeps, type MeshSettings } from "../../src/mesh/meshService.js";
 import type { SecretStore } from "../../src/mesh/secrets.js";
@@ -356,6 +356,22 @@ describe("mesh service", () => {
     await ben.revokeDevice(ana.me.deviceId);
     expect(ben.rooms().find((room) => room.id === roomId)?.managed).toBe(false);
   }, 30_000);
+
+  it("looks at the key wraps once a round of handing out keys, however many keys its rooms have had", async () => {
+    const ana = await started(await MeshService.create(deps("AnaW"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const roomId = await ana.createRoom("Plans");
+    const service = ana as unknown as { commit(change: (state: WorkspaceState) => void, joins: unknown[], keys: Map<string, Uint8Array>): Promise<unknown>; ensureWraps(): void };
+    for (let n = 2; n <= 6; n++) {
+      const key = newRoomKey();
+      await service.commit((state) => void state.rooms[roomId]!.epochs.push({ n, commit: keyCommitment(ana.settings.id, roomId, n, key) }), [], new Map([[roomId, key]]));
+    }
+    expect(ana.state.rooms[roomId]!.epochs).toHaveLength(6);
+    let scans = 0;
+    const allWraps = ana.node.allWraps.bind(ana.node);
+    ana.node.allWraps = () => (scans++, allWraps());
+    service.ensureWraps();
+    expect(scans).toBe(1);
+  });
 
   it("never goes online once stopped", async () => {
     const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
