@@ -311,6 +311,11 @@ export class RoomReplica {
     return docs.some((doc) => this.node.hasUnpersisted(`${this.roomId}/${doc}/`)) || keys.some((key) => this.node.isUnpersisted(key));
   }
 
+  /** Whether something received for these documents isn't safely stored here yet. */
+  hasUnstoredReceived(docs: DocId[]): boolean {
+    return docs.some((doc) => this.node.hasUnstoredReceived(`${this.roomId}/${doc}/`));
+  }
+
   /** Key (see envelopeKey) of this device's latest update of a document, to check later whether it is stored. */
   ownUpdateKey(docId: DocId): string | null {
     const clock = this.node.store.maxClock(this.roomId, docId, this.node.deviceId);

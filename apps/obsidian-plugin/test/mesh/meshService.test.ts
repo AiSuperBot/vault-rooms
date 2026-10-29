@@ -120,6 +120,42 @@ describe("mesh service", () => {
     expect(ana.node.allWraps().some((w) => w.body.room === roomId && w.body.n === 2 && w.body.to === ben.me.deviceId)).toBe(false);
   });
 
+  it("stores a new room key before the others can hear of it, so Obsidian stopping right then doesn't lose it", async () => {
+    const anaDeps = deps("AnaK");
+    const ana = await started(await MeshService.create(anaDeps, { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    // What is on disk as each version is taken in (and sent to the others): Obsidian may stop right after.
+    const files = anaDeps.files as MemoryFiles;
+    const disks = new Map<unknown, Map<string, string>>();
+    const offer = ana.node.offerVersions.bind(ana.node);
+    ana.node.offerVersions = (versions, ...rest) => {
+      for (const version of versions) disks.set(version, new Map(files.data));
+      return offer(versions, ...rest);
+    };
+    /** Ana's computer starting again from that moment, then hearing of the version from someone: does it hold key `n`? */
+    const keyAfterCrash = async (version: typeof ana.node.chain.head, n: number) => {
+      const disk = new MemoryFiles();
+      for (const [path, data] of disks.get(version)!) disk.data.set(path, data);
+      const again = (await MeshService.open({ ...anaDeps, files: disk }))!;
+      services.push(again);
+      expect(again.node.offerVersions([version]).status).toBe("appended");
+      return again.replica(roomId)?.keyFor(n) !== undefined;
+    };
+    const roomId = await ana.createRoom("Plans");
+    expect(await keyAfterCrash(ana.node.chain.head, 1)).toBe(true);
+    const link = async () => (await ana.createInvite({ [roomId]: "write" })).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const ben = await started(await MeshService.join(deps("BenK"), { link: await link(), userName: "Ben", deviceName: "Ben PC" }));
+    const cy = await started(await MeshService.join(deps("CyK"), { link: await link(), userName: "Cy", deviceName: "Cy PC" }));
+    await until(() => ben.replica(roomId)?.keyFor(1) !== undefined && cy.replica(roomId)?.keyFor(1) !== undefined);
+    // A removal starts a new key.
+    await ana.setMember(roomId, ben.me.userId, null);
+    expect(await keyAfterCrash(ana.node.chain.head, 2)).toBe(true);
+    // So does revoking a computer that held the newest one.
+    await until(() => cy.replica(roomId)?.keyFor(2) !== undefined);
+    await ana.revokeDevice(cy.me.deviceId);
+    await until(() => ana.state.rooms[roomId]!.epochs.length === 3);
+    expect(await keyAfterCrash(ana.node.chain.all().find((version) => version.body.state.rooms[roomId]?.epochs.length === 3)!, 3)).toBe(true);
+  }, 30_000);
+
   it("keeps the key of a room whose creation lost a race to someone ranking higher", async () => {
     const ana = await started(await MeshService.create(deps("Ana3"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
     await ana.setRoomCreation("members");

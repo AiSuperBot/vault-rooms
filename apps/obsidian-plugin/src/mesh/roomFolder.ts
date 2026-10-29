@@ -61,10 +61,11 @@ interface Known extends FileStat {
   mine?: true;
   /**
    * Remembered while what this computer made for it wasn't safely stored yet ("entry": its new index entry, which no one
-   * else has then). If Obsidian stopped before it was, the shared state may lack it: such a file isn't taken as
-   * "unchanged here" until the shared version matches it, and a new entry that never got stored is made again.
+   * else has then), or only what it received for its note ("received"). If Obsidian stopped before it was, the shared
+   * state here may lack it: such a file isn't taken as "unchanged here" until the shared version matches it, and a new
+   * entry that never got stored is made again.
    */
-  unstored?: true | "entry";
+  unstored?: true | "entry" | "received";
 }
 
 export interface RoomFolderState {
@@ -430,8 +431,8 @@ export class RoomFolder {
 
   /**
    * Remember a file as synced. What this computer made for it counts only once stored: edits of its note, and `made`,
-   * the envelopes (by key) it just made for the file's entry (`created`: a new entry). Until then the file is marked
-   * (see Known.unstored), and the mark is checked again whenever state is saved.
+   * the envelopes (by key) it just made for the file's entry (`created`: a new entry); and so does what it received for
+   * its note. Until then the file is marked (see Known.unstored), and the mark is checked again whenever state is saved.
    */
   private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false): void {
     const replica = this.o.replica;
@@ -450,17 +451,19 @@ export class RoomFolder {
       size: stat?.size ?? -1,
       mtime: stat?.mtime ?? -1,
       ...(blob ? { blob: blob.id, ...(blob.by === replica.deviceId ? { mine: true as const } : {}) } : {}),
-      ...(unstored ? { unstored: pending.created ? ("entry" as const) : (true as const) } : {})
+      ...(unstored ? { unstored } : {})
     });
     if (this.heldBack.delete(id)) this.o.heldBackChanged?.();
     this.saveSoon();
   }
 
-  private unstored(pending: Pending): boolean {
+  /** The file's mark while something for it isn't safely stored yet (see Known.unstored), else undefined. */
+  private unstored(pending: Pending): Known["unstored"] {
     const replica = this.o.replica;
     const keys = [...pending.keys];
     if (pending.index) keys.push(replica.ownUpdateKey(INDEX_DOC) ?? "");
-    return replica.hasUnstored([...pending.docs], keys) || (pending.index && replica.hasUnsent(INDEX_DOC));
+    if (replica.hasUnstored([...pending.docs], keys) || (pending.index && replica.hasUnsent(INDEX_DOC))) return pending.created ? "entry" : true;
+    return replica.hasUnstoredReceived([...pending.docs]) ? "received" : undefined;
   }
 
   /** Tell the user once about something (per subject). */
@@ -736,8 +739,9 @@ export class RoomFolder {
     const path = this.vaultPath(known.path);
     const stat = this.o.vault.stat(path);
     const entry = this.o.replica.entries().get(id);
-    // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here.
-    const busy = this.doubtful(id) || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
+    // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here. One
+    // only received was theirs.
+    const busy = (this.doubtful(id) && known.unstored !== "received") || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     this.known.delete(id);
     if (!stat) return;
     const current = isMarkdownPath(known.path) ? await this.readNote(path) : await this.o.vault.readBytes(path);
@@ -754,7 +758,8 @@ export class RoomFolder {
   /** Files in the folder that aren't tracked yet become shared files (when this user may write). */
   private async adoptLocalFiles(): Promise<void> {
     if (!this.o.replica.canWrite()) return;
-    const indexPaths = new Set([...this.o.replica.files().values()].map((entry) => pathKey(entry.path)));
+    // Paths shared or tracked here, by key: looked up per file, so built once (not a scan per file).
+    const tracked = new Set([...this.o.replica.files().values(), ...this.known.values()].map((file) => pathKey(file.path)));
     for (const path of this.o.vault.listFiles(this.o.folder)) {
       if (this.o.inOtherRoom?.(path)) continue;
       const relative = this.relative(path);
@@ -762,8 +767,11 @@ export class RoomFolder {
         if (this.unsafeInside(path)) this.notShared(path.slice(this.prefix.length), "name");
         continue;
       }
-      if (this.idAt(relative) || indexPaths.has(pathKey(relative))) continue;
+      if (tracked.has(pathKey(relative))) continue;
+      const before = this.known.size;
       await this.safely(relative, () => this.createEntry(relative));
+      // Remembered now: a name differing only in case (another file where case counts) is the same path to the others.
+      if (this.known.size > before) tracked.add(pathKey(relative));
     }
   }
 

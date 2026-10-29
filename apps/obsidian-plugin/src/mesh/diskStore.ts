@@ -59,7 +59,7 @@ function lastPart(path: string): string {
  *   blobs/<room>/<author>.<id>.<n>.json  one encrypted attachment version per file; gone.json lists dropped ones
  * Everything here is either public (the signed record) or ciphertext; device secrets live in Obsidian's secret
  * storage. Names are case-safe (see fileNameOf). Envelopes this device makes are on disk before they are sent
- * (`persisted`), so a crash can't lose one that peers already have.
+ * (`persisted`), so a crash can't lose one that peers already have; a write that failed is made again when asked.
  */
 export class DiskStore implements BlobStorage {
   private queues = new Map<string, Promise<void>>();
@@ -67,7 +67,7 @@ export class DiskStore implements BlobStorage {
   /** The append that will carry each document's pending lines. */
   private batches = new Map<string, Promise<void>>();
   private pendingWrites = new Map<string, Promise<void>>();
-  /** Envelopes made here whose write failed: written again when asked (`persisted`). */
+  /** Envelopes whose write failed: written again when asked (`persisted`). */
   private failedWrites = new Set<string>();
   private rewrites = new Set<string>();
   private goneWrites = new Set<string>();
@@ -373,7 +373,7 @@ export class DiskStore implements BlobStorage {
     }
   }
 
-  /** Resolves once an envelope this device made is on disk (see MeshNode.persist). */
+  /** Resolves once an envelope is on disk (see MeshNode.persist). */
   persisted(env: StoredEnvelope): Promise<void> {
     const key = envelopeKey(env);
     const pending = this.pendingWrites.get(key);

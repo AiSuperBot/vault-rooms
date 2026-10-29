@@ -503,6 +503,32 @@ describe("mesh", () => {
     }
   });
 
+  it("passes on at once what it received, and keeps storing it until it is stored", async () => {
+    vi.useFakeTimers();
+    try {
+      const { chain, ana, ben, cy, roomId, key, seal } = setup();
+      const net = new Network();
+      const a = nodeFor(chain, ana);
+      const b = nodeFor(chain, ben);
+      const c = nodeFor(chain, cy);
+      let failures = 1;
+      b.persist = () => (failures-- > 0 ? Promise.reject(new Error("disk full")) : Promise.resolve());
+      net.link(a, b);
+      net.link(b, c);
+      net.pump();
+      a.publish(seal(ana, 1, "via Ben"));
+      net.pump();
+      await vi.advanceTimersByTimeAsync(0);
+      // Ben's disk couldn't store it: passed on all the same, and known not to be stored here yet.
+      expect(texts(c, roomId, key)).toEqual(["via Ben"]);
+      expect(b.hasUnstoredReceived(`${roomId}/${INDEX_DOC}/`)).toBe(true);
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(b.hasUnstoredReceived(`${roomId}/${INDEX_DOC}/`)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("passes on more small file versions than fit in one message", async () => {
     const { chain, ws, ana, cy, roomId, key } = setup();
     const net = new Network();
