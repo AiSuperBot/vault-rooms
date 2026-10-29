@@ -547,7 +547,7 @@ describe("room folder", () => {
     await c.vault.writeText("Team/Plan.md", "base\ntyped meanwhile\n");
     await s.settle();
     await c.folder.stop();
-    // Cy's computer starts again and hears from Ana's, which never had the typing.
+    // Cy's computer starts again and hears from Ana's, which never had the typing: it stays, as changed here.
     const again = s.make(s.cy, "Team", c.vault);
     again.saved.state = c.saved.state;
     s.net.link(again.node, a.node);
@@ -555,8 +555,8 @@ describe("room folder", () => {
     again.replica.refreshKeys();
     await again.folder.start();
     await s.settle();
-    const copy = [...again.vault.files.keys()].find((path) => path.includes("(conflict"));
-    expect(copy && text(again.vault, copy)).toBe("base\ntyped meanwhile\n");
+    expect(text(again.vault, "Team/Plan.md")).toBe("base\ntyped meanwhile\n");
+    expect([...again.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
   });
 
   it("trashes a note someone else deleted while it was off, once only what it received there was left unstored", async () => {
