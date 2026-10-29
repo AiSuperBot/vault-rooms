@@ -134,11 +134,14 @@ export class MeshNode {
   private effectiveCache: WorkspaceState | null = null;
   /** Envelopes made here that aren't safely stored yet: they don't leave this device until they are. */
   private unpersisted = new Set<string>();
+  /** Envelopes received that aren't safely stored yet, counted by document (`room/doc/`, see envelopeKey). */
+  private unstoredReceived = new Map<string, number>();
   /** Attempts to store them that are under way. */
   private storing = new Set<Promise<void>>();
   /**
-   * Set by the owner: resolves once an envelope made here is safely on disk. Only then is it sent, so a crash can
-   * never lose an envelope a peer already has, and the counter it used is never handed out twice.
+   * Set by the owner: resolves once an envelope is safely on disk. One made here is sent only then, so a crash can never
+   * lose an envelope a peer already has, and the counter it used is never handed out twice. One received is passed on at
+   * once (its author has it), and stored again until it is.
    */
   persist: ((env: StoredEnvelope) => Promise<void>) | null = null;
   /**
@@ -416,24 +419,31 @@ export class MeshNode {
     if (result === "quota") this.events.rejected?.(`quota:${env.room}`, env.author);
     if (result !== "added") return false;
     this.events.envelope?.(env);
-    if (from || env.author !== this.deviceId || !this.persist) {
-      this.broadcast({ t: "push", env }, from);
-      return true;
-    }
+    const mine = !from && env.author === this.deviceId;
+    if (!mine || !this.persist) this.broadcast({ t: "push", env }, from);
+    if (!this.persist) return true;
     const key = envelopeKey(env);
-    this.unpersisted.add(key);
+    const doc = `${env.room}/${env.k === "b" ? "b" : env.doc}/`;
+    if (mine) this.unpersisted.add(key);
+    else this.unstoredReceived.set(doc, (this.unstoredReceived.get(doc) ?? 0) + 1);
     const attempt = (retryIn: number): void => {
       // Once stopped, nothing more is written: storage may be gone (left), or in use by the next session.
       if (this.stopped) return;
       const done = this.persist!(env).then(
         () => {
+          if (!mine) {
+            const left = this.unstoredReceived.get(doc)! - 1;
+            if (left > 0) this.unstoredReceived.set(doc, left);
+            else this.unstoredReceived.delete(doc);
+            return;
+          }
           this.unpersisted.delete(key);
           if (this.stopped) return;
           this.broadcast({ t: "push", env });
           this.events.stored?.(env);
         },
         (error: unknown) => {
-          // Not stored yet (a full disk, say): it isn't sent, and storing it is tried again later.
+          // Not stored yet (a full disk, say): tried again later. One made here isn't sent until then.
           this.events.rejected?.(`not_stored:${errorText(error)}`, this.deviceId);
           if (this.stopped) return;
           const timer = setTimeout(() => attempt(Math.min(retryIn * 2, 300_000)), retryIn);
@@ -447,7 +457,7 @@ export class MeshNode {
     return true;
   }
 
-  /** Resolves once the envelopes made here that are being stored right now are stored (or failed to be, this time). */
+  /** Resolves once the envelopes being stored right now are stored (or failed to be, this time). */
   async stored(): Promise<void> {
     await Promise.all([...this.storing]);
   }
@@ -467,6 +477,11 @@ export class MeshNode {
     if (this.unpersisted.size === 0) return false;
     for (const key of this.unpersisted) if (key.startsWith(prefix)) return true;
     return false;
+  }
+
+  /** Whether an envelope received for a document (`room/doc/`, see envelopeKey) is still waiting to be stored. */
+  hasUnstoredReceived(doc: string): boolean {
+    return this.unstoredReceived.has(doc);
   }
 
   /** Presence: only fresh messages, at a bounded rate per author, each passed on once. */

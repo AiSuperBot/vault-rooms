@@ -487,6 +487,59 @@ describe("room folder", () => {
     expect(copy && text(again.vault, copy)).toBe("base\nAna's last words\n");
   });
 
+  it("keeps someone's edit it couldn't store, if Obsidian stops before anyone who has it is back", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    const r = s.make(s.rae, "Team");
+    for (const device of [s.ana, s.cy, s.rae]) s.giveKey(a, device);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const toCy = s.net.link(a.node, c.node);
+    const toRae = s.net.link(a.node, r.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Rae's computer goes away with the note as it was; then Cy's edit reaches Ana's, whose disk can't store it.
+    toRae.cut();
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    await c.vault.writeText("Team/Plan.md", "base\nfrom Cy\n");
+    await s.settle();
+    expect(text(a.vault, "Team/Plan.md")).toBe("base\nfrom Cy\n");
+    await a.folder.stop();
+    toCy.cut();
+    // Ana's computer starts again while Cy's is away, and hears only from Rae's, which never had the edit.
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, r.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    const copy = [...again.vault.files.keys()].find((path) => path.includes("(conflict"));
+    expect(copy && text(again.vault, copy)).toBe("base\nfrom Cy\n");
+  });
+
+  it("starts on a folder of many synced files without looking each one up among all the others", async () => {
+    const s = setup();
+    // 5,000 files remembered as synced in an earlier session.
+    const vault = new MemoryVault();
+    const known: RoomFolderState["known"] = {};
+    for (let i = 0; i < 5000; i++) {
+      await vault.writeText(`Team/Note ${i}.md`, "");
+      known[randomId("f")] = { path: `Note ${i}.md`, hash: "", size: 0, mtime: 0 };
+    }
+    const a = s.make(s.ana, "Team", vault);
+    a.saved.state = { known };
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    const start = performance.now();
+    await a.folder.start();
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
   it("doesn't hold in doubt an edit stored just as Obsidian stopped", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

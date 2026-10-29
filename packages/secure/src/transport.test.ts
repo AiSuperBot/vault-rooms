@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import * as tls from "node:tls";
-import { fromUtf8, utf8 } from "./bytes.js";
+import { concatBytes, fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
-import { newSigningKeyPair } from "./crypto.js";
+import { newSigningKeyPair, sign } from "./crypto.js";
 import { makeAnnouncement, readAnnouncement } from "./discovery.js";
 import { INDEX_DOC, openEnvelope, sealUpdate } from "./envelope.js";
 import { encodeFrame, FrameReader } from "./frames.js";
@@ -145,6 +145,32 @@ describe("TLS transport", () => {
     const a = await peer(w.chain, w.ana, w.tlsA);
     const config: TransportConfig = { workspaceId: w.ws, deviceId: w.cy.id, deviceKey: w.cy.sign, tls: w.tlsC, membership: () => w.chain.state };
     await expect(dial(config, "127.0.0.1", a.port, { device: w.ana.id, fingerprint: w.tlsC.fingerprint })).rejects.toThrow("certificate_mismatch");
+  });
+
+  it("hands on what comes in the same chunk as the answer to its authentication", async () => {
+    const w = await world();
+    // Ana's side answers and says hello in one write, as a busy computer may.
+    const sockets: tls.TLSSocket[] = [];
+    const server = tls.createServer({ key: w.tlsA.keyPem, cert: w.tlsA.certPem, minVersion: "TLSv1.3" }, (socket) => {
+      sockets.push(socket);
+      socket.once("data", () => {
+        const ekm = new Uint8Array(socket.exportKeyingMaterial(32, "EXPORTER-vault-rooms-peer-auth", Buffer.alloc(0)));
+        const sig = sign(w.ana.sign.secretKey, "peer-auth-ok", concatBytes(ekm, utf8(`ok|${w.cy.id}|${w.ana.id}|${workspaceTag(w.ws)}`)));
+        socket.write(Buffer.concat([encodeFrame({ t: "auth_ok", device: w.ana.id, sig }), encodeFrame({ t: "hello", ws: w.ws })]));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((resolve) => server.close(resolve));
+    });
+    const config: TransportConfig = { workspaceId: w.ws, deviceId: w.cy.id, deviceKey: w.cy.sign, tls: w.tlsC, membership: () => w.chain.state };
+    const link = await dial(config, "127.0.0.1", (server.address() as { port: number }).port, { device: w.ana.id, fingerprint: w.tlsA.fingerprint });
+    const heard: unknown[] = [];
+    link.onMessage((message) => heard.push(message));
+    await until(() => heard.length > 0, 2000);
+    expect(heard).toEqual([{ t: "hello", ws: w.ws }]);
+    link.channel.close("done");
   });
 
   it("refuses a caller that claims a member's id without its key", async () => {

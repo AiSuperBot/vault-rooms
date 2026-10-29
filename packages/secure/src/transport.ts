@@ -81,6 +81,11 @@ export function verifyAcceptor(state: WorkspaceState, workspaceId: string, diale
 class Wire {
   private reader = new FrameReader(AUTH_MAX_FRAME);
   private handlers: Array<(message: unknown) => void> = [];
+  /**
+   * Messages that came after `link` and before its owner listened (they can share a chunk with the last authentication
+   * message): handed to the first `onMessage`.
+   */
+  private early: unknown[] | null = null;
   private closeHandlers: Array<(reason: string) => void> = [];
   private closed = false;
   private promoted = false;
@@ -100,7 +105,8 @@ class Wire {
       for (const message of messages) {
         if (this.closed) return;
         if (typeof message === "object" && message !== null && (message as { t?: unknown }).t === "ping") continue;
-        for (const handler of this.handlers) handler(message);
+        if (this.early) this.early.push(message);
+        else for (const handler of this.handlers) handler(message);
       }
     });
     socket.on("close", () => this.close("socket_closed"));
@@ -122,10 +128,9 @@ class Wire {
 
   onMessage(handler: (message: unknown) => void): void {
     this.handlers.push(handler);
-  }
-
-  replaceHandlers(handler: (message: unknown) => void): void {
-    this.handlers = [handler];
+    const early = this.early ?? [];
+    this.early = null;
+    for (const message of early) if (!this.closed) handler(message);
   }
 
   onClose(handler: (reason: string) => void): void {
@@ -152,6 +157,7 @@ class Wire {
   link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void): PeerLink {
     if (!joining) this.promote();
     this.handlers = [];
+    this.early = [];
     return {
       remoteDevice,
       remoteAddress: this.socket.remoteAddress ?? "",

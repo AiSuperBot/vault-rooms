@@ -30,6 +30,7 @@ import {
   WorkspaceChain,
   wrapRoomKey,
   type JoinRecord,
+  type KeyWrap,
   type MeshEvents,
   type OfferResult,
   type PresenceEnvelope,
@@ -112,6 +113,8 @@ export class MeshService {
   private lastAutomate = 0;
   /** Keys of rooms this device just created, handed to the replica before anyone hears of it. */
   private ownKeys = new Map<string, { n: number; key: Uint8Array }>();
+  /** Wraps to this device itself of keys it is making, stored before the record names the keys (see commit). */
+  private newWraps = new Set<KeyWrap>();
   private quotaNoticeAt = new Map<string, number>();
   /** Since when each (room, epoch, device) has been seen without a receipt for the key. */
   private missingSince = new Map<string, number>();
@@ -133,7 +136,7 @@ export class MeshService {
       this.emit();
     };
     events.wraps = () => {
-      this.saveSoon("wraps", () => this.disk.saveWraps(this.node.savedWraps()));
+      this.saveSoon("wraps", () => this.saveWraps());
       this.refreshKeys();
       this.automateSoon();
       this.emit();
@@ -325,7 +328,7 @@ export class MeshService {
     }
     await this.disk.saveChain(this.node.chain.all());
     await this.disk.saveJoins(this.node.joinEntries());
-    await this.disk.saveWraps(this.node.savedWraps());
+    await this.saveWraps();
     await this.disk.flush();
     for (const replica of this.replicas.values()) replica.destroy();
     this.replicas.clear();
@@ -452,11 +455,7 @@ export class MeshService {
             const n = room.epochs.length + 1;
             room.epochs.push({ n, commit: keyCommitment(this.settings.id, roomId, n, key) });
           }
-        });
-        for (const [roomId, key] of keys) {
-          const epoch = this.node.chain.state.rooms[roomId]?.epochs.find((e) => e.commit === keyCommitment(this.settings.id, roomId, e.n, key));
-          if (epoch) await this.keepKey(roomId, epoch.n, key);
-        }
+        }, [], keys);
       } catch {
         failed.push(String(version.body.v));
         for (const roomId of Object.keys(version.body.state.rooms)) if (!base.rooms[roomId] && !this.node.chain.state.rooms[roomId]) for (const listener of this.lostRoomListeners) listener(roomId);
@@ -568,27 +567,53 @@ export class MeshService {
 
   // ---- changes to the workspace record ----
 
-  /** Sign and apply a change, and store the record before returning. A change that changes nothing isn't made. */
-  private async commit(change: (state: WorkspaceState) => void, joins: JoinRecord[] = []): Promise<SignedVersion | null> {
-    const head = this.node.chain.head;
-    const draft = structuredClone(head.body.state);
-    change(draft);
-    if (joins.length === 0 && canonicalJson(draft) === canonicalJson(head.body.state)) return null;
-    const version = nextVersion(this.settings.id, head, this.secrets.sign, change, Date.now(), joins);
-    const result = this.node.offerVersions([version]);
-    if (result.status !== "appended") throw new MeshServiceError(`The change wasn't applied (${result.status === "rejected" ? result.reason : result.status}).`);
-    await this.disk.saveChain(this.node.chain.all());
-    return version;
+  /**
+   * Sign and apply a change, and store the record before returning. A change that changes nothing isn't made.
+   * `keys`: new room keys the change names, by room. Each is stored first, wrapped to this device itself, and only then
+   * is the change made: once the others have it, a crash mustn't lose the only copy of its key. (After a restart, a wrap
+   * of a key the record doesn't name yet is kept aside until it does, see MeshNode.restore.)
+   */
+  private async commit(change: (state: WorkspaceState) => void, joins: JoinRecord[] = [], keys = new Map<string, Uint8Array>()): Promise<SignedVersion | null> {
+    const wraps: KeyWrap[] = [];
+    try {
+      for (;;) {
+        const head = this.node.chain.head;
+        const draft = structuredClone(head.body.state);
+        change(draft);
+        if (joins.length === 0 && canonicalJson(draft) === canonicalJson(head.body.state)) return null;
+        const missing = [...keys].flatMap(([roomId, key]) => {
+          const epoch = draft.rooms[roomId]?.epochs.find((e) => e.commit === keyCommitment(this.settings.id, roomId, e.n, key));
+          if (!epoch || wraps.some((wrap) => wrap.body.room === roomId && wrap.body.n === epoch.n)) return [];
+          return [wrapRoomKey(this.settings.id, roomId, epoch.n, key, { id: this.settings.deviceId, agree: this.secrets.agree.publicKey }, this.secrets.sign)];
+        });
+        if (missing.length > 0) {
+          for (const wrap of missing) {
+            wraps.push(wrap);
+            this.newWraps.add(wrap);
+          }
+          await this.saveWraps();
+          // The record may have moved on meanwhile: the change is looked at again on top of it.
+          continue;
+        }
+        const version = nextVersion(this.settings.id, head, this.secrets.sign, change, Date.now(), joins);
+        const result = this.node.offerVersions([version]);
+        if (result.status !== "appended") throw new MeshServiceError(`The change wasn't applied (${result.status === "rejected" ? result.reason : result.status}).`);
+        for (const wrap of wraps) {
+          if (version.body.state.rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit !== wrap.body.commit) continue;
+          this.replicas.get(wrap.body.room)?.addOwnKey(wrap.body.n, keys.get(wrap.body.room)!);
+          this.node.addWrap(wrap);
+        }
+        await this.disk.saveChain(this.node.chain.all());
+        return version;
+      }
+    } finally {
+      for (const wrap of wraps) this.newWraps.delete(wrap);
+    }
   }
 
-  /**
-   * A key this device made: give it to the replica, and wrap it to this device itself, stored before this returns, so
-   * a crash right after can't lose the only copy.
-   */
-  private async keepKey(roomId: string, n: number, key: Uint8Array): Promise<void> {
-    this.replicas.get(roomId)?.addOwnKey(n, key);
-    this.node.addWrap(wrapRoomKey(this.settings.id, roomId, n, key, { id: this.settings.deviceId, agree: this.secrets.agree.publicKey }, this.secrets.sign));
-    await this.disk.saveWraps(this.node.savedWraps());
+  /** Store the wraps, with those of keys this device is making (see commit). */
+  private saveWraps(): Promise<void> {
+    return this.disk.saveWraps([...this.node.savedWraps(), ...this.newWraps]);
   }
 
   async createRoom(name: string, members: Record<string, Role> = {}, roomId = randomId("r")): Promise<string> {
@@ -602,9 +627,8 @@ export class MeshService {
           members: { ...members, [this.settings.userId]: "manage" },
           epochs: [{ n: 1, commit: keyCommitment(this.settings.id, roomId, 1, key) }]
         };
-      });
+      }, [], new Map([[roomId, key]]));
       this.syncReplicas();
-      await this.keepKey(roomId, 1, key);
     } finally {
       this.ownKeys.delete(roomId);
     }
@@ -614,19 +638,22 @@ export class MeshService {
 
   /** Add, change or (with null) remove a member. Removing someone also starts a new room key, in the same change. */
   async setMember(roomId: string, userId: string, role: Role | null): Promise<void> {
-    const room = this.node.chain.state.rooms[roomId];
-    if (!room) throw new MeshServiceError("No such room.");
-    const rotation = role ? null : { n: room.epochs.length + 1, key: newRoomKey() };
-    await this.commit((state) => {
-      const next = state.rooms[roomId]!;
-      if (role) {
-        next.members[userId] = role;
-        return;
-      }
-      delete next.members[userId];
-      next.epochs.push({ n: rotation!.n, commit: keyCommitment(this.settings.id, roomId, rotation!.n, rotation!.key) });
-    });
-    if (rotation) await this.keepKey(roomId, rotation.n, rotation.key);
+    if (!this.node.chain.state.rooms[roomId]) throw new MeshServiceError("No such room.");
+    const key = role ? null : newRoomKey();
+    await this.commit(
+      (state) => {
+        const next = state.rooms[roomId]!;
+        if (role) {
+          next.members[userId] = role;
+          return;
+        }
+        delete next.members[userId];
+        const n = next.epochs.length + 1;
+        next.epochs.push({ n, commit: keyCommitment(this.settings.id, roomId, n, key!) });
+      },
+      [],
+      key ? new Map([[roomId, key]]) : undefined
+    );
     this.automateSoon();
   }
 
@@ -876,10 +903,11 @@ export class MeshService {
       if (!stale || !replica.keyFor(n)) continue;
       if (!this.leads(replica)) continue;
       const key = newRoomKey();
-      await this.commit((next) => {
-        next.rooms[roomId]!.epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) });
-      });
-      await this.keepKey(roomId, n + 1, key);
+      await this.commit(
+        (next) => void next.rooms[roomId]!.epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) }),
+        [],
+        new Map([[roomId, key]])
+      );
       this.ensureWraps();
     }
   }
