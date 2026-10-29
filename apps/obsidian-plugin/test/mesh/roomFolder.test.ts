@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
-import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { folderProblem, RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
 import { MemoryVault } from "./memoryVault.js";
 
 interface Pc {
@@ -19,6 +19,8 @@ interface Pc {
   saved: { state: RoomFolderState | null; saves: unknown };
   /** The stored saves can't be read, or written (a locked file, say). */
   savesLocked?: "read" | "write";
+  /** The stored state can't be read (a locked file, say). */
+  stateLocked?: boolean;
   bound: Set<string>;
   gone: string[];
 }
@@ -39,7 +41,10 @@ function setup(raeRole: "read" | "write" = "read") {
       deviceName: pc.device.name,
       isBound: (id) => pc.bound.has(id),
       folderGone: () => void pc.gone.push(pc.folderPath),
-      loadState: async () => pc.saved.state,
+      loadState: async () => {
+        if (pc.stateLocked) throw new Error("EBUSY");
+        return pc.saved.state;
+      },
       saveState: async (state) => {
         pc.saved.state = structuredClone(state);
       },
@@ -2047,5 +2052,49 @@ describe("room folder, files on disk", () => {
     await s.settle();
     expect(c.vault.files.size).toBe(200);
     expect(c.vault.lists).toBeLessThan(10);
+  });
+});
+
+describe("room folder, rules and health", () => {
+  it("offers and shares a folder by one rule: names, dot folders anywhere, overlaps as the disk compares them", () => {
+    expect(folderProblem("Notes/.hidden/Sub", [])).not.toBeNull();
+    expect(folderProblem(".obsidian", [])).not.toBeNull();
+    expect(folderProblem("Team/Sub", ["team"])).not.toBeNull();
+    expect(folderProblem("Projects", ["projects/2026"])).not.toBeNull();
+    expect(folderProblem("Café", ["Café"])).not.toBeNull();
+    expect(folderProblem("Team", ["Teams"])).toBeNull();
+    // A hidden room's folder isn't among the folders of rooms shown here: it can be shared again.
+    expect(folderProblem("Team", [])).toBeNull();
+  });
+
+  it("tells what isn't syncing, until it does", async () => {
+    const { s, a, c } = await pair();
+    a.vault.failWrites = (path) => path === "Team/New.md";
+    await c.vault.writeText("Team/New.md", "from Cy\n");
+    await s.settle();
+    expect(a.folder.health()).toEqual({ stopped: null, failing: ["New.md"], heldBack: [] });
+    a.vault.failWrites = undefined;
+    a.folder.retryNow();
+    await s.settle();
+    expect(a.folder.health()).toEqual({ stopped: null, failing: [], heldBack: [] });
+    expect(text(a.vault, "Team/New.md")).toBe("from Cy\n");
+  });
+
+  it("tells that a folder doesn't sync when what it last synced can't be read", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    a.stateLocked = true;
+    await a.folder.start();
+    expect(a.folder.health().stopped).toContain("EBUSY");
+  });
+
+  it("tells which notes of yours stay as they are here, not shared", async () => {
+    const { s, a } = await pair({ "Plan.md": "base\n" });
+    const [id] = [...a.replica.files().keys()];
+    a.folder.holdBackNote(id!);
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual(["Plan.md"]);
   });
 });

@@ -50,7 +50,10 @@ export interface WorkspaceSettings {
   userId: string;
   /** This device's TLS certificate (public; its key is in secret storage). */
   certPem: string;
+  /** The first of the PORT_SPAN ports this device may listen on (the firewall rule covers them all); 0: any, for tests. */
   port: number;
+  /** The one of them it listened on last time: tried first, so peers find it where they last did. */
+  boundPort?: number;
   /** Peers given by address ("host:port"), for networks where discovery doesn't reach. */
   peers: string[];
   /** Where devices of the workspace were reached or said to be, [device id, "host:port"]: found again after a restart. */
@@ -77,6 +80,8 @@ export interface MeshDeps {
 }
 
 export const DEFAULT_PORT = 47880;
+/** How many ports from WorkspaceSettings.port a device may listen on: the first free one is used. */
+export const PORT_SPAN = 10;
 /** Blobs no file uses any more are dropped after this long. */
 const BLOB_GRACE_MS = 7 * 86_400_000;
 /** How long a device may go without confirming a key before every holder sends it one. */
@@ -89,9 +94,21 @@ export interface RoomInfo {
   role: Role | undefined;
   members: Record<string, Role>;
   epochs: number;
+  /** A manager of the room still has a computer in the workspace (else no one can change its members any more). */
+  managed: boolean;
 }
 
 export class MeshServiceError extends Error {}
+
+/** Live rooms with a manager who has a computer that isn't revoked (`except`: as if that one were). */
+function managedRooms(state: WorkspaceState, except?: string): Set<string> {
+  const present = new Set(Object.entries(state.devices).filter(([deviceId, device]) => deviceId !== except && !device.revoked).map(([, device]) => device.user));
+  return new Set(
+    Object.entries(state.rooms)
+      .filter(([, room]) => !room.deleted && Object.entries(room.members).some(([userId, role]) => role === "manage" && !state.users[userId]?.removed && present.has(userId)))
+      .map(([roomId]) => roomId)
+  );
+}
 
 export class MeshService {
   private listeners = new Set<() => void>();
@@ -264,10 +281,20 @@ export class MeshService {
       addresses: () => this.rememberAddresses()
     });
     this.server = new PeerServer(config, (link) => this.manager?.accept(link), (reason, address) => this.deps.log(`refused ${address}: ${reason}`));
-    this.port = await this.listen(this.settings.port || DEFAULT_PORT);
+    // Saved by 0.3.5 or earlier: the port listened on, maybe the next one up after a busy 47880. The range starts there.
+    if (this.settings.boundPort === undefined && this.settings.port > DEFAULT_PORT && this.settings.port < DEFAULT_PORT + PORT_SPAN) {
+      this.settings.boundPort = this.settings.port;
+      this.settings.port = DEFAULT_PORT;
+    }
+    try {
+      this.port = await this.listen();
+    } catch (error) {
+      await this.abandonStart();
+      throw error;
+    }
     if (this.stopped) return this.abandonStart();
-    if (this.port !== this.settings.port) {
-      this.settings.port = this.port;
+    if (this.port !== this.settings.boundPort && this.settings.port !== 0) {
+      this.settings.boundPort = this.port;
       await this.deps.save();
       if (this.stopped) return this.abandonStart();
     }
@@ -301,15 +328,26 @@ export class MeshService {
     await this.server?.close();
   }
 
-  private async listen(preferred: number): Promise<number> {
-    for (let port = preferred; port < preferred + 10; port++) {
+  /**
+   * Listen on the first free port of this device's range (see WorkspaceSettings.port), the one it had last time first;
+   * never on one outside it, which the firewall rule wouldn't let others reach. (Port 0: any free port, for tests.)
+   */
+  private async listen(): Promise<number> {
+    const first = this.settings.port;
+    if (first === 0) return this.server!.listen(0);
+    const range = Array.from({ length: PORT_SPAN }, (_, i) => first + i);
+    const last = this.settings.boundPort;
+    let problem = "";
+    for (const port of last !== undefined && range.includes(last) ? [last, ...range.filter((p) => p !== last)] : range) {
       try {
         return await this.server!.listen(port);
-      } catch {
-        // busy: try the next one
+      } catch (error) {
+        problem = (error as { code?: string }).code ?? (error as Error).message;
       }
     }
-    return this.server!.listen(0);
+    throw new MeshServiceError(
+      `Other computers can't connect to this one: none of ports ${first}–${first + PORT_SPAN - 1} could be used (${problem}). Close the program using them, or choose another port in Vault Rooms' settings (and allow it in the firewall), then try again.`
+    );
   }
 
   async stop(): Promise<void> {
@@ -533,17 +571,36 @@ export class MeshService {
     return this.manager?.connected() ?? [];
   }
 
-  /** This device's addresses on the local network, for invite links. */
+  /** This device's addresses on the local network, for invite links (none while it isn't listening). */
   addresses(): string[] {
     const out: string[] = [];
+    if (this.port === 0) return out;
     for (const list of Object.values(networkInterfaces())) {
       for (const entry of list ?? []) if (entry.family === "IPv4" && !entry.internal) out.push(`${entry.address}:${this.port}`);
     }
     return out;
   }
 
+  /**
+   * Rooms no one could change the members of any more, were this device revoked: it is the last computer of their
+   * managers. (Revoking still works, as a lost computer has to be shut out; an admin can then only delete them.)
+   */
+  roomsLeftUnmanaged(deviceId: string): string[] {
+    const after = managedRooms(this.state, deviceId);
+    return [...managedRooms(this.state)].filter((roomId) => !after.has(roomId));
+  }
+
+  /** Rooms this person is the only manager of: they can't leave them, nor be removed, before someone else manages them. */
+  roomsOnlyManagedBy(userId: string): string[] {
+    const state = this.state;
+    return Object.entries(state.rooms)
+      .filter(([, room]) => !room.deleted && room.members[userId] === "manage" && !Object.entries(room.members).some(([other, role]) => other !== userId && role === "manage" && !state.users[other]?.removed))
+      .map(([roomId]) => roomId);
+  }
+
   rooms(): RoomInfo[] {
     const state = this.state;
+    const managed = managedRooms(state);
     return Object.entries(state.rooms)
       .filter(([, room]) => !room.deleted)
       .map(([id, room]) => {
@@ -557,7 +614,7 @@ export class MeshService {
             name = null;
           }
         }
-        return { id, name, role: roleIn(state, id, this.settings.userId), members: { ...room.members }, epochs: room.epochs.length };
+        return { id, name, role: roleIn(state, id, this.settings.userId), members: { ...room.members }, epochs: room.epochs.length, managed: managed.has(id) };
       });
   }
 
@@ -708,20 +765,35 @@ export class MeshService {
 
   /** Revoke a device, and withdraw the open invites it made. */
   async revokeDevice(deviceId: string): Promise<void> {
+    const pending = await this.recordFirst((join) => join.body.device.id === deviceId);
     await this.commit((state) => {
       const device = state.devices[deviceId];
       if (device) device.revoked = true;
+      for (const inviteId of pending) if (state.invites[inviteId]?.used === undefined) delete state.invites[inviteId];
       for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.dev === deviceId && invite.used === undefined) delete state.invites[inviteId];
     });
   }
 
   /** Remove a person, and withdraw the open invites they made. */
   async removeUser(userId: string): Promise<void> {
+    const pending = await this.recordFirst((join) => join.body.user.id === userId);
     await this.commit((state) => {
       const user = state.users[userId];
       if (user) user.removed = true;
+      for (const inviteId of pending) if (state.invites[inviteId]?.used === undefined) delete state.invites[inviteId];
       for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.by === userId && invite.used === undefined) delete state.invites[inviteId];
     });
+  }
+
+  /**
+   * Joins that count here but aren't recorded yet (see MeshNode.joinsInEffect), of the computer or person about to be
+   * shut out: recorded first, so shutting out takes hold of them, here and wherever they would be recorded later. Their
+   * invites, for the change itself to withdraw should recording fail.
+   */
+  private async recordFirst(of: (join: JoinRecord) => boolean): Promise<string[]> {
+    const pending = this.node.joinsInEffect().filter(of);
+    for (const join of pending) await this.commit((state) => foldJoinInto(state, join), [join]).catch((error: Error) => this.deps.log(`record join: ${error.message}`));
+    return pending.map((join) => join.body.invite);
   }
 
   async setAdmin(userId: string, admin: boolean): Promise<void> {
@@ -922,7 +994,7 @@ export class MeshService {
   /** Write proven joins into the record. Done by admins and by the invite's creator, once each. */
   private async recordJoins(): Promise<void> {
     const state = this.node.chain.state;
-    for (const join of this.node.pendingJoinRecords()) {
+    for (const join of this.node.joinsInEffect()) {
       const invite = state.invites[join.body.invite];
       if (!invite || invite.used !== undefined) continue;
       if (!(this.isAdmin() || invite.by === this.settings.userId)) continue;

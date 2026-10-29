@@ -297,6 +297,14 @@ function hasActiveAdmin(state: WorkspaceState): boolean {
   );
 }
 
+/**
+ * Whether a state holds more than the record may: users, devices, or devices of `userId` (revoked ones included).
+ * Checked when a device is recorded, and before a join takes effect without being recorded yet (applyJoins).
+ */
+export function overCapacity(state: WorkspaceState, userId: string): boolean {
+  return Object.keys(state.users).length > LIMITS.users || Object.keys(state.devices).length > LIMITS.devices || Object.values(state.devices).filter((device) => device.user === userId).length > LIMITS.devicesPerUser;
+}
+
 function hasManager(state: WorkspaceState, room: RoomRecord): boolean {
   return Object.entries(room.members).some(([userId, role]) => role === "manage" && state.users[userId] !== undefined && !state.users[userId]!.removed);
 }
@@ -500,7 +508,7 @@ export function authorize(prev: WorkspaceState, next: WorkspaceState, signer: Si
       if (!newDevices.has(deviceId) || after.revoked) deny(`device_add:${deviceId}`);
       const owner = next.users[after.user];
       if (!owner || owner.removed) deny(`device_user:${deviceId}`);
-      if (Object.values(next.devices).filter((device) => device.user === after.user).length > LIMITS.devicesPerUser) deny(`device_limit:${deviceId}`);
+      if (overCapacity(next, after.user)) deny(`device_limit:${deviceId}`);
       continue;
     }
     if (before.user !== after.user || before.sign !== after.sign || before.agree !== after.agree || before.tls !== after.tls) deny(`device_keys:${deviceId}`);

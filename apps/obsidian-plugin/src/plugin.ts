@@ -6,7 +6,7 @@ import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
 import { adapterFiles, ObsidianVault } from "./mesh/obsidianVault.js";
 import { RoomPresence } from "./mesh/presence.js";
-import { normalizeNote, RoomFolder, type RoomFolderState } from "./mesh/roomFolder.js";
+import { folderProblem, normalizeNote, RoomFolder, type RoomFolderState, type RoomHealth } from "./mesh/roomFolder.js";
 import { isScope, obsidianSecrets } from "./mesh/secrets.js";
 import { JoinModal } from "./ui/modals.js";
 import { ROOMS_VIEW, RoomsView } from "./ui/roomsView.js";
@@ -186,6 +186,8 @@ export default class VaultRoomsPlugin extends Plugin {
     this.unsubscribers.push(
       svc.onChange(() => {
         this.retryPendingMounts();
+        // A role may have changed: editors open on the room's notes become editable or read-only at once.
+        this.syncEditorsSoon();
         this.changed();
       }),
       svc.onReplica((roomId, replica) => void this.onReplica(roomId, replica)),
@@ -228,6 +230,13 @@ export default class VaultRoomsPlugin extends Plugin {
     await this.stopFolders();
     await this.service?.stop();
     this.service = null;
+  }
+
+  /** Open the workspace and start sharing again (after either failed: shown until it works). */
+  async restartService(): Promise<void> {
+    await this.starting;
+    await this.stopService();
+    await this.startService();
   }
 
   async createWorkspace(input: { workspaceName: string; userName: string; deviceName: string }): Promise<void> {
@@ -283,14 +292,14 @@ export default class VaultRoomsPlugin extends Plugin {
     return best?.roomId ?? null;
   }
 
-  /** Why a folder can't be (or become) a room's folder: unusable name, or inside, around or equal to another room's. */
-  private folderProblem(path: string, exceptRoomIds: string[] = []): string | null {
-    if (safeRoomPath(path) === null) return `"${path}" can't be shared (dot folders and some characters can't be used).`;
-    for (const [roomId, folder] of this.roomFolders()) {
-      if (exceptRoomIds.includes(roomId)) continue;
-      if (isWithin(path, folder) || isWithin(folder, path)) return `"${path}" overlaps the folder of another room ("${folder}").`;
-    }
-    return null;
+  /** Why a folder can't be (or become) a room's folder (see folderProblem), rooms shown here counted, but `exceptRoomIds`. */
+  folderProblem(path: string, exceptRoomIds: string[] = []): string | null {
+    return folderProblem(
+      path,
+      this.roomFolders()
+        .filter(([roomId]) => !exceptRoomIds.includes(roomId))
+        .map(([, folder]) => folder)
+    );
   }
 
   /** A folder for a room shared with you: under the mount root, named after the room, clashing with nothing (or null). */
@@ -433,10 +442,14 @@ export default class VaultRoomsPlugin extends Plugin {
       isBound: (fileId) => this.editors.isBound(roomId, fileId),
       inOtherRoom: (path) => this.roomAt(path) !== roomId,
       folderGone: () => void this.folderGone(roomId),
-      heldBackChanged: () => this.syncEditorsSoon(),
+      heldBackChanged: () => {
+        this.syncEditorsSoon();
+        this.changed();
+      },
       passed: () => {
         if (this.editorsWaiting) this.syncEditorsSoon();
       },
+      healthChanged: () => this.changed(),
       loadState: () => svc.disk.loadRoomState<RoomFolderState>(roomId),
       saveState: (state) => svc.disk.saveRoomState(roomId, state),
       loadSaves: () => svc.disk.loadRoomState(roomId, ".saves"),
@@ -448,6 +461,20 @@ export default class VaultRoomsPlugin extends Plugin {
     await folder.start();
     this.syncEditors();
     this.changed();
+  }
+
+  /** How a room's folder is syncing here (see RoomFolder.health), or null when it isn't shown here. */
+  roomHealth(roomId: string): RoomHealth | null {
+    return this.folders.get(roomId)?.health() ?? null;
+  }
+
+  /** Try a room's folder again now: what failed, or (if it doesn't sync at all) the whole folder, shown anew. */
+  async retryRoom(roomId: string): Promise<void> {
+    const folder = this.folders.get(roomId);
+    if (!folder?.health().stopped) return folder?.retryNow();
+    await this.unmount(roomId);
+    const replica = this.service?.replica(roomId);
+    if (replica) await this.onReplica(roomId, replica);
   }
 
   /** Room folders still stopping: a room shown again waits for its old folder to finish (see onReplica). */

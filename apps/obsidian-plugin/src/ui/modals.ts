@@ -1,6 +1,7 @@
 import { App, Modal, Notice, Setting, TFolder } from "obsidian";
 import { cleanName, ROLES, roleIn, type Role } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
+import { personLabel } from "./labels.js";
 
 const ROLE_LABEL: Record<Role, string> = { read: "Can read", write: "Can edit", manage: "Manages" };
 
@@ -33,6 +34,23 @@ export function confirmAction(app: App, title: string, body: string, action: str
     };
     modal.open();
   });
+}
+
+/** Said of a room whose managers have no computer left in the workspace (see RoomInfo.managed). */
+export const UNMANAGED = "No one can change this room's members any more: its managers have no computer left in the workspace. It keeps syncing for its members; an admin can delete it (its files stay on every computer), and share its folder again as a new room.";
+
+/** Delete a room for everyone, once confirmed (managers and admins may). */
+export async function deleteRoom(plugin: VaultRoomsPlugin, roomId: string, done?: () => void): Promise<void> {
+  const svc = plugin.service;
+  if (!svc) return;
+  const name = svc.rooms().find((room) => room.id === roomId)?.name;
+  if (!(await confirmAction(plugin.app, "Delete room", `${name ? `"${name}"` : "This room"} is deleted for everyone: its files stay on every computer that has them, but stop syncing, and no one can open the room again. This can't be undone.`, "Delete"))) return;
+  try {
+    await svc.deleteRoom(roomId);
+    done?.();
+  } catch (error) {
+    new Notice(errorText(error), 8000);
+  }
 }
 
 export class CreateWorkspaceModal extends Modal {
@@ -202,12 +220,12 @@ export class NewRoomModal extends Modal {
 
   onOpen(): void {
     this.titleEl.setText("Share a folder as a room");
-    const taken = Object.values(this.plugin.settings.mesh.workspace?.rooms ?? {}).map((room) => room.folder);
+    // The folders sharing would take: the same check it makes (names, dot folders, other rooms' folders).
     const folders = this.app.vault
       .getAllLoadedFiles()
-      .filter((file): file is TFolder => file instanceof TFolder && file.path !== "/" && !file.path.startsWith("."))
+      .filter((file): file is TFolder => file instanceof TFolder && file.path !== "/")
       .map((folder) => folder.path)
-      .filter((path) => !taken.some((room) => path === room || path.startsWith(`${room}/`) || room.startsWith(`${path}/`)))
+      .filter((path) => this.plugin.folderProblem(path) === null)
       .sort();
     const values = { folder: folders[0] ?? "", name: folders[0]?.split("/").pop() ?? "" };
     this.contentEl.createEl("p", { text: "Everything in the folder is shared, end-to-end encrypted, with the people you add. You manage the room; add people under Members afterwards." });
@@ -264,10 +282,11 @@ export class MembersModal extends Modal {
     this.titleEl.setText(`Members of ${room.name ?? "this room"}`);
     const state = svc.state;
     const iManage = room.role === "manage";
+    if (!room.managed) this.contentEl.createEl("p", { cls: "vault-rooms-error", text: UNMANAGED });
     for (const [userId, role] of Object.entries(room.members)) {
       const user = state.users[userId];
       if (!user || user.removed) continue;
-      const row = new Setting(this.contentEl).setName(`${user.name}${userId === svc.me.userId ? " (you)" : ""}`);
+      const row = new Setting(this.contentEl).setName(`${personLabel(state, userId)}${userId === svc.me.userId ? " (you)" : ""}`);
       if (iManage) {
         row.addDropdown((dropdown) => {
           for (const option of ROLES) dropdown.addOption(option, ROLE_LABEL[option]);
@@ -278,7 +297,7 @@ export class MembersModal extends Modal {
         if (userId !== svc.me.userId)
           row.addButton((button) =>
             button.setButtonText("Remove").onClick(async () => {
-              if (await confirmAction(this.app, "Remove from room", `${user.name} loses access to this room. A new room key is made, so they can't read anything added from now on (they keep what they already have).`, "Remove")) await this.run(() => svc.setMember(this.roomId, userId, null));
+              if (await confirmAction(this.app, "Remove from room", `${personLabel(state, userId)} loses access to this room. A new room key is made, so they can't read anything added from now on (they keep what they already have).`, "Remove")) await this.run(() => svc.setMember(this.roomId, userId, null));
             })
           );
       } else row.setDesc(ROLE_LABEL[role]);
@@ -291,21 +310,36 @@ export class MembersModal extends Modal {
         new Setting(this.contentEl)
           .setName("Add a person")
           .addDropdown((dropdown) => {
-            for (const [userId, user] of candidates) dropdown.addOption(userId, user.name);
+            for (const [userId] of candidates) dropdown.addOption(userId, personLabel(state, userId));
             dropdown.onChange((value) => (chosen = value));
           })
           .addDropdown((dropdown) => {
             for (const option of ROLES) dropdown.addOption(option, ROLE_LABEL[option]);
             dropdown.setValue(role).onChange((value) => (role = value as Role));
           })
-          .addButton((button) => button.setButtonText("Add").onClick(() => this.run(() => svc.setMember(this.roomId, chosen, role))));
+          .addButton((button) =>
+            button.setButtonText("Add").onClick(async () => {
+              if (await confirmAction(this.app, "Add to room", `${personLabel(state, chosen)} is added to this room (${ROLE_LABEL[role].toLowerCase()}), and gets everything already in it.`, "Add")) await this.run(() => svc.setMember(this.roomId, chosen, role));
+            })
+          );
       }
+      let name = room.name ?? "";
+      new Setting(this.contentEl)
+        .setName("Room name")
+        .addText((text) => text.setValue(name).onChange((value) => (name = cleanName(value))))
+        .addButton((button) => button.setButtonText("Rename").onClick(() => (name ? this.run(() => svc.renameRoom(this.roomId, name)) : undefined)));
     }
-    new Setting(this.contentEl).addButton((button) =>
-      button.setButtonText("Leave this room").onClick(async () => {
-        if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) await this.run(() => svc.leaveRoom(this.roomId));
-      })
-    );
+    const actions = new Setting(this.contentEl);
+    if (svc.roomsOnlyManagedBy(svc.me.userId).includes(this.roomId)) {
+      // Leaving would leave no one to manage it: the record wouldn't take it.
+      actions.setDesc("You're this room's only manager: to leave it, make someone else a manager first, or delete the room.");
+    } else
+      actions.addButton((button) =>
+        button.setButtonText("Leave this room").onClick(async () => {
+          if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) await this.run(() => svc.leaveRoom(this.roomId));
+        })
+      );
+    if (iManage || svc.isAdmin()) actions.addButton((button) => button.setButtonText("Delete room").setWarning().onClick(() => deleteRoom(this.plugin, this.roomId, () => this.close())));
   }
 
   private async run(action: () => Promise<void>): Promise<void> {

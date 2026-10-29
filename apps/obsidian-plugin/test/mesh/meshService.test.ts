@@ -290,6 +290,73 @@ describe("mesh service", () => {
     await until(() => again.node.recordCompared);
   }, 60_000);
 
+  it("listens only on its own ports, the one it had first, and says so when none of them is free", async () => {
+    // Ten ports no other test uses, all held by another program at first.
+    const base = 48_000 + (process.pid % 90) * 10;
+    const hold = async (port: number) => {
+      const server = createServer().listen(port, "0.0.0.0");
+      await once(server, "listening");
+      return server;
+    };
+    const held = new Map<number, ReturnType<typeof createServer>>();
+    for (let i = 0; i < 10; i++) held.set(base + i, await hold(base + i));
+    const free = async (port: number) => {
+      const server = held.get(port)!;
+      held.delete(port);
+      await new Promise((resolve) => server.close(resolve));
+    };
+    const d = deps("Ports");
+    const first = await MeshService.create(d, { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" });
+    d.settings.workspace!.port = base;
+    try {
+      await expect(first.start()).rejects.toThrow(`${base}–${base + 9}`);
+      expect(first.listeningPort).toBe(0);
+      expect(first.addresses()).toEqual([]);
+      await first.stop();
+      /** Obsidian starting again: the port it listens on. */
+      const restart = async () => {
+        const service = (await MeshService.open(d))!;
+        await service.start();
+        const port = service.listeningPort;
+        await service.stop();
+        return port;
+      };
+      // One comes free: it is used, and kept to after that, even once the first of them is free too.
+      await free(base + 3);
+      expect(await restart()).toBe(base + 3);
+      await free(base);
+      expect(await restart()).toBe(base + 3);
+      // Taken again: the first free one of the range, never one past it.
+      held.set(base + 3, await hold(base + 3));
+      expect(await restart()).toBe(base);
+    } finally {
+      for (const port of [...held.keys()]) await free(port);
+    }
+  }, 30_000);
+
+  it("says which rooms no one could manage any more, were a computer revoked, and shows them so once it is", async () => {
+    const ana = await started(await MeshService.create(deps("AnaM"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));
+    const roomId = await ana.createRoom("Plans");
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const ben = await started(await MeshService.join(deps("BenM"), { link, userName: "Ben", deviceName: "Ben PC" }));
+    await until(() => ana.node.chain.state.devices[ben.me.deviceId] !== undefined);
+    await ana.setAdmin(ben.me.userId, true);
+    await until(() => ben.isAdmin());
+    // Ana's PC is the last computer of the room's only manager.
+    expect(ben.roomsLeftUnmanaged(ana.me.deviceId)).toEqual([roomId]);
+    expect(ana.roomsOnlyManagedBy(ana.me.userId)).toEqual([roomId]);
+    // With a second computer of hers, it isn't.
+    const deviceLink = (await ana.createDeviceInvite()).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const laptop = await started(await MeshService.join(deps("AnaM2"), { link: deviceLink, userName: "Ana", deviceName: "Ana laptop" }));
+    await until(() => ben.state.devices[laptop.me.deviceId] !== undefined);
+    expect(ben.roomsLeftUnmanaged(ana.me.deviceId)).toEqual([]);
+    // Both revoked: the room is shown as one no one can manage.
+    await ben.revokeDevice(laptop.me.deviceId);
+    expect(ben.roomsLeftUnmanaged(ana.me.deviceId)).toEqual([roomId]);
+    await ben.revokeDevice(ana.me.deviceId);
+    expect(ben.rooms().find((room) => room.id === roomId)?.managed).toBe(false);
+  }, 30_000);
+
   it("never goes online once stopped", async () => {
     const service = await MeshService.create(deps("Gone"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
     service.settings.port = 0;

@@ -7,7 +7,7 @@ import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
-import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
+import { createRoom, fold, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion, rebaseChange } from "./workspace.js";
 
 function nodeFor(chain: WorkspaceChain, device: TestDevice, log: string[] = []): MeshNode {
@@ -527,6 +527,24 @@ describe("mesh", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("lets a join take effect only within the record's limits, counting the joins before it", () => {
+    const { chain, ana } = setup();
+    // Computers of Ana's up to one below the limit, then two more joining at once.
+    while (Object.values(chain.state.devices).filter((device) => device.user === ana.userId).length < 29) invite(chain, ana, { forUser: ana });
+    const joins = [invite(chain, ana, { forUser: ana, fold: false }).join, invite(chain, ana, { forUser: ana, fold: false }).join];
+    const a = nodeFor(chain, ana);
+    for (const join of joins) a.addJoin(join);
+    expect(a.joinsInEffect()).toHaveLength(1);
+    expect(Object.values(a.effective().devices).filter((device) => device.user === ana.userId)).toHaveLength(30);
+    // Once the one in effect is recorded, the other can't take effect at all.
+    const recorded = a.joinsInEffect()[0]!;
+    fold(chain, ana, recorded);
+    const b = nodeFor(chain, ana);
+    b.addJoin(joins.find((join) => join !== recorded)!);
+    expect(b.joinsInEffect()).toEqual([]);
+    expect(Object.values(b.effective().devices).filter((device) => device.user === ana.userId)).toHaveLength(30);
   });
 
   it("doesn't hold an attachment it received in memory to store it again", async () => {
