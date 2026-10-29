@@ -185,6 +185,8 @@ function suffixed(path: string, tag: string): string | null {
 export class RoomFolder {
   private known = new Map<string, Known>();
   private expected = new Map<string, string>();
+  /** Moves this folder makes, by the vault path moved from: where to (see move). */
+  private moving = new Map<string, string>();
   private queue: Promise<void> = Promise.resolve();
   private materializeTimer: ReturnType<typeof setTimeout> | null = null;
   /** A pass is queued and hasn't started: it will see every change made until it does. */
@@ -201,6 +203,8 @@ export class RoomFolder {
   private retryIds = new Set<string>();
   /** A removal or rename failed: the retry is a full pass. Taking in local files failed: the retry tries again. */
   private retryAll = false;
+  /** The next pass is a retry's (see retrySoon). */
+  private retrying = false;
   private retryAdopt = false;
   /** Versions of files kept as conflict copies since they were last synced, by path key: kept once (see keepAside). */
   private keptAside = new Map<string, { hash: string; name: string }>();
@@ -618,8 +622,19 @@ export class RoomFolder {
     return this.expecting(path, DELETED, () => this.o.vault.trash(path));
   }
 
-  private move(from: string, to: string): Promise<void> {
-    return this.expecting(this.vaultPath(from), `\u0000moved:${this.vaultPath(to)}`, () => this.o.vault.rename(this.vaultPath(from), this.vaultPath(to)));
+  /**
+   * Move a file, its rename event marked as ours apart from the marks of writes: a new file written at the old name in
+   * the same pass must not make this move look like the user's (and the new file be renamed for everyone).
+   */
+  private async move(from: string, to: string): Promise<void> {
+    const [oldPath, newPath] = [this.vaultPath(from), this.vaultPath(to)];
+    this.moving.set(oldPath, newPath);
+    try {
+      await this.o.vault.rename(oldPath, newPath);
+    } catch (error) {
+      this.moving.delete(oldPath);
+      throw error;
+    }
   }
 
   /** A free name next to `relative` for a copy of a file that would otherwise be lost (one safe path segment). */
@@ -699,8 +714,8 @@ export class RoomFolder {
 
   private async materializeNow(): Promise<void> {
     if (this.stopped || !this.started) return;
-    const { everything, dirty } = this;
-    this.everything = false;
+    const { everything, dirty, retrying } = this;
+    this.everything = this.retrying = false;
     this.dirty = new Set();
     this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
@@ -726,10 +741,14 @@ export class RoomFolder {
         done = false;
       }
     }
+    // Whose each local name is, once the renames are done: a file still tracked as another's (whose rename or removal
+    // is still to come, a file in the way being in use) is never taken for this one, nor written over.
+    const owners = new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const));
     for (const [id, entry] of desired) {
       if (!everything && !dirty.has(id) && !this.toKeep.has(id)) continue;
-      // One that failed (a file in use, say) is tried again by the next retry.
-      if (!(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
+      const owner = owners.get(pathKey(entry.path));
+      // One that failed (a file in use, say), or must wait for another, is tried again by the next retry.
+      if ((owner !== undefined && owner !== id) || !(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
         this.retryIds.add(id);
         done = false;
       }
@@ -741,12 +760,13 @@ export class RoomFolder {
         done = false;
       }
     }
-    // Work that failed is tried again by itself, soon at first and less often while it keeps failing.
-    // Back to the first delay only once nothing waits to be tried again (other passes may well go fine meanwhile).
+    // Work that failed is tried again by itself, soon at first and less often while it keeps failing: back to the first
+    // delay only when a retry's own pass goes fine (other passes may well go fine meanwhile).
     if (!done) this.retrySoon();
-    else if (!this.retryTimer) this.retryIn = RETRY_FIRST_MS;
-    // A whole pass without trouble: whatever failed before (for a file gone since, say) isn't failing any more.
-    if (done && everything && this.failing.size > 0) {
+    else if (retrying) this.retryIn = RETRY_FIRST_MS;
+    // A whole pass without trouble: whatever failed before (for a file gone since, say) isn't failing any more, unless
+    // taking in local files waits to be tried again (a whole pass doesn't).
+    if (done && everything && !this.retryAdopt && this.failing.size > 0) {
       this.failing.clear();
       this.o.healthChanged?.();
     }
@@ -759,6 +779,7 @@ export class RoomFolder {
     if (this.stopped || this.retryTimer) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
+      this.retrying = true;
       for (const id of this.retryIds) this.dirty.add(id);
       this.retryIds.clear();
       if (this.retryAll) this.everything = true;
@@ -1080,6 +1101,19 @@ export class RoomFolder {
       if (!this.o.vault.stat(vaultPath)) return;
       const id = this.idAt(relative) ?? [...this.queuedEntries].find(([, path]) => pathKey(path) === pathKey(relative))?.[0];
       const entry = id ? this.o.replica.files().get(id) : undefined;
+      // A new file here, nothing of ours: taken in, which checks its size before reading it (it may be huge). One that
+      // can't be read yet (in use) is told of, and taken in by a retry.
+      if (!id && !this.expected.has(vaultPath)) {
+        if (!this.o.replica.canWrite()) return this.readOnlyNotice(`You can only read this room: "${relative}" stays on this computer and isn't shared.`);
+        if (!(await this.safely(relative, () => this.createEntry(relative)))) {
+          this.retryAdopt = true;
+          this.retrySoon();
+        }
+        return;
+      }
+      // Still under its old name here (its rename is blocked by a file in the way): the change waits for the rename,
+      // and is taken in from the new name by the pass after it.
+      if (id && entry && this.known.has(id) && this.known.get(id)!.path !== entry.path) return this.remoteChanged(id);
       // Read as what the shared file is (a note or another file), even under a name that says otherwise (renamed so by
       // an earlier version): a note's text never goes out as an attachment, nor the reverse.
       const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
@@ -1168,9 +1202,8 @@ export class RoomFolder {
     this.noteLocal(newVaultPath, true);
     return this.run(async () => {
       if (!this.started) return; // taken in by start
-      const expected = this.expected.get(oldVaultPath);
-      if (expected === `\u0000moved:${newVaultPath}`) {
-        this.expected.delete(oldVaultPath);
+      if (this.moving.get(oldVaultPath) === newVaultPath) {
+        this.moving.delete(oldVaultPath);
         return;
       }
       const from = this.relative(oldVaultPath);
@@ -1180,7 +1213,7 @@ export class RoomFolder {
       if (id && (to !== null || unusable)) {
         // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name.
         const back = () => {
-          this.expected.set(newVaultPath, `\u0000moved:${oldVaultPath}`);
+          this.moving.set(newVaultPath, oldVaultPath);
           return this.o.vault.rename(newVaultPath, oldVaultPath);
         };
         if (unusable) {
