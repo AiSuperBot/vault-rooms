@@ -529,13 +529,12 @@ describe("mesh", () => {
     }
   });
 
-  it("sends the record to a peer behind it in messages of bounded size, and a branch of its own whole", () => {
+  it("sends the record as the previous release does, 500 versions a message, cutting only what wouldn't fit a frame", () => {
     const { chain, ana, cy } = setup();
     const base = chain.length;
-    for (let i = 0; i < 300; i++) createRoom(chain, ana, `Room ${i}`);
+    for (let i = 0; i < 20; i++) createRoom(chain, ana, `Room ${i}`);
     const added = chain.all().slice(base);
-    expect(added.reduce((bytes, version) => bytes + Buffer.byteLength(JSON.stringify(version)), 0)).toBeGreaterThan(8 << 20);
-    /** Cy's computer with the record up to `base` (and `own`, a version of its own), meeting Ana's: what it is sent. */
+    /** Cy's computer with the record up to `base` (and, with `own`, a version of its own), meeting Ana's: what it is sent. */
     const meet = (own: boolean) => {
       const prefix = WorkspaceChain.load(chain.all().slice(0, base));
       if (own) step(prefix, cy, (state) => void (state.users[cy.userId]!.name = "Cy too"));
@@ -546,15 +545,20 @@ describe("mesh", () => {
       const net = new Network();
       net.link(nodeFor(chain, ana), c);
       net.pump();
-      return { c, offered };
+      return offered;
     };
-    const behind = meet(false);
-    expect(behind.offered.length).toBeGreaterThan(1);
-    expect(behind.offered.reduce((a, b) => a + b, 0)).toBe(added.length);
-    expect(behind.c.chain.headHash).toBe(chain.headHash);
-    for (const batch of versionBatches(added)) expect(batch.reduce((bytes, version) => bytes + Buffer.byteLength(JSON.stringify(version)), 0)).toBeLessThanOrEqual(8 << 20);
-    expect(meet(true).offered[0]).toBe(added.length);
-  }, 60_000);
+    // Behind, or with a branch of its own: all of it in one message, judged whole.
+    expect(meet(false)).toEqual([added.length]);
+    expect(meet(true)).toEqual([added.length]);
+    // Cut by size: every version, in order, each run within the size (or a single version).
+    const size = (version: (typeof added)[number]) => Buffer.byteLength(JSON.stringify(version));
+    const limit = Math.max(...added.map(size)) * 3;
+    const runs = versionBatches(added, limit);
+    expect(runs.flat()).toEqual(added);
+    expect(runs.length).toBeGreaterThan(1);
+    for (const run of runs) expect(run.length === 1 || run.reduce((bytes, version) => bytes + size(version), 0) <= limit).toBe(true);
+    expect(versionBatches(added, Infinity)).toEqual([added]);
+  });
 
   it("lets a join take effect only within the record's limits, counting the joins before it", () => {
     const { chain, ana } = setup();

@@ -298,11 +298,14 @@ function hasActiveAdmin(state: WorkspaceState): boolean {
 }
 
 /**
- * Whether a state holds more than the record may: users, devices, or devices of `userId` (revoked ones included).
- * Checked when a device is recorded, and before a join takes effect without being recorded yet (applyJoins).
+ * Whether a state holds more than the record may: users, devices, or devices of `userId` (revoked ones included);
+ * with `joining`, counting one more device of theirs (and them, if new). Checked when a device is recorded, and before
+ * a join takes effect without being recorded yet (applyJoins).
  */
-export function overCapacity(state: WorkspaceState, userId: string): boolean {
-  return Object.keys(state.users).length > LIMITS.users || Object.keys(state.devices).length > LIMITS.devices || Object.values(state.devices).filter((device) => device.user === userId).length > LIMITS.devicesPerUser;
+export function overCapacity(state: WorkspaceState, userId: string, joining = false): boolean {
+  const more = joining ? 1 : 0;
+  const users = Object.keys(state.users).length + (joining && state.users[userId] === undefined ? 1 : 0);
+  return users > LIMITS.users || Object.keys(state.devices).length + more > LIMITS.devices || Object.values(state.devices).filter((device) => device.user === userId).length + more > LIMITS.devicesPerUser;
 }
 
 function hasManager(state: WorkspaceState, room: RoomRecord): boolean {

@@ -195,9 +195,14 @@ export class RoomFolder {
    */
   private dirty = new Set<string>();
   private everything = true;
-  /** A pass that will try again what failed (see retrySoon), and how long the next one waits. */
+  /** A pass that will try again what failed (see retrySoon), how long the next one waits, and what it tries again. */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryIn = RETRY_FIRST_MS;
+  private retryIds = new Set<string>();
+  /** A removal or rename failed: the retry is a full pass. */
+  private retryAll = false;
+  /** Versions of files kept as conflict copies since they were last synced, by path key: kept once (see keepAside). */
+  private keptAside = new Map<string, { hash: string; name: string }>();
   /** Work that failed and isn't done yet (by file path, or "renames"): what went wrong. See health. */
   private failing = new Map<string, string>();
   /** Why the folder doesn't sync at all (what it last synced couldn't be read), if so. */
@@ -274,6 +279,12 @@ export class RoomFolder {
     return id && this.o.replica.files().get(id)?.kind === "md" && !this.heldBack.has(id) && !this.doubtful(id) ? id : null;
   }
 
+  /** Stop tracking a file (gone, or no longer the room's), and whatever was held back of it. */
+  private forget(id: string): void {
+    this.known.delete(id);
+    if (this.heldBack.delete(id)) this.o.heldBackChanged?.();
+  }
+
   /** Remembered in an earlier session before what was made here got stored: settled by the next pass, not by an editor. */
   private doubtful(id: string): boolean {
     return this.known.get(id)?.unstored !== undefined && !this.unstoredNow.has(id);
@@ -324,7 +335,14 @@ export class RoomFolder {
     if (this.retryTimer) clearTimeout(this.retryTimer);
     this.retryTimer = null;
     this.retryIn = RETRY_FIRST_MS;
+    this.retryIds.clear();
+    this.retryAll = false;
     this.everything = true;
+    // Held-back files too: looked at afresh (shared now if they can be, held back again if not).
+    if (this.heldBack.size > 0) {
+      this.heldBack.clear();
+      this.o.heldBackChanged?.();
+    }
     if (this.started && !this.stopped) this.queuePass();
   }
 
@@ -512,6 +530,7 @@ export class RoomFolder {
    */
   private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false): void {
     const replica = this.o.replica;
+    this.keptAside.delete(pathKey(path));
     const stat = this.o.vault.stat(this.vaultPath(path));
     const pending = this.unstoredNow.get(id) ?? { docs: new Set<string>(), keys: new Set<string>(), index: false, created: false };
     if (isMarkdownPath(path)) pending.docs.add(id);
@@ -617,10 +636,15 @@ export class RoomFolder {
   }
 
   private async keepAside(relative: string, content: string | Uint8Array): Promise<string> {
+    // This very version is kept already (by a try that failed after it, say), and the copy is still there: not again.
+    const hash = sha(content);
+    const kept = this.keptAside.get(pathKey(relative));
+    if (kept?.hash === hash && this.o.vault.stat(this.vaultPath(kept.name))) return kept.name;
     const name = this.copyName(relative, "conflict");
     // Not marked as ours: the copy is a local addition and gets shared like any other.
     if (typeof content === "string") await this.o.vault.writeText(this.vaultPath(name), content);
     else await this.o.vault.writeBytes(this.vaultPath(name), content);
+    this.keptAside.set(pathKey(relative), { hash, name });
     this.o.notify(`"${relative}" was changed here and by someone else at the same time. Your version is kept as "${name}".`);
     return name;
   }
@@ -640,7 +664,12 @@ export class RoomFolder {
     // A new name fits every limit and is no other file's (nor one given just before): with the id's start, longer if
     // that is taken. Groups go in a fixed order, so every device names them alike.
     const taken = new Set(groups.keys());
-    for (const key of [...groups.keys()].sort()) {
+    const clashing: string[] = [];
+    for (const [key, group] of groups) {
+      if (group.length === 1) out.set(group[0]![0], group[0]![1]);
+      else clashing.push(key);
+    }
+    for (const key of clashing.sort()) {
       const group = groups.get(key)!.sort(([a], [b]) => (a < b ? -1 : 1));
       group.forEach(([id, entry], index) => {
         if (index === 0) return out.set(id, entry);
@@ -684,28 +713,31 @@ export class RoomFolder {
         if (entries.get(id)?.deleted) whole = (await this.safely(known.path, () => this.applyRemoval(id, known))) && whole;
         else if (!entries.has(id) && this.doubtful(id) && known.unstored === "entry") {
           // Shared in a session that ended before its new entry was stored, so no one has it: shared again.
-          this.known.delete(id);
+          this.forget(id);
           this.needsAdopt = true;
         }
       }
       whole = (await this.safely("renames", () => this.applyRenames(desired))) && whole;
-      // What failed (a file in use, say) is looked at again by the next full pass.
+      // What failed (a file in use, say) is looked at again by the full pass of the next retry (see retrySoon).
       if (!whole) {
-        this.everything = true;
+        this.retryAll = true;
         done = false;
       }
     }
     for (const [id, entry] of desired) {
       if (!everything && !dirty.has(id) && !this.toKeep.has(id)) continue;
-      // One that failed (a file in use, say) is tried again by the next pass.
+      // One that failed (a file in use, say) is tried again by the next retry.
       if (!(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
-        this.dirty.add(id);
+        this.retryIds.add(id);
         done = false;
       }
     }
     if (this.needsAdopt && replica.canWrite()) {
       this.needsAdopt = false;
-      if (!(await this.adoptLocalFiles())) this.needsAdopt = done = false;
+      if (!(await this.adoptLocalFiles())) {
+        this.needsAdopt = true;
+        done = false;
+      }
     }
     // Work that failed is tried again by itself, soon at first and less often while it keeps failing.
     if (done) this.retryIn = RETRY_FIRST_MS;
@@ -719,10 +751,15 @@ export class RoomFolder {
     if (this.ready) this.o.passed?.();
   }
 
+  /** What failed is tried again by a pass of its own, on this schedule only (passes for other changes stay small). */
   private retrySoon(): void {
     if (this.stopped || this.retryTimer) return;
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
+      for (const id of this.retryIds) this.dirty.add(id);
+      this.retryIds.clear();
+      if (this.retryAll) this.everything = true;
+      this.retryAll = false;
       this.queuePass();
     }, this.retryIn);
     this.retryIn = Math.min(this.retryIn * 2, RETRY_MAX_MS);
@@ -870,16 +907,16 @@ export class RoomFolder {
     const busy = (this.doubtful(id) && known.unstored !== "received") || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     // Forgotten only once the file is dealt with: one that can't be read or trashed now (in use, say) stays tracked, and
     // is tried again, rather than being left behind untracked and shared again as a new file.
-    if (!stat) return void this.known.delete(id);
+    if (!stat) return this.forget(id);
     const current = (entry ? entry.kind === "md" : isMarkdownPath(known.path)) ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(current) === known.hash);
     if (unchanged) {
       await this.trash(known.path);
-      this.known.delete(id);
+      this.forget(id);
       return;
     }
     // Changed here after someone else removed it, or being worked on here: keep it, and share it again as a new file.
-    this.known.delete(id);
+    this.forget(id);
     if (!this.o.replica.canWrite()) return;
     await this.createEntry(known.path);
     this.o.notify(`"${known.path}" was deleted by someone else while you were working on it here. Your copy stays, and is shared again.`);
@@ -1039,6 +1076,9 @@ export class RoomFolder {
       const content = asNote ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
       const hash = sha(content);
       if (this.isEcho(vaultPath, hash)) return;
+      // Someone else deleted it, and it couldn't be trashed here yet: the removal, tried again, settles it (sharing it
+      // again once, if it was changed here).
+      if (id && !entry && this.o.replica.entries().get(id)?.deleted) return this.remoteChanged();
       if (!id || !entry) {
         if (this.o.replica.canWrite()) return this.createEntry(relative);
         return this.readOnlyNotice(`You can only read this room: "${relative}" stays on this computer and isn't shared.`);
@@ -1102,7 +1142,7 @@ export class RoomFolder {
     if (this.o.vault.stat(vaultPath)) return; // back already
     const id = this.idAt(relative);
     if (!id) return;
-    this.known.delete(id);
+    this.forget(id);
     if (!this.o.replica.canWrite()) {
       this.readOnlyNotice(`You can only read this room, so "${relative}" was put back.`);
       this.dirty.add(id);
@@ -1137,8 +1177,10 @@ export class RoomFolder {
           this.tellOnce(`rename:${newVaultPath}`, `"${newVaultPath.slice(this.prefix.length)}" can't be used in a shared room (too long, an unusual character, or a file type that isn't shared). The file keeps its old name.`);
           return back();
         }
-        // A note and other files are shared differently: one can't become the other by a new name.
-        if (isMarkdownPath(from!) !== isMarkdownPath(to!)) {
+        // A note and other files are shared differently: one can't become the other by a new name. (Judged by what it is
+        // shared as, so a note an earlier version renamed to Plan.txt may go back to Plan.md.)
+        const isNote = (this.o.replica.files().get(id)?.kind ?? (isMarkdownPath(from!) ? "md" : "bin")) === "md";
+        if (isNote !== isMarkdownPath(to!)) {
           this.tellOnce(`kind:${newVaultPath}`, `"${from}" keeps its name: in a shared room a note can't be renamed into another type of file, nor another file into a note. Make a copy under the new name instead.`);
           return back();
         }
@@ -1154,7 +1196,7 @@ export class RoomFolder {
       }
       // Moved out of the room: it leaves the room. Moved in: it joins it.
       if (id) {
-        this.known.delete(id);
+        this.forget(id);
         if (!this.o.replica.canWrite()) {
           this.dirty.add(id);
           return this.materializeNow();

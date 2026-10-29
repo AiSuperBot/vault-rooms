@@ -1,7 +1,7 @@
 import * as tls from "node:tls";
 import { b64u, concatBytes, utf8 } from "./bytes.js";
 import { hashTagged, sign, verify, type KeyPair } from "./crypto.js";
-import { encodeFrame, FrameReader, MAX_FRAME } from "./frames.js";
+import { encodeFrame, FrameReader, MAX_FRAME, PROVEN_MAX_FRAME } from "./frames.js";
 import { deviceIdFor } from "./ids.js";
 import type { Channel, PeerMessage } from "./mesh.js";
 import { certificateFingerprint, type TlsIdentity } from "./tlsIdentity.js";
@@ -29,8 +29,6 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
 const EXPORTER_LABEL = "EXPORTER-vault-rooms-peer-auth";
 const AUTH_TIMEOUT_MS = 10_000;
 const AUTH_MAX_FRAME = 64 << 10;
-/** Until a member, once it has shown it holds our record: a message of record versions (see PeerSession). */
-const PROVEN_MAX_FRAME = 16 << 20;
 const PING_EVERY_MS = 15_000;
 const SILENCE_LIMIT_MS = 45_000;
 const MAX_BUFFERED = 128 << 20;
