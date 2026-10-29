@@ -3,6 +3,8 @@ import { fail } from "./errors.js";
 /** Messages on a peer connection: a 4-byte big-endian length, then that many bytes of UTF-8 JSON. */
 
 export const MAX_FRAME = 64 << 20;
+/** Frames from a device that isn't a member here yet, once it has shown it holds this device's record (see PeerSession). */
+export const PROVEN_MAX_FRAME = 16 << 20;
 
 export function encodeFrame(message: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(message), "utf8");

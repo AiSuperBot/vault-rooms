@@ -232,12 +232,20 @@ export default class VaultRoomsPlugin extends Plugin {
     this.service = null;
   }
 
-  /** Open the workspace and start sharing again (after either failed: shown until it works). */
-  async restartService(): Promise<void> {
-    await this.starting;
-    await this.stopService();
-    await this.startService();
+  /**
+   * Open the workspace and start sharing again (after either failed: shown until it works). One at a time: a second
+   * call while one runs gets that one, so two services of this device never run at once; and an unload waits for it.
+   */
+  restartService(): Promise<void> {
+    if (!this.restarting) {
+      const run = this.starting.then(() => this.stopService()).then(() => this.startNow());
+      this.starting = run.catch(() => {});
+      this.restarting = run.finally(() => (this.restarting = null));
+    }
+    return this.restarting;
   }
+
+  private restarting: Promise<void> | null = null;
 
   async createWorkspace(input: { workspaceName: string; userName: string; deviceName: string }): Promise<void> {
     const service = await MeshService.create(this.deps(), input);

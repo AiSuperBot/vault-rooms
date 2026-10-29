@@ -73,7 +73,11 @@ export class RoomsView extends ItemView {
     if (this.plugin.serviceError) {
       root.createEl("p", { text: this.plugin.serviceError, cls: "vault-rooms-error" });
       const buttons = root.createDiv({ cls: "vault-rooms-buttons" });
-      buttons.createEl("button", { text: "Try again", cls: "mod-cta" }).onclick = () => this.act(() => this.plugin.restartService());
+      const retry = buttons.createEl("button", { text: "Try again", cls: "mod-cta" });
+      retry.onclick = () => {
+        retry.disabled = true;
+        void this.act(() => this.plugin.restartService());
+      };
       if (!svc) {
         buttons.createEl("button", { text: "Leave the workspace on this computer" }).onclick = async () => {
           if (await confirmAction(this.app, "Leave the workspace", "This deletes the workspace data and this computer's keys from this vault. Your files stay. You can join again with a new invite.", "Leave")) await this.act(() => this.plugin.leaveWorkspace());

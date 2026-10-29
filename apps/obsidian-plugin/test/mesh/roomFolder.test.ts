@@ -2098,3 +2098,95 @@ describe("room folder, rules and health", () => {
     expect(a.folder.health().heldBack).toEqual(["Plan.md"]);
   });
 });
+
+describe("room folder, retries", () => {
+  it("shares a file it couldn't trash yet only once when it is saved meanwhile", async () => {
+    const { s, a, c } = await pair();
+    await c.vault.writeText("Team/Plan.md", "base\n");
+    await s.settle();
+    a.vault.failTrash = (path) => path === "Team/Plan.md";
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    await a.vault.writeText("Team/Plan.md", "base\nkept\n");
+    await s.settle();
+    const live = (pc: { replica: { files(): Map<string, { path: string }> } }) => [...pc.replica.files().values()].filter((entry) => entry.path.startsWith("Plan"));
+    expect(live(a)).toHaveLength(1);
+    expect(live(c)).toHaveLength(1);
+    expect(text(c.vault, `Team/${live(c)[0]!.path}`)).toBe("base\nkept\n");
+  });
+
+  it("takes in a local file it couldn't read at first, once it can", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/scan.pdf", new Uint8Array([1, 2, 3]));
+    let blocked = true;
+    a.vault.failReads = (path) => blocked && path === "Team/scan.pdf";
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    await s.settle();
+    expect([...a.replica.files().values()]).toEqual([]);
+    blocked = false;
+    await until(() => [...a.replica.files().values()].some((entry) => entry.path === "scan.pdf"));
+  });
+
+  it("tries a failed deletion again on its own schedule, keeping other passes small", async () => {
+    const files: Record<string, string> = {};
+    for (let i = 0; i < 20; i++) files[`n${i}.md`] = `note ${i}\n`;
+    const { s, a, c } = await pair(files);
+    await c.vault.writeText("Team/Plan.md", "base\n");
+    await s.settle();
+    a.vault.failTrash = (path) => path === "Team/Plan.md";
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    // A change to one note right after: its pass looks at that note, not at every note of the room.
+    let looked = 0;
+    const noteText = a.replica.noteText.bind(a.replica);
+    a.replica.noteText = (id: string) => (looked++, noteText(id));
+    await c.vault.writeText("Team/n5.md", "note 5, edited\n");
+    await s.settle();
+    expect(text(a.vault, "Team/n5.md")).toBe("note 5, edited\n");
+    expect(looked).toBeLessThan(5);
+  });
+
+  it("keeps one copy of a version it couldn't write over, however often it tries again", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "base\n" });
+    // Changed here while Obsidian was closed, and by Cy: Ana's file can't be written while it is open elsewhere.
+    a.vault.silently("Team/Plan.md", "base\nana\n");
+    a.vault.failWrites = (path) => path === "Team/Plan.md";
+    await c.vault.writeText("Team/Plan.md", "base\ncy\n");
+    await s.settle();
+    await new Promise((resolve) => setTimeout(resolve, 3_500));
+    const copies = () => [...a.vault.files.keys()].filter((path) => path.includes("(conflict"));
+    expect(copies()).toHaveLength(1);
+    a.vault.failWrites = undefined;
+    await until(() => text(a.vault, "Team/Plan.md") === "base\ncy\n");
+    expect(copies()).toHaveLength(1);
+    expect(text(a.vault, copies()[0]!)).toBe("base\nana\n");
+  }, 20_000);
+
+  it("looks again at files held back when asked, and forgets those gone", async () => {
+    const { s, a } = await pair({ "Plan.md": "base\n", "Log.md": "log\n" });
+    const ids = [...a.replica.files()].map(([id]) => id);
+    for (const id of ids) a.folder.holdBackNote(id);
+    expect(a.folder.health().heldBack.sort()).toEqual(["Log.md", "Plan.md"]);
+    await a.vault.trash("Team/Log.md");
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual(["Plan.md"]);
+    a.folder.retryNow();
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual([]);
+  });
+
+  it("lets a note an earlier version renamed into another type of file take a note's name again", async () => {
+    const { s, a, c } = await pair({ "a.md": "hello\n" });
+    const [id] = [...c.replica.files().keys()];
+    c.replica.editIndex((files) => files.set(id!, { path: "a.txt", kind: "md" }));
+    await s.settle();
+    await a.vault.rename("Team/a.txt", "Team/a.md");
+    await s.settle();
+    expect(a.vault.files.has("Team/a.md")).toBe(true);
+    expect(c.replica.files().get(id!)?.path).toBe("a.md");
+    expect(a.notices.filter((message) => message.includes("can't be renamed"))).toEqual([]);
+  });
+});

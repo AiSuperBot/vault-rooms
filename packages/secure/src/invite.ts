@@ -211,16 +211,14 @@ export function applyJoins(
     if (!current || hash < current.hash) best.set(join.body.invite, { join, hash });
   }
   if (best.size === 0) return { state, applied: [] };
-  let next = structuredClone(state);
+  const next = structuredClone(state);
   const applied: JoinRecord[] = [];
   const takenUsers = new Set<string>();
   for (const { join } of [...best.values()].sort((a, b) => (a.hash < b.hash ? -1 : 1))) {
     if (next.devices[join.body.device.id] || (!state.invites[join.body.invite]!.forUser && takenUsers.has(join.body.user.id))) continue;
     // Only within what the record may hold, counting the joins before it: as recording them all would be.
-    const trial = structuredClone(next);
-    foldJoinInto(trial, join);
-    if (overCapacity(trial, join.body.user.id)) continue;
-    next = trial;
+    if (overCapacity(next, join.body.user.id, true)) continue;
+    foldJoinInto(next, join);
     takenUsers.add(join.body.user.id);
     applied.push(join);
   }

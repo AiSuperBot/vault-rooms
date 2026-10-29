@@ -4,6 +4,7 @@ import { MAX_FORK_DEPTH, WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
 import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
+import { MAX_FRAME, PROVEN_MAX_FRAME } from "./frames.js";
 import { isId } from "./ids.js";
 import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, verifyJoinRecord, type JoinRecord } from "./invite.js";
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
@@ -94,16 +95,16 @@ function chunks<T>(items: T[], size: number): T[][] {
 }
 
 /**
- * Record versions in messages a peer takes whatever it allows us: at most MAX_ITEMS versions and about `maxBytes`
- * each (a version is at most LIMITS.versionBytes, so one always fits, well under the smallest frame limit that applies).
+ * Record versions in runs of at most about `maxBytes` (a version is at most LIMITS.versionBytes, so one always fits the
+ * frame limits that apply): all of them in one when they fit.
  */
-export function versionBatches(versions: SignedVersion[], maxBytes = MAX_BATCH_BYTES): SignedVersion[][] {
+export function versionBatches(versions: SignedVersion[], maxBytes: number): SignedVersion[][] {
   const out: SignedVersion[][] = [];
   let batch: SignedVersion[] = [];
   let bytes = 0;
   for (const version of versions) {
     const size = Buffer.byteLength(JSON.stringify(version), "utf8");
-    if (batch.length > 0 && (batch.length >= MAX_ITEMS || bytes + size > maxBytes)) {
+    if (batch.length > 0 && bytes + size > maxBytes) {
       out.push(batch);
       batch = [];
       bytes = 0;
@@ -817,10 +818,12 @@ export class PeerSession {
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
       const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
-      // Only behind (their head is in our record): every message extends theirs, so messages are cut to fit any frame.
-      // A branch of their own is judged against ours whole: it goes as the previous release sends it.
-      const behind = theirHead === -1 || (theirHead === common && this.node.chain.hashAt(theirHead) === theirHeadHash);
-      for (const batch of behind ? versionBatches(versions) : chunks(versions, MAX_ITEMS)) this.send({ t: "versions", versions: batch });
+      // As the previous release sends them, 500 versions a message: the other side judges a branch by what one message
+      // holds. Only a message too large for the frames it reads from us is cut by size (it would fail whole): 64 MiB, or
+      // 16 MiB while its record doesn't list this device yet.
+      const knowsUs = theirHead === -1 || (common >= 0 && this.node.chain.versionAt(common)?.body.state.devices[this.node.deviceId] !== undefined);
+      const fits = (knowsUs ? MAX_FRAME : PROVEN_MAX_FRAME) - (1 << 20);
+      for (const chunk of chunks(versions, MAX_ITEMS)) for (const batch of versionBatches(chunk, fits)) this.send({ t: "versions", versions: batch });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
