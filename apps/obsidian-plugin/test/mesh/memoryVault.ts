@@ -23,14 +23,22 @@ export class MemoryVault implements VaultLike {
     return data ? Buffer.from(data).toString("utf8") : undefined;
   }
 
+  /** Reads, or moves to the trash, of paths these are true for fail (a file held by another program, say). */
+  failReads?: (path: string) => boolean;
+  failTrash?: (path: string) => boolean;
+  /** How many times the folder's files were listed. */
+  lists = 0;
+
   async readText(path: string): Promise<string> {
     await this.gate?.(path);
+    if (this.failReads?.(path)) throw new Error(`EBUSY ${path}`);
     const data = this.files.get(path);
     if (!data) throw new Error(`ENOENT ${path}`);
     return Buffer.from(data).toString("utf8");
   }
 
   async readBytes(path: string): Promise<Uint8Array> {
+    if (this.failReads?.(path)) throw new Error(`EBUSY ${path}`);
     const data = this.files.get(path);
     if (!data) throw new Error(`ENOENT ${path}`);
     return new Uint8Array(data);
@@ -81,12 +89,14 @@ export class MemoryVault implements VaultLike {
   }
 
   async trash(path: string): Promise<void> {
+    if (this.failTrash?.(path)) throw new Error(`EBUSY ${path}`);
     this.files.delete(path);
     this.trashed.push(path);
     this.listener.delete?.(path);
   }
 
   listFiles(folder: string): string[] {
+    this.lists++;
     return [...this.files.keys()].filter((path) => path.startsWith(`${folder}/`)).sort();
   }
 

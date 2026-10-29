@@ -52,7 +52,7 @@ function setup(raeRole: "read" | "write" = "read") {
         pc.saved.saves = structuredClone(saves);
       },
       notify: (message) => pc.notices.push(message),
-      log: () => {},
+      log: (message) => process.env.FOLDER_LOG && console.log(`[${pc.device.name}] ${message}`),
       now: () => new Date("2026-10-26T12:30:00Z")
     });
     pc.vault.listener = {
@@ -1851,5 +1851,201 @@ describe("room folder", () => {
     await s.settle();
     expect(text(r.vault, "Team/Cy.md")).toBe("from Cy\nand Ana\n");
     expect(reads).toBe(0);
+  });
+});
+
+async function until(check: () => boolean, ms = 8_000): Promise<void> {
+  const start = Date.now();
+  while (!check()) {
+    if (Date.now() - start > ms) throw new Error("timed out");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/** Ana's and Cy's computers, both with the room's folder "Team", started and in step. */
+async function pair(files: Record<string, string> = {}) {
+  const s = setup();
+  const a = s.make(s.ana, "Team");
+  for (const [path, content] of Object.entries(files)) await a.vault.writeText(`Team/${path}`, content);
+  const c = s.make(s.cy, "Team");
+  s.giveKey(a, s.ana);
+  s.giveKey(a, s.cy);
+  a.replica.refreshKeys();
+  await a.folder.start();
+  const link = s.net.link(a.node, c.node);
+  await s.settle();
+  c.replica.refreshKeys();
+  await c.folder.start();
+  await s.settle();
+  return { s, a, c, link };
+}
+
+describe("room folder, files on disk", () => {
+  it("puts back a note renamed into another type of file, and keeps sharing its edits", async () => {
+    const { s, a, c } = await pair({ "a.md": "hello\n" });
+    await a.vault.rename("Team/a.md", "Team/a.txt");
+    await s.settle();
+    expect(a.vault.files.has("Team/a.txt")).toBe(false);
+    expect(a.notices.some((message) => message.includes("can't be renamed into another type of file"))).toBe(true);
+    await a.vault.writeText("Team/a.md", "new\n");
+    await s.settle();
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(text(a.vault, "Team/a.md")).toBe("new\n");
+    expect(text(c.vault, "Team/a.md")).toBe("new\n");
+  });
+
+  it("puts back a file renamed into a note, and keeps sharing it", async () => {
+    const { s, a, c } = await pair({ "b.txt": "plain\n" });
+    await a.vault.rename("Team/b.txt", "Team/b.md");
+    await s.settle();
+    expect(a.vault.files.has("Team/b.md")).toBe(false);
+    await a.vault.writeText("Team/b.txt", "changed\n");
+    await s.settle();
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(text(a.vault, "Team/b.txt")).toBe("changed\n");
+    expect(text(c.vault, "Team/b.txt")).toBe("changed\n");
+  });
+
+  it("shares edits of a note an earlier version renamed into another type of file, as a note", async () => {
+    const { s, a, c, link } = await pair({ "a.md": "hello\n" });
+    // Cy's computer, on an earlier version, renamed the note to a.txt in the index, still as a note.
+    const [id] = [...c.replica.files().keys()];
+    c.replica.editIndex((files) => files.set(id!, { path: "a.txt", kind: "md" }));
+    await s.settle();
+    expect(text(a.vault, "Team/a.txt")).toBe("hello\n");
+    await a.vault.writeText("Team/a.txt", "new\n");
+    await s.settle();
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(c.replica.noteText(id!)).toBe("new\n");
+    expect(text(a.vault, "Team/a.txt")).toBe("new\n");
+    // And after Ana's computer starts again.
+    await a.folder.stop();
+    link.cut();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(text(again.vault, "Team/a.txt")).toBe("new\n");
+    expect([...again.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+  });
+
+  it("keeps trying a deletion it couldn't make yet, and never shares the file again for it", async () => {
+    const { s, a, c } = await pair();
+    await c.vault.writeText("Team/Plan.md", "base\n");
+    await s.settle();
+    // The file is held by another program on Ana's computer as Cy deletes it: reading it fails once, then trashing it.
+    let reads = 1;
+    let trashes = 1;
+    a.vault.failReads = (path) => path === "Team/Plan.md" && reads-- > 0;
+    a.vault.failTrash = (path) => path === "Team/Plan.md" && trashes-- > 0;
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    await until(() => !a.vault.files.has("Team/Plan.md"));
+    // Both failed once on the way.
+    expect([reads < 0, trashes < 0]).toEqual([true, true]);
+    await s.settle();
+    expect([...a.replica.files().values()]).toEqual([]);
+    expect([...c.replica.files().values()]).toEqual([]);
+  }, 20_000);
+
+  it("makes a deletion it couldn't make after a restart, and never shares the file again for it", async () => {
+    const { s, a, c, link } = await pair();
+    await c.vault.writeText("Team/Plan.md", "base\n");
+    await s.settle();
+    a.vault.failTrash = (path) => path === "Team/Plan.md";
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    expect(a.vault.files.has("Team/Plan.md")).toBe(true);
+    await a.folder.stop();
+    link.cut();
+    a.vault.failTrash = undefined;
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(again.vault.files.has("Team/Plan.md")).toBe(false);
+    expect([...c.replica.files().values()]).toEqual([]);
+  });
+
+  it("writes again by itself a file it couldn't write, once it can", async () => {
+    const { s, a, c } = await pair();
+    a.vault.failWrites = (path) => path === "Team/New.md";
+    await c.vault.writeText("Team/New.md", "from Cy\n");
+    await s.settle();
+    expect(a.vault.files.has("Team/New.md")).toBe(false);
+    a.vault.failWrites = undefined;
+    await until(() => text(a.vault, "Team/New.md") === "from Cy\n");
+  });
+
+  it("gives files whose names collide names that fit every limit, so both stay shared", async () => {
+    const { s, a, c } = await pair();
+    const long = `${"x".repeat(117)}.md`;
+    const deep = `${"d".repeat(100)}/${"e".repeat(100)}/${"f".repeat(100)}/${"y".repeat(90)}.md`;
+    const ids = Array.from({ length: 4 }, () => randomId("f")).sort();
+    // The lower id of each pair keeps the name.
+    a.replica.editIndex((files) => {
+      files.set(ids[0]!, { path: long, kind: "md" });
+      files.set(ids[1]!, { path: long, kind: "md" });
+      files.set(ids[2]!, { path: deep, kind: "md" });
+      files.set(ids[3]!, { path: deep, kind: "md" });
+    });
+    for (const [i, id] of ids.entries()) a.replica.edit(id, (doc) => doc.getText("content").insert(0, `note ${i}\n`));
+    a.folder.remoteChanged();
+    await s.settle();
+    const paths = [...a.replica.files()].sort(([x], [y]) => (x < y ? -1 : 1)).map(([, entry]) => entry.path);
+    expect(paths).toHaveLength(4);
+    expect(new Set(paths.map((path) => path.toLowerCase())).size).toBe(4);
+    for (const path of paths) {
+      expect(path.length).toBeLessThanOrEqual(400);
+      for (const segment of path.split("/")) expect(segment.length).toBeLessThanOrEqual(120);
+    }
+    expect([paths[0], paths[2]]).toEqual([long, deep]);
+    for (const [i, path] of paths.entries()) {
+      expect(text(a.vault, `Team/${path}`)).toBe(`note ${i}\n`);
+      expect(text(c.vault, `Team/${path}`)).toBe(`note ${i}\n`);
+    }
+  });
+
+  it("takes a longer tag when a colliding file's suffixed name is taken", async () => {
+    const { s, a } = await pair();
+    const ids = Array.from({ length: 2 }, () => randomId("f")).sort();
+    const other = randomId("f");
+    a.replica.editIndex((files) => {
+      files.set(ids[0]!, { path: "plan.md", kind: "md" });
+      files.set(ids[1]!, { path: "plan.md", kind: "md" });
+      files.set(other, { path: `plan (${ids[1]!.slice(1, 5)}).md`, kind: "md" });
+    });
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(a.replica.files().get(ids[1]!)?.path).toBe(`plan (${ids[1]!.slice(1, 9)}).md`);
+    expect(a.replica.files().get(other)?.path).toBe(`plan (${ids[1]!.slice(1, 5)}).md`);
+  });
+
+  it("lists the folder's files about once per pass, however many files come in", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    for (let i = 0; i < 200; i++) await a.vault.writeText(`Team/n${i}.md`, `note ${i}\n`);
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    c.vault.lists = 0;
+    await c.folder.start();
+    await s.settle();
+    expect(c.vault.files.size).toBe(200);
+    expect(c.vault.lists).toBeLessThan(10);
   });
 });

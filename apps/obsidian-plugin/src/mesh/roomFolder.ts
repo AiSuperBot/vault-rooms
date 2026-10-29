@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
+import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
 import { reconcileYTextByLines } from "../crdtReconcile.js";
 
 /**
@@ -121,6 +121,9 @@ export function isShareable(path: string): boolean {
 }
 
 const DELETED = "\u0000deleted";
+/** Work on files that failed (a file in use, a full disk) is tried again after this, doubling up to the maximum. */
+const RETRY_FIRST_MS = 1_000;
+const RETRY_MAX_MS = 300_000;
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
 const RECENT_EDIT_MS = 10 * 60_000;
 
@@ -143,6 +146,19 @@ function code(error: unknown): string {
   return error instanceof SecureError ? error.code : "error";
 }
 
+/** `path` with ` (tag)` before its extension, its name shortened to fit a path segment and a whole path; null if it can't. */
+function suffixed(path: string, tag: string): string | null {
+  const slash = path.lastIndexOf("/");
+  const dir = path.slice(0, slash + 1);
+  const { stem, ext } = splitName(path.slice(slash + 1));
+  const suffix = ` (${tag})`;
+  const room = Math.min(MAX_SEGMENT, MAX_PATH - dir.length) - suffix.length - ext.length;
+  if (room < 1) return null;
+  // Never half of a character made of two (a surrogate pair).
+  const cut = stem.slice(0, room).replace(/[\uD800-\uDBFF]$/, "").trimEnd();
+  return cut ? safeRoomPath(`${dir}${cut}${suffix}${ext}`) : null;
+}
+
 export class RoomFolder {
   private known = new Map<string, Known>();
   private expected = new Map<string, string>();
@@ -156,6 +172,14 @@ export class RoomFolder {
    */
   private dirty = new Set<string>();
   private everything = true;
+  /** A pass that will try again what failed (see retrySoon), and how long the next one waits. */
+  private retryTimer: ReturnType<typeof setTimeout> | null = null;
+  private retryIn = RETRY_FIRST_MS;
+  /**
+   * The folder's files by path key (room-relative names), for untrackedCaseVariant: listed once per pass when first
+   * needed, and kept up to date from the vault's events meanwhile.
+   */
+  private localNames: Map<string, Set<string>> | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private deleteTimer: ReturnType<typeof setTimeout> | null = null;
   private deletions = new Set<string>();
@@ -282,7 +306,7 @@ export class RoomFolder {
         this.savesUnread = true;
       }
       this.started = true;
-      await this.adoptLocalFiles();
+      if (!(await this.adoptLocalFiles())) this.needsAdopt = true;
       await this.materializeNow();
       this.ready = true;
       this.o.passed?.();
@@ -291,8 +315,8 @@ export class RoomFolder {
 
   stop(): Promise<void> {
     this.stopped = true;
-    for (const timer of [this.materializeTimer, this.saveTimer, this.deleteTimer]) if (timer) clearTimeout(timer);
-    this.materializeTimer = this.saveTimer = this.deleteTimer = null;
+    for (const timer of [this.materializeTimer, this.saveTimer, this.deleteTimer, this.retryTimer]) if (timer) clearTimeout(timer);
+    this.materializeTimer = this.saveTimer = this.deleteTimer = this.retryTimer = null;
     return this.run(async () => {
       // Never loaded: the saved state stays as it was.
       if (!this.started) return;
@@ -356,7 +380,9 @@ export class RoomFolder {
   }
 
   /** Clash copies asked for (see noteClashed) are written, and the replica told, so what gave way can go. */
-  private async keepClashCopies(): Promise<void> {
+  /** Returns whether every copy that could be written was (one that failed is tried again, see retrySoon). */
+  private async keepClashCopies(): Promise<boolean> {
+    let done = true;
     for (const [id, versions] of [...this.toKeep]) {
       const entry = this.o.replica.entries().get(id);
       // A note deleted meanwhile needs no copy, and nothing is taken out of it (asked again if it comes back).
@@ -368,15 +394,17 @@ export class RoomFolder {
       // keep) waits, both lines staying in the note.
       if (entry?.kind !== "md" || !this.writesHere(entry.path)) continue;
       for (const version of versions) {
-        await this.safely(entry.path, async () => {
-          await this.keepAside(entry.path, version);
-          const left = (this.toKeep.get(id) ?? []).filter((one) => one !== version);
-          if (left.length > 0) this.toKeep.set(id, left);
-          else this.toKeep.delete(id);
-          this.o.replica.copyKept(id, version);
-        });
+        done =
+          (await this.safely(entry.path, async () => {
+            await this.keepAside(entry.path, version);
+            const left = (this.toKeep.get(id) ?? []).filter((one) => one !== version);
+            if (left.length > 0) this.toKeep.set(id, left);
+            else this.toKeep.delete(id);
+            this.o.replica.copyKept(id, version);
+          })) && done;
       }
     }
+    return done;
   }
 
   /** Whether a note's local version is held back (couldn't be shared): the editor shouldn't be bound to it. */
@@ -493,31 +521,37 @@ export class RoomFolder {
 
   // ---- writing to disk (ours, so the resulting vault events are ignored) ----
 
-  private async writeText(relative: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
-    const path = this.vaultPath(relative);
-    this.expected.set(path, sha(text));
-    const wrote = await this.o.vault.writeText(path, text, expected);
-    if (!wrote) this.expected.delete(path);
-    return wrote;
+  /** Do something to a file that its vault event will report: `mark` says what to expect, dropped if it doesn't happen. */
+  private async expecting<T>(path: string, mark: string, act: () => Promise<T>, happened: (result: T) => boolean = () => true): Promise<T> {
+    this.expected.set(path, mark);
+    try {
+      const result = await act();
+      if (!happened(result)) this.expected.delete(path);
+      return result;
+    } catch (error) {
+      // Failed (in use, a full disk): a later change by someone else isn't taken for ours.
+      this.expected.delete(path);
+      throw error;
+    }
   }
 
-  private async writeBytes(relative: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
+  private writeText(relative: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
     const path = this.vaultPath(relative);
-    this.expected.set(path, sha(bytes));
-    const wrote = await this.o.vault.writeBytes(path, bytes, expected);
-    if (!wrote) this.expected.delete(path);
-    return wrote;
+    return this.expecting(path, sha(text), () => this.o.vault.writeText(path, text, expected), (wrote) => wrote);
   }
 
-  private async trash(relative: string): Promise<void> {
+  private writeBytes(relative: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
     const path = this.vaultPath(relative);
-    this.expected.set(path, DELETED);
-    await this.o.vault.trash(path);
+    return this.expecting(path, sha(bytes), () => this.o.vault.writeBytes(path, bytes, expected), (wrote) => wrote);
   }
 
-  private async move(from: string, to: string): Promise<void> {
-    this.expected.set(this.vaultPath(from), `\u0000moved:${this.vaultPath(to)}`);
-    await this.o.vault.rename(this.vaultPath(from), this.vaultPath(to));
+  private trash(relative: string): Promise<void> {
+    const path = this.vaultPath(relative);
+    return this.expecting(path, DELETED, () => this.o.vault.trash(path));
+  }
+
+  private move(from: string, to: string): Promise<void> {
+    return this.expecting(this.vaultPath(from), `\u0000moved:${this.vaultPath(to)}`, () => this.o.vault.rename(this.vaultPath(from), this.vaultPath(to)));
   }
 
   /** A free name next to `relative` for a copy of a file that would otherwise be lost (one safe path segment). */
@@ -556,12 +590,17 @@ export class RoomFolder {
     }
     const out = new Map<string, FileEntry>();
     const renames: Array<[string, FileEntry, string]> = [];
-    for (const group of groups.values()) {
-      group.sort(([a], [b]) => (a < b ? -1 : 1));
+    // A new name fits every limit and is no other file's (nor one given just before): with the id's start, longer if
+    // that is taken. Groups go in a fixed order, so every device names them alike.
+    const taken = new Set(groups.keys());
+    for (const key of [...groups.keys()].sort()) {
+      const group = groups.get(key)!.sort(([a], [b]) => (a < b ? -1 : 1));
       group.forEach(([id, entry], index) => {
         if (index === 0) return out.set(id, entry);
-        const { stem, ext } = splitName(entry.path);
-        const path = `${stem} (${id.slice(1, 5)})${ext}`;
+        const path = [id.slice(1, 5), id.slice(1, 9), id.slice(1)].map((tag) => suffixed(entry.path, tag)).find((name) => name !== null && !taken.has(pathKey(name)));
+        // No name fits (its folders already fill the path): not written here, rather than over the other file.
+        if (!path) return;
+        taken.add(pathKey(path));
         out.set(id, { ...entry, path });
         renames.push([id, entry, path]);
       });
@@ -585,34 +624,56 @@ export class RoomFolder {
     const { everything, dirty } = this;
     this.everything = false;
     this.dirty = new Set();
+    this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
-    await this.keepClashCopies();
+    let done = await this.keepClashCopies();
     const replica = this.o.replica;
     const desired = this.desired();
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
     if (everything && replica.isComplete(INDEX_DOC)) {
       const entries = replica.entries();
+      let whole = true;
       for (const [id, known] of [...this.known]) {
-        if (entries.get(id)?.deleted) await this.safely(known.path, () => this.applyRemoval(id, known));
+        if (entries.get(id)?.deleted) whole = (await this.safely(known.path, () => this.applyRemoval(id, known))) && whole;
         else if (!entries.has(id) && this.doubtful(id) && known.unstored === "entry") {
           // Shared in a session that ended before its new entry was stored, so no one has it: shared again.
           this.known.delete(id);
           this.needsAdopt = true;
         }
       }
-      await this.safely("renames", () => this.applyRenames(desired));
+      whole = (await this.safely("renames", () => this.applyRenames(desired))) && whole;
+      // What failed (a file in use, say) is looked at again by the next full pass.
+      if (!whole) {
+        this.everything = true;
+        done = false;
+      }
     }
     for (const [id, entry] of desired) {
       if (!everything && !dirty.has(id) && !this.toKeep.has(id)) continue;
       // One that failed (a file in use, say) is tried again by the next pass.
-      if (!(await this.safely(entry.path, () => this.applyContent(id, entry)))) this.dirty.add(id);
+      if (!(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
+        this.dirty.add(id);
+        done = false;
+      }
     }
     if (this.needsAdopt && replica.canWrite()) {
       this.needsAdopt = false;
-      await this.adoptLocalFiles();
+      if (!(await this.adoptLocalFiles())) this.needsAdopt = done = false;
     }
+    // Work that failed is tried again by itself, soon at first and less often while it keeps failing.
+    if (done) this.retryIn = RETRY_FIRST_MS;
+    else this.retrySoon();
     this.saveSoon();
     if (this.ready) this.o.passed?.();
+  }
+
+  private retrySoon(): void {
+    if (this.stopped || this.retryTimer) return;
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      this.queuePass();
+    }, this.retryIn);
+    this.retryIn = Math.min(this.retryIn * 2, RETRY_MAX_MS);
   }
 
   private async applyRenames(desired: Map<string, FileEntry>): Promise<void> {
@@ -635,9 +696,9 @@ export class RoomFolder {
       const [, move] = moves.entries().next().value as [string, { from: string; to: string }];
       const occupant = this.idAt(move.to);
       if (occupant && moves.has(occupant)) {
-        const { stem, ext } = splitName(moves.get(occupant)!.from);
-        const temporary = `${stem} (moving ${occupant.slice(1, 5)})${ext}`;
-        await this.move(moves.get(occupant)!.from, temporary);
+        const from = moves.get(occupant)!.from;
+        const temporary = suffixed(from, `moving ${occupant.slice(1, 5)}`) ?? `${from.slice(0, from.lastIndexOf("/") + 1)}moving ${occupant.slice(1, 9)}${splitName(from).ext}`;
+        await this.move(from, temporary);
         this.known.set(occupant, { ...this.known.get(occupant)!, path: temporary });
         moves.set(occupant, { from: temporary, to: moves.get(occupant)!.to });
       } else {
@@ -650,12 +711,22 @@ export class RoomFolder {
 
   /** A file here whose name differs from `relative` only in case (the same file on Windows and macOS), if untracked. */
   private untrackedCaseVariant(relative: string): string | null {
-    const key = pathKey(relative);
-    for (const path of this.o.vault.listFiles(this.o.folder)) {
-      const other = this.relative(path);
-      if (other !== null && other !== relative && pathKey(other) === key && !this.idAt(other)) return other;
+    if (!this.localNames) {
+      this.localNames = new Map();
+      for (const path of this.o.vault.listFiles(this.o.folder)) this.noteLocal(path, true);
     }
+    for (const other of this.localNames.get(pathKey(relative)) ?? []) if (other !== relative && !this.idAt(other) && this.o.vault.stat(this.vaultPath(other))) return other;
     return null;
+  }
+
+  /** Keep localNames (when listed) in step with a file of the folder appearing or going away. */
+  private noteLocal(vaultPath: string, present: boolean): void {
+    const relative = this.localNames ? this.relative(vaultPath) : null;
+    if (relative === null) return;
+    const key = pathKey(relative);
+    const names = this.localNames!.get(key) ?? new Set<string>();
+    if (present) this.localNames!.set(key, names.add(relative));
+    else names.delete(relative);
   }
 
   private async applyContent(id: string, entry: FileEntry): Promise<void> {
@@ -745,12 +816,18 @@ export class RoomFolder {
     // Whether the others ever had this version is in doubt (see Known.unstored): it counts as a change made here. One
     // only received was theirs.
     const busy = (this.doubtful(id) && known.unstored !== "received") || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
-    this.known.delete(id);
-    if (!stat) return;
-    const current = isMarkdownPath(known.path) ? await this.readNote(path) : await this.o.vault.readBytes(path);
+    // Forgotten only once the file is dealt with: one that can't be read or trashed now (in use, say) stays tracked, and
+    // is tried again, rather than being left behind untracked and shared again as a new file.
+    if (!stat) return void this.known.delete(id);
+    const current = (entry ? entry.kind === "md" : isMarkdownPath(known.path)) ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const unchanged = !busy && ((stat.size === known.size && stat.mtime === known.mtime) || sha(current) === known.hash);
-    if (unchanged) return this.trash(known.path);
+    if (unchanged) {
+      await this.trash(known.path);
+      this.known.delete(id);
+      return;
+    }
     // Changed here after someone else removed it, or being worked on here: keep it, and share it again as a new file.
+    this.known.delete(id);
     if (!this.o.replica.canWrite()) return;
     await this.createEntry(known.path);
     this.o.notify(`"${known.path}" was deleted by someone else while you were working on it here. Your copy stays, and is shared again.`);
@@ -758,11 +835,15 @@ export class RoomFolder {
 
   // ---- disk -> shared ----
 
-  /** Files in the folder that aren't tracked yet become shared files (when this user may write). */
-  private async adoptLocalFiles(): Promise<void> {
-    if (!this.o.replica.canWrite()) return;
+  /**
+   * Files in the folder that aren't tracked yet become shared files (when this user may write). Returns whether every
+   * file was taken in that could be (one that failed, unreadable say, is tried again).
+   */
+  private async adoptLocalFiles(): Promise<boolean> {
+    if (!this.o.replica.canWrite()) return true;
     // Paths shared or tracked here, by key: looked up per file, so built once (not a scan per file).
     const tracked = new Set([...this.o.replica.files().values(), ...this.known.values()].map((file) => pathKey(file.path)));
+    let done = true;
     for (const path of this.o.vault.listFiles(this.o.folder)) {
       if (this.o.inOtherRoom?.(path)) continue;
       const relative = this.relative(path);
@@ -772,10 +853,11 @@ export class RoomFolder {
       }
       if (tracked.has(pathKey(relative))) continue;
       const before = this.known.size;
-      await this.safely(relative, () => this.createEntry(relative));
+      done = (await this.safely(relative, () => this.createEntry(relative))) && done;
       // Remembered now: a name differing only in case (another file where case counts) is the same path to the others.
       if (this.known.size > before) tracked.add(pathKey(relative));
     }
+    return done;
   }
 
   private async createEntry(relative: string): Promise<void> {
@@ -887,6 +969,7 @@ export class RoomFolder {
   }
 
   onLocalWrite(vaultPath: string): Promise<void> {
+    this.noteLocal(vaultPath, true);
     return this.run(async () => {
       if (!this.started) return; // taken in by start
       if (this.localOnly.has(vaultPath)) return;
@@ -898,7 +981,10 @@ export class RoomFolder {
       if (!this.o.vault.stat(vaultPath)) return;
       const id = this.idAt(relative) ?? [...this.queuedEntries].find(([, path]) => pathKey(path) === pathKey(relative))?.[0];
       const entry = id ? this.o.replica.files().get(id) : undefined;
-      const content = isMarkdownPath(relative) ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
+      // Read as what the shared file is (a note or another file), even under a name that says otherwise (renamed so by
+      // an earlier version): a note's text never goes out as an attachment, nor the reverse.
+      const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
+      const content = asNote ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
       const hash = sha(content);
       if (this.isEcho(vaultPath, hash)) return;
       if (!id || !entry) {
@@ -930,6 +1016,7 @@ export class RoomFolder {
 
   /** Deletions wait a moment: if the room's whole folder went, that is an unmount here, not deletions for everyone. */
   onLocalDelete(vaultPath: string): Promise<void> {
+    this.noteLocal(vaultPath, false);
     if (this.stopped) return Promise.resolve();
     this.deletions.add(vaultPath);
     if (!this.deleteTimer) {
@@ -975,6 +1062,8 @@ export class RoomFolder {
   }
 
   onLocalRename(oldVaultPath: string, newVaultPath: string): Promise<void> {
+    this.noteLocal(oldVaultPath, false);
+    this.noteLocal(newVaultPath, true);
     return this.run(async () => {
       if (!this.started) return; // taken in by start
       const expected = this.expected.get(oldVaultPath);
@@ -994,6 +1083,11 @@ export class RoomFolder {
         };
         if (unusable) {
           this.tellOnce(`rename:${newVaultPath}`, `"${newVaultPath.slice(this.prefix.length)}" can't be used in a shared room (too long, an unusual character, or a file type that isn't shared). The file keeps its old name.`);
+          return back();
+        }
+        // A note and other files are shared differently: one can't become the other by a new name.
+        if (isMarkdownPath(from!) !== isMarkdownPath(to!)) {
+          this.tellOnce(`kind:${newVaultPath}`, `"${from}" keeps its name: in a shared room a note can't be renamed into another type of file, nor another file into a note. Make a copy under the new name instead.`);
           return back();
         }
         if (!this.o.replica.canWrite()) {
