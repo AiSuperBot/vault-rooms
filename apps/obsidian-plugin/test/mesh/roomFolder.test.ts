@@ -2309,3 +2309,54 @@ describe("room folder, blocked renames", () => {
     expect(a.notices.some((message) => message.includes("recording.mp4") && message.includes("too large"))).toBe(true);
   });
 });
+
+describe("room folder, renames waiting", () => {
+  const bytes = (vault: MemoryVault, path: string) => [...(vault.files.get(path) ?? [])];
+  const copies = (vault: MemoryVault) => [...vault.files.keys()].filter((path) => path.includes("(conflict"));
+
+  it("waits for a file whose removal is still to come rather than keep it as a copy", async () => {
+    const { s, a, c } = await pair();
+    await c.vault.writeBytes("Team/plan.pdf", new Uint8Array([1]));
+    await c.vault.writeBytes("Team/draft.pdf", new Uint8Array([2]));
+    await s.settle();
+    // Ana has plan.pdf open in a program that won't let it be moved or trashed when Cy replaces it with the draft.
+    a.vault.failTrash = (path) => path === "Team/plan.pdf";
+    a.vault.failMoves = (path) => path === "Team/plan.pdf";
+    await c.vault.trash("Team/plan.pdf");
+    await s.settle();
+    await c.vault.rename("Team/draft.pdf", "Team/plan.pdf");
+    await s.settle();
+    expect(copies(a.vault)).toEqual([]);
+    a.vault.failTrash = a.vault.failMoves = undefined;
+    a.folder.retryNow();
+    for (let i = 0; i < 20 && bytes(a.vault, "Team/plan.pdf")[0] !== 2; i++) {
+      await s.settle();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(bytes(a.vault, "Team/plan.pdf")).toEqual([2]);
+    expect(a.vault.files.has("Team/draft.pdf")).toBe(false);
+    expect([...copies(a.vault), ...copies(c.vault)]).toEqual([]);
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["plan.pdf"]);
+  }, 20_000);
+
+  it("remembers an editor's save of a note whose rename waits, so no copy is made for it later", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "base\n" });
+    const [id] = [...a.replica.files().keys()];
+    a.vault.failMoves = (path) => path === "Team/Plan.md";
+    await c.vault.rename("Team/Plan.md", "Team/Notes.md");
+    await s.settle();
+    // Ana types in the open note (the editor puts it into the shared text) and Obsidian saves it; Cy then edits too.
+    a.bound.add(id!);
+    a.replica.edit(id!, (doc) => doc.getText("content").insert(5, "typed\n"));
+    await a.vault.writeText("Team/Plan.md", "base\ntyped\n");
+    await s.settle();
+    a.bound.delete(id!);
+    await c.vault.writeText("Team/Notes.md", "base\ntyped\nfrom Cy\n");
+    await s.settle();
+    a.vault.failMoves = undefined;
+    a.folder.retryNow();
+    await s.settle();
+    expect(text(a.vault, "Team/Notes.md")).toBe("base\ntyped\nfrom Cy\n");
+    expect(copies(a.vault)).toEqual([]);
+  });
+});

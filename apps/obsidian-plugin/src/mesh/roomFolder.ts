@@ -169,6 +169,11 @@ function code(error: unknown): string {
   return error instanceof SecureError ? error.code : "error";
 }
 
+/** A move of the folder's own, from one vault path to another (both, so another move from the same file can't take its place). */
+function movingMark(from: string, to: string): string {
+  return `${from}\u0000${to}`;
+}
+
 /** `path` with ` (tag)` before its extension, its name shortened to fit a path segment and a whole path; null if it can't. */
 function suffixed(path: string, tag: string): string | null {
   const slash = path.lastIndexOf("/");
@@ -185,8 +190,8 @@ function suffixed(path: string, tag: string): string | null {
 export class RoomFolder {
   private known = new Map<string, Known>();
   private expected = new Map<string, string>();
-  /** Moves this folder makes, by the vault path moved from: where to (see move). */
-  private moving = new Map<string, string>();
+  /** Moves this folder makes (see move and movingMark), each until its rename event comes. */
+  private moving = new Set<string>();
   private queue: Promise<void> = Promise.resolve();
   private materializeTimer: ReturnType<typeof setTimeout> | null = null;
   /** A pass is queued and hasn't started: it will see every change made until it does. */
@@ -628,11 +633,12 @@ export class RoomFolder {
    */
   private async move(from: string, to: string): Promise<void> {
     const [oldPath, newPath] = [this.vaultPath(from), this.vaultPath(to)];
-    this.moving.set(oldPath, newPath);
+    const mark = movingMark(oldPath, newPath);
+    this.moving.add(mark);
     try {
       await this.o.vault.rename(oldPath, newPath);
     } catch (error) {
-      this.moving.delete(oldPath);
+      this.moving.delete(mark);
       throw error;
     }
   }
@@ -815,6 +821,9 @@ export class RoomFolder {
         await this.move(from, temporary);
         this.known.set(occupant, { ...this.known.get(occupant)!, path: temporary });
         moves.set(occupant, { from: temporary, to: moves.get(occupant)!.to });
+      } else if (occupant) {
+        // Another file is still tracked there (its removal to come: in use, say): the renames wait for it (retried).
+        throw new Error(`"${move.to}" is still another file's here`);
       } else {
         // An untracked local file is in the way: keep it under a conflict name.
         await this.keepAside(move.to, await this.o.vault.readBytes(this.vaultPath(move.to)));
@@ -1112,8 +1121,12 @@ export class RoomFolder {
         return;
       }
       // Still under its old name here (its rename is blocked by a file in the way): the change waits for the rename,
-      // and is taken in from the new name by the pass after it.
-      if (id && entry && this.known.has(id) && this.known.get(id)!.path !== entry.path) return this.remoteChanged(id);
+      // and is taken in from the new name by the pass after it, which decides by size, time and content (so a mark of
+      // our own write here is dropped). An editor's save is remembered as ever (under the name it has here).
+      if (id && entry && this.known.has(id) && this.known.get(id)!.path !== entry.path && !(entry.kind === "md" && this.o.isBound(id))) {
+        this.expected.delete(vaultPath);
+        return this.remoteChanged(id);
+      }
       // Read as what the shared file is (a note or another file), even under a name that says otherwise (renamed so by
       // an earlier version): a note's text never goes out as an attachment, nor the reverse.
       const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
@@ -1202,10 +1215,7 @@ export class RoomFolder {
     this.noteLocal(newVaultPath, true);
     return this.run(async () => {
       if (!this.started) return; // taken in by start
-      if (this.moving.get(oldVaultPath) === newVaultPath) {
-        this.moving.delete(oldVaultPath);
-        return;
-      }
+      if (this.moving.delete(movingMark(oldVaultPath, newVaultPath))) return;
       const from = this.relative(oldVaultPath);
       const to = this.relative(newVaultPath);
       const id = from === null ? undefined : this.idAt(from);
@@ -1213,7 +1223,7 @@ export class RoomFolder {
       if (id && (to !== null || unusable)) {
         // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name.
         const back = () => {
-          this.moving.set(newVaultPath, oldVaultPath);
+          this.moving.add(movingMark(newVaultPath, oldVaultPath));
           return this.o.vault.rename(newVaultPath, oldVaultPath);
         };
         if (unusable) {
