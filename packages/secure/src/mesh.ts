@@ -86,6 +86,35 @@ function hashOf(purpose: string, value: unknown): string {
   return b64u(hashTagged(purpose, utf8(canonicalJson(value))));
 }
 
+/** `items` in runs of at most `size`. */
+function chunks<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Record versions in messages a peer takes whatever it allows us: at most MAX_ITEMS versions and about `maxBytes`
+ * each (a version is at most LIMITS.versionBytes, so one always fits, well under the smallest frame limit that applies).
+ */
+export function versionBatches(versions: SignedVersion[], maxBytes = MAX_BATCH_BYTES): SignedVersion[][] {
+  const out: SignedVersion[][] = [];
+  let batch: SignedVersion[] = [];
+  let bytes = 0;
+  for (const version of versions) {
+    const size = Buffer.byteLength(JSON.stringify(version), "utf8");
+    if (batch.length > 0 && (batch.length >= MAX_ITEMS || bytes + size > maxBytes)) {
+      out.push(batch);
+      batch = [];
+      bytes = 0;
+    }
+    batch.push(version);
+    bytes += size;
+  }
+  if (batch.length > 0) out.push(batch);
+  return out;
+}
+
 function errorText(error: unknown): string {
   return error instanceof SecureError ? `${error.code}:${error.message}` : `error:${String(error)}`;
 }
@@ -788,7 +817,10 @@ export class PeerSession {
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
       const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
-      for (let i = 0; i < versions.length; i += MAX_ITEMS) this.send({ t: "versions", versions: versions.slice(i, i + MAX_ITEMS) });
+      // Only behind (their head is in our record): every message extends theirs, so messages are cut to fit any frame.
+      // A branch of their own is judged against ours whole: it goes as the previous release sends it.
+      const behind = theirHead === -1 || (theirHead === common && this.node.chain.hashAt(theirHead) === theirHeadHash);
+      for (const batch of behind ? versionBatches(versions) : chunks(versions, MAX_ITEMS)) this.send({ t: "versions", versions: batch });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });

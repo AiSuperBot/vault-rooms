@@ -6,7 +6,7 @@ import { INDEX_DOC, openEnvelope, sealBlob, sealPresence, sealUpdate, type Envel
 import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
-import { JoinHandshake, MeshNode, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
+import { JoinHandshake, MeshNode, versionBatches, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { createRoom, fold, founder, invite, Network, step, type TestDevice } from "./testkit.js";
 import { nextVersion, rebaseChange } from "./workspace.js";
 
@@ -528,6 +528,33 @@ describe("mesh", () => {
       vi.useRealTimers();
     }
   });
+
+  it("sends the record to a peer behind it in messages of bounded size, and a branch of its own whole", () => {
+    const { chain, ana, cy } = setup();
+    const base = chain.length;
+    for (let i = 0; i < 300; i++) createRoom(chain, ana, `Room ${i}`);
+    const added = chain.all().slice(base);
+    expect(added.reduce((bytes, version) => bytes + Buffer.byteLength(JSON.stringify(version)), 0)).toBeGreaterThan(8 << 20);
+    /** Cy's computer with the record up to `base` (and `own`, a version of its own), meeting Ana's: what it is sent. */
+    const meet = (own: boolean) => {
+      const prefix = WorkspaceChain.load(chain.all().slice(0, base));
+      if (own) step(prefix, cy, (state) => void (state.users[cy.userId]!.name = "Cy too"));
+      const c = new MeshNode(prefix, cy.id);
+      const offered: number[] = [];
+      const offer = c.offerVersions.bind(c);
+      c.offerVersions = (versions, from, appendOnly) => (from && offered.push(versions.length), offer(versions, from, appendOnly));
+      const net = new Network();
+      net.link(nodeFor(chain, ana), c);
+      net.pump();
+      return { c, offered };
+    };
+    const behind = meet(false);
+    expect(behind.offered.length).toBeGreaterThan(1);
+    expect(behind.offered.reduce((a, b) => a + b, 0)).toBe(added.length);
+    expect(behind.c.chain.headHash).toBe(chain.headHash);
+    for (const batch of versionBatches(added)) expect(batch.reduce((bytes, version) => bytes + Buffer.byteLength(JSON.stringify(version)), 0)).toBeLessThanOrEqual(8 << 20);
+    expect(meet(true).offered[0]).toBe(added.length);
+  }, 60_000);
 
   it("lets a join take effect only within the record's limits, counting the joins before it", () => {
     const { chain, ana } = setup();

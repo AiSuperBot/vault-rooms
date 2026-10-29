@@ -906,28 +906,6 @@ export class MeshService {
   }
 
   /**
-   * Devices that have shown they hold a room key: each device wraps a key it obtained to itself, as a receipt. A wrap
-   * someone else sent proves nothing (it could carry a wrong key), so only receipts count.
-   */
-  private holders(roomId: string, n: number): Set<string> {
-    return new Set(
-      this.node
-        .allWraps()
-        .filter((w) => w.body.room === roomId && w.body.n === n && w.body.to === w.body.by)
-        .map((w) => w.body.to)
-    );
-  }
-
-  /** Of the devices that hold a room key and are online right now, the lowest id hands it out (fewer duplicates). */
-  private isWrapper(roomId: string, n: number): boolean {
-    const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
-    const holders = this.holders(roomId, n);
-    holders.add(this.settings.deviceId);
-    const candidates = [...holders].filter((device) => online.has(device)).sort();
-    return candidates[0] === this.settings.deviceId;
-  }
-
-  /**
    * Every key this device holds goes to every entitled device that hasn't confirmed holding it (no receipt yet),
    * once from each wrapper; and this device files its own receipt. The lowest online holder wraps at once; every
    * other holder steps in once a device has gone without a receipt for a while, so no single member (who might send
@@ -936,19 +914,29 @@ export class MeshService {
   private ensureWraps(): void {
     const state = this.state;
     const now = Date.now();
-    const mine = new Set(this.node.allWraps().filter((w) => w.body.by === this.settings.deviceId).map((w) => `${w.body.room}/${w.body.n}/${w.body.to}`));
+    // The wraps, looked at once: who has shown they hold each key, and what this device wrapped. A device shows it holds
+    // a key by wrapping it to itself (a receipt); a wrap someone else sent proves nothing (it could carry a wrong key).
+    const holders = new Map<string, Set<string>>();
+    const mine = new Set<string>();
+    for (const { body } of this.node.allWraps()) {
+      if (body.to === body.by) holders.set(`${body.room}/${body.n}`, (holders.get(`${body.room}/${body.n}`) ?? new Set<string>()).add(body.to));
+      if (body.by === this.settings.deviceId) mine.add(`${body.room}/${body.n}/${body.to}`);
+    }
+    const online = new Set([...this.connectedDevices(), this.settings.deviceId]);
     const stillMissing = new Map<string, number>();
     for (const [roomId, replica] of this.replicas) {
       const room = state.rooms[roomId];
       if (!room) continue;
+      const entitled = Object.entries(state.devices).filter(([deviceId]) => this.entitled(state, roomId, deviceId));
       for (const epoch of room.epochs) {
         const key = replica.keyFor(epoch.n);
         if (!key) continue;
-        const holders = this.holders(roomId, epoch.n);
-        const wrapper = this.isWrapper(roomId, epoch.n);
-        for (const [deviceId, device] of Object.entries(state.devices)) {
+        const held = holders.get(`${roomId}/${epoch.n}`) ?? new Set<string>();
+        // Of the devices that hold the key and are online right now, the lowest id hands it out (fewer duplicates).
+        const wrapper = [...held, this.settings.deviceId].filter((device) => online.has(device)).sort()[0] === this.settings.deviceId;
+        for (const [deviceId, device] of entitled) {
           const slot = `${roomId}/${epoch.n}/${deviceId}`;
-          if (holders.has(deviceId) || mine.has(slot) || !this.entitled(state, roomId, deviceId)) continue;
+          if (held.has(deviceId) || mine.has(slot)) continue;
           const since = this.missingSince.get(slot) ?? now;
           stillMissing.set(slot, since);
           if (deviceId !== this.settings.deviceId && !wrapper && now - since < STEP_IN_MS) continue;

@@ -20,7 +20,7 @@ This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms
 
 - Obsidian 1.11.4 or later on Windows, macOS or Linux (desktop only). Tested on Obsidian 1.14.5 on Windows 11.
 - The computers are on the same local network.
-- **Firewall:** each computer must accept incoming connections from the local network on TCP port 47880 (the next free port up to 47889 is used if it's taken) and, for automatic discovery, UDP port 47879. On managed Windows PCs your IT department may have to add the rule. For example, in an elevated PowerShell:
+- **Firewall:** each computer must accept incoming connections from the local network on TCP port 47880 (the next free port up to 47889 is used if it's taken; never one outside them: if all ten are taken, the panel says so) and, for automatic discovery, UDP port 47879. On managed Windows PCs your IT department may have to add the rule. For example, in an elevated PowerShell:
 
   ```powershell
   New-NetFirewallRule -DisplayName "Obsidian Vault Rooms" -Direction Inbound -Protocol TCP -LocalPort 47880-47889 -RemoteAddress LocalSubnet -Profile Domain,Private -Action Allow

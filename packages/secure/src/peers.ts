@@ -274,23 +274,25 @@ export async function joinWorkspace(input: {
   ];
   const errors: string[] = [];
   for (const address of addresses) {
+    let link: PeerLink | null = null;
     try {
-      const link = await dial(config, address.host, address.port);
+      const open = (link = await dial(config, address.host, address.port));
       const chain = await new Promise<WorkspaceChain>((resolve, reject) => {
-        const handshake = new JoinHandshake(link.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
-        link.onMessage((message) => handshake.receive(message));
-        link.onClose((reason) => reject(new Error(reason)));
+        const handshake = new JoinHandshake(open.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
+        open.onMessage((message) => handshake.receive(message));
+        open.onClose((reason) => reject(new Error(reason)));
         handshake.start();
       });
       // Now that the record is known, check that whoever answered is the device it claimed, with its pinned certificate.
       const membership = applyJoins(chain.state, chain.workspaceId, [{ join, firstSeen: Date.now() }]).state;
-      if (!link.unverifiedAcceptor || !verifyAcceptor(membership, chain.workspaceId, join.body.device.id, link.unverifiedAcceptor)) {
-        link.channel.close("unverified_peer");
-        throw new Error("unverified_peer");
-      }
-      return { chain, join, link };
+      if (!open.unverifiedAcceptor || !verifyAcceptor(membership, chain.workspaceId, join.body.device.id, open.unverifiedAcceptor)) throw new Error("unverified_peer");
+      link = null;
+      return { chain, join, link: open };
     } catch (error) {
       errors.push(`${address.host}:${address.port} ${(error as Error).message}`);
+    } finally {
+      // Only the connection that worked is kept (for the first session); every other is closed.
+      link?.channel.close("join_failed");
     }
   }
   throw new Error(`could not join: ${errors.join("; ") || "no peer addresses"}`);
