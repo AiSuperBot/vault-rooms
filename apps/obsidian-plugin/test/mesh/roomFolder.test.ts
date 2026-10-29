@@ -522,6 +522,141 @@ describe("room folder", () => {
     expect(copy && text(again.vault, copy)).toBe("base\nfrom Cy\n");
   });
 
+  it("keeps what was typed while the room's new key was missing, if Obsidian stops before it comes", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Ana starts a new room key and goes away before Cy's computer gets it; Cy types on in the open note.
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    await s.settle();
+    link.cut();
+    const [id] = [...c.replica.files().keys()];
+    c.bound.add(id!);
+    expect(c.replica.edit(id!, (doc) => doc.getText("content").insert(5, "typed meanwhile\n"))).toBe("queued");
+    await c.vault.writeText("Team/Plan.md", "base\ntyped meanwhile\n");
+    await s.settle();
+    await c.folder.stop();
+    // Cy's computer starts again and hears from Ana's, which never had the typing.
+    const again = s.make(s.cy, "Team", c.vault);
+    again.saved.state = c.saved.state;
+    s.net.link(again.node, a.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    const copy = [...again.vault.files.keys()].find((path) => path.includes("(conflict"));
+    expect(copy && text(again.vault, copy)).toBe("base\ntyped meanwhile\n");
+  });
+
+  it("trashes a note someone else deleted while it was off, once only what it received there was left unstored", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Ana's disk stores her own edit after a moment, and never Cy's.
+    a.node.persist = (env) => (env.author === s.ana.id ? new Promise<void>((resolve) => setTimeout(resolve, 100)) : Promise.reject(new Error("disk full")));
+    await c.vault.writeText("Team/Plan.md", "base\nfrom Cy\n");
+    await s.settle();
+    await a.vault.writeText("Team/Plan.md", "base\nfrom Cy\nfrom Ana\n");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    await s.settle();
+    expect(text(c.vault, "Team/Plan.md")).toBe("base\nfrom Cy\nfrom Ana\n");
+    await a.folder.stop();
+    link.cut();
+    // While Ana is away, Cy deletes the note.
+    await c.vault.trash("Team/Plan.md");
+    await s.settle();
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, c.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(again.vault.files.has("Team/Plan.md")).toBe(false);
+    expect(again.notices.filter((message) => message.includes("deleted by someone else"))).toEqual([]);
+  });
+
+  it("keeps an attachment's version whose entry it couldn't store, if Obsidian stops before anyone who has it is back", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeBytes("Team/plan.pdf", new Uint8Array([1, 1, 1]));
+    const c = s.make(s.cy, "Team");
+    const r = s.make(s.rae, "Team");
+    for (const device of [s.ana, s.cy, s.rae]) s.giveKey(a, device);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const toCy = s.net.link(a.node, c.node);
+    const toRae = s.net.link(a.node, r.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Rae's computer goes away; Cy saves a new version, whose index entry Ana's disk can't store.
+    toRae.cut();
+    a.node.persist = () => Promise.reject(new Error("disk full"));
+    await c.vault.writeBytes("Team/plan.pdf", new Uint8Array([2, 2, 2]));
+    await s.settle();
+    expect([...a.vault.files.get("Team/plan.pdf")!]).toEqual([2, 2, 2]);
+    await a.folder.stop();
+    toCy.cut();
+    // Ana's computer starts again while Cy's is away, and hears only from Rae's, which has the old version.
+    const again = s.make(s.ana, "Team", a.vault);
+    again.saved.state = a.saved.state;
+    s.net.link(again.node, r.node);
+    await s.settle();
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    const copy = [...again.vault.files.keys()].find((path) => path.includes("(conflict"));
+    expect(copy && [...again.vault.files.get(copy)!]).toEqual([2, 2, 2]);
+  });
+
+  it("clears a note's mark once what it received there is stored, even with nothing else going on", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Plan.md", "base\n");
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    // Ana's disk is slow: Cy's edit is stored there a second after her folder took it in and saved its state.
+    a.node.persist = () => new Promise<void>((resolve) => setTimeout(resolve, 1_000));
+    await c.vault.writeText("Team/Plan.md", "base\nfrom Cy\n");
+    await s.settle();
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(Object.values(a.saved.state!.known).map((known) => known.unstored)).toContain("received");
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    await s.settle();
+    expect(Object.values(a.saved.state!.known).filter((known) => known.unstored)).toEqual([]);
+  });
+
   it("starts on a folder of many synced files without looking each one up among all the others", async () => {
     const s = setup();
     // 5,000 files remembered as synced in an earlier session.

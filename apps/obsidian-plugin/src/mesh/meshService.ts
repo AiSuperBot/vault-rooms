@@ -577,6 +577,9 @@ export class MeshService {
     const wraps: KeyWrap[] = [];
     try {
       for (;;) {
+        // Stopped (while a new key was being stored, say): nothing more is changed or written, as the next session may
+        // be using the files already.
+        if (this.stopped) throw new MeshServiceError("The workspace is closing: the change wasn't made.");
         const head = this.node.chain.head;
         const draft = structuredClone(head.body.state);
         change(draft);
@@ -904,7 +907,11 @@ export class MeshService {
       if (!this.leads(replica)) continue;
       const key = newRoomKey();
       await this.commit(
-        (next) => void next.rooms[roomId]!.epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) }),
+        (next) => {
+          // Another change may have started a new key meanwhile (a removal, say): then this one isn't needed.
+          const epochs = next.rooms[roomId]?.epochs;
+          if (epochs?.length === n) epochs.push({ n: n + 1, commit: keyCommitment(this.settings.id, roomId, n + 1, key) });
+        },
         [],
         new Map([[roomId, key]])
       );
