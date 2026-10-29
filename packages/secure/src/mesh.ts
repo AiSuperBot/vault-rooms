@@ -134,7 +134,7 @@ export class MeshNode {
   private olderPresence = new Set<string>();
   private presenceBudgets = new Map<string, Budget>();
   private memberRooms = new Set<string>();
-  private effectiveCache: WorkspaceState | null = null;
+  private effectiveCache: { state: WorkspaceState; applied: JoinRecord[] } | null = null;
   /** Envelopes made here that aren't safely stored yet: they don't leave this device until they are. */
   private unpersisted = new Set<string>();
   /** Envelopes received that aren't safely stored yet, counted by document (`room/doc/`, see envelopeKey). */
@@ -213,7 +213,16 @@ export class MeshNode {
 
   /** The signed record plus valid joins no one has recorded yet: the membership every check uses. */
   effective(): WorkspaceState {
-    if (!this.effectiveCache) this.effectiveCache = applyJoins(this.chain.state, this.workspaceId, this.joins.values()).state;
+    return this.withJoins().state;
+  }
+
+  /** The joins not recorded yet that take effect here (see applyJoins), in the order they do: the ones to record. */
+  joinsInEffect(): JoinRecord[] {
+    return this.withJoins().applied;
+  }
+
+  private withJoins(): { state: WorkspaceState; applied: JoinRecord[] } {
+    if (!this.effectiveCache) this.effectiveCache = applyJoins(this.chain.state, this.workspaceId, this.joins.values());
     return this.effectiveCache;
   }
 

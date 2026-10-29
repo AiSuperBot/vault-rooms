@@ -1,6 +1,6 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
 import { cleanName } from "@vault-rooms/secure";
-import type { MeshService } from "../mesh/meshService.js";
+import { PORT_SPAN, type MeshService } from "../mesh/meshService.js";
 import type VaultRoomsPlugin from "../plugin.js";
 import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
 
@@ -34,7 +34,19 @@ export class RoomsSettingTab extends PluginSettingTab {
       return;
     }
     const state = svc?.state;
-    new Setting(containerEl).setName("Workspace").setDesc(state ? `${state.name} · you are ${state.users[ws.userId]?.name ?? "?"} on ${state.devices[ws.deviceId]?.name ?? "this computer"}` : (this.plugin.serviceError ?? "Not running."));
+    new Setting(containerEl).setName("Workspace").setDesc(state ? `${state.name} · you are ${state.users[ws.userId]?.name ?? "?"} on ${state.devices[ws.deviceId]?.name ?? "this computer"}` : "Not running.");
+    // Whatever stopped the workspace, or sharing, from starting: shown until it starts.
+    if (this.plugin.serviceError)
+      new Setting(containerEl)
+        .setName("Not syncing")
+        .setDesc(this.plugin.serviceError)
+        .addButton((button) =>
+          button.setButtonText("Try again").onClick(async () => {
+            button.setDisabled(true);
+            await this.plugin.restartService();
+            this.display();
+          })
+        );
 
     if (svc && svc.isMember()) {
       new Setting(containerEl).setName("Your name").addText((text) => {
@@ -77,12 +89,13 @@ export class RoomsSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Port")
-      .setDesc("The port other computers connect to. Every computer needs an inbound firewall rule for Obsidian on this port (local network only). Takes effect after restarting Obsidian.")
+      .setDesc(`The first port other computers connect to: the first free one of it and the next ${PORT_SPAN - 1} is used${svc?.listeningPort ? ` (now ${svc.listeningPort})` : ""}, never another. Every computer needs an inbound firewall rule for Obsidian on these ports (local network only). Takes effect after restarting Obsidian.`)
       .addText((text) =>
         text.setValue(String(ws.port)).onChange(async (value) => {
           const port = Number(value);
-          if (!Number.isInteger(port) || port < 1024 || port > 65535) return;
+          if (!Number.isInteger(port) || port < 1024 || port > 65535 - PORT_SPAN + 1) return;
           ws.port = port;
+          delete ws.boundPort;
           await this.plugin.saveSettings();
         })
       );

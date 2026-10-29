@@ -4,7 +4,7 @@ import { hashTagged, hkdf, randomBytes, sign, signingKeyPairFromSeed, verify, ty
 import { fail } from "./errors.js";
 import { deviceIdFor, isHash, isId, randomId } from "./ids.js";
 import * as v from "./validate.js";
-import { activeDevice, grantedRooms, inviteCreatorStands, parseAgreementKey, parseSigningKey, roleAtLeast, roleIn, type DeviceRecord, type InviteRecord, type Role, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, grantedRooms, inviteCreatorStands, overCapacity, parseAgreementKey, parseSigningKey, roleAtLeast, roleIn, type DeviceRecord, type InviteRecord, type Role, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 /**
  * Invites. The link carries a random 32-byte secret. From it both sides derive an Ed25519 "invite key": the admin
@@ -211,12 +211,16 @@ export function applyJoins(
     if (!current || hash < current.hash) best.set(join.body.invite, { join, hash });
   }
   if (best.size === 0) return { state, applied: [] };
-  const next = structuredClone(state);
+  let next = structuredClone(state);
   const applied: JoinRecord[] = [];
   const takenUsers = new Set<string>();
   for (const { join } of [...best.values()].sort((a, b) => (a.hash < b.hash ? -1 : 1))) {
     if (next.devices[join.body.device.id] || (!state.invites[join.body.invite]!.forUser && takenUsers.has(join.body.user.id))) continue;
-    foldJoinInto(next, join);
+    // Only within what the record may hold, counting the joins before it: as recording them all would be.
+    const trial = structuredClone(next);
+    foldJoinInto(trial, join);
+    if (overCapacity(trial, join.body.user.id)) continue;
+    next = trial;
     takenUsers.add(join.body.user.id);
     applied.push(join);
   }

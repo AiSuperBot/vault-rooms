@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
+import { INDEX_DOC, isMarkdownPath, isWithin, MAX_BYTES, MAX_NOTE_BYTES, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
 import { reconcileYTextByLines } from "../crdtReconcile.js";
 
 /**
@@ -74,6 +74,16 @@ export interface RoomFolderState {
   saves?: unknown;
 }
 
+/** See RoomFolder.health. */
+export interface RoomHealth {
+  /** Why the folder doesn't sync at all, if it doesn't. */
+  stopped: string | null;
+  /** Files whose writing, reading or trashing here failed and is being tried again (in use, a full disk). */
+  failing: string[];
+  /** Files whose version here couldn't be shared (too large, the room's storage full): kept as they are here. */
+  heldBack: string[];
+}
+
 export interface RoomFolderOptions {
   folder: string;
   replica: RoomReplica;
@@ -89,6 +99,8 @@ export interface RoomFolderOptions {
   heldBackChanged?(): void;
   /** A pass over the shared state is done: notes may have become ready for an editor (keys arrived, doubts settled). */
   passed?(): void;
+  /** What health() says changed: files started or stopped failing, or the folder stopped syncing. */
+  healthChanged?(): void;
   loadState(): Promise<RoomFolderState | null>;
   saveState(state: RoomFolderState): Promise<void>;
   /**
@@ -114,6 +126,17 @@ export const SHARED_EXTENSIONS = new Set([
   "mp3", "wav", "m4a", "ogg", "oga", "opus", "flac", "mp4", "m4v", "webm", "mov", "mkv", "ogv",
   "zip"
 ]);
+
+/**
+ * Why a vault folder can't be (or become) a room's folder: a name some computers can't use (a dot folder anywhere in it
+ * included), or inside, around or the same as one of `others` (the folders of the rooms shown here), compared as the
+ * disk compares names. Used both to offer folders and to share one.
+ */
+export function folderProblem(path: string, others: string[]): string | null {
+  if (safeRoomPath(path) === null) return `"${path}" can't be shared (dot folders and some characters can't be used).`;
+  const clash = others.find((folder) => isWithin(path, folder) || isWithin(folder, path));
+  return clash === undefined ? null : `"${path}" overlaps the folder of another room ("${clash}").`;
+}
 
 export function isShareable(path: string): boolean {
   const dot = path.lastIndexOf(".");
@@ -175,6 +198,10 @@ export class RoomFolder {
   /** A pass that will try again what failed (see retrySoon), and how long the next one waits. */
   private retryTimer: ReturnType<typeof setTimeout> | null = null;
   private retryIn = RETRY_FIRST_MS;
+  /** Work that failed and isn't done yet (by file path, or "renames"): what went wrong. See health. */
+  private failing = new Map<string, string>();
+  /** Why the folder doesn't sync at all (what it last synced couldn't be read), if so. */
+  private loadProblem: string | null = null;
   /**
    * The folder's files by path key (room-relative names), for untrackedCaseVariant: listed once per pass when first
    * needed, and kept up to date from the vault's events meanwhile.
@@ -276,11 +303,29 @@ export class RoomFolder {
   private async safely(what: string, task: () => Promise<void>): Promise<boolean> {
     try {
       await task();
+      if (this.failing.delete(what)) this.o.healthChanged?.();
       return true;
     } catch (error) {
       this.o.log(`room folder, ${what}: ${(error as Error).message}`);
+      if (!this.failing.has(what)) this.o.healthChanged?.();
+      this.failing.set(what, (error as Error).message);
       return false;
     }
+  }
+
+  /** How the folder's syncing goes, from its own work: for the panel, so trouble stays visible after a notice is gone. */
+  health(): RoomHealth {
+    const pathOf = (id: string) => this.known.get(id)?.path ?? this.queuedEntries.get(id) ?? id;
+    return { stopped: this.loadProblem, failing: [...this.failing.keys()], heldBack: [...this.heldBack.keys()].map(pathOf) };
+  }
+
+  /** Try again now what failed (rather than when its next retry is due). */
+  retryNow(): void {
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+    this.retryIn = RETRY_FIRST_MS;
+    this.everything = true;
+    if (this.started && !this.stopped) this.queuePass();
   }
 
   /**
@@ -294,7 +339,9 @@ export class RoomFolder {
         saved = await this.o.loadState();
       } catch (error) {
         // Without it every file would look new: better not to sync this folder at all than to guess.
-        this.o.notify(`"${this.o.folder}" isn't syncing: what was last synced there couldn't be read (${(error as Error).message}). Restart Obsidian to try again.`);
+        this.loadProblem = `what was last synced here couldn't be read (${(error as Error).message})`;
+        this.o.healthChanged?.();
+        this.o.notify(`"${this.o.folder}" isn't syncing: ${this.loadProblem}. Try again from the Vault Rooms panel, or restart Obsidian.`);
         throw error;
       }
       for (const [id, known] of Object.entries(saved?.known ?? {})) this.known.set(id, known);
@@ -663,6 +710,11 @@ export class RoomFolder {
     // Work that failed is tried again by itself, soon at first and less often while it keeps failing.
     if (done) this.retryIn = RETRY_FIRST_MS;
     else this.retrySoon();
+    // A whole pass without trouble: whatever failed before (for a file gone since, say) isn't failing any more.
+    if (done && everything && this.failing.size > 0) {
+      this.failing.clear();
+      this.o.healthChanged?.();
+    }
     this.saveSoon();
     if (this.ready) this.o.passed?.();
   }
