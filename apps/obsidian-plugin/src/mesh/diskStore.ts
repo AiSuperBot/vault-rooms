@@ -97,18 +97,33 @@ export class DiskStore implements BlobStorage {
     return next;
   }
 
+  /** Folders made or found here: not looked for again on every write (a failed write forgets its folder, see written). */
+  private folders = new Set<string>();
+
   private async ensureFolder(path: string): Promise<void> {
     const parts = path.split("/").slice(0, -1);
+    if (this.folders.has(parts.join("/"))) return;
     for (let i = 1; i <= parts.length; i++) {
       const folder = parts.slice(0, i).join("/");
       if (folder && !(await this.files.exists(folder))) await this.files.mkdir(folder);
+    }
+    this.folders.add(parts.join("/"));
+  }
+
+  /** A write that failed may have lost its folder (deleted from outside): it is looked for again next time. */
+  private async written(path: string, write: Promise<void>): Promise<void> {
+    try {
+      await write;
+    } catch (error) {
+      this.folders.delete(path.split("/").slice(0, -1).join("/"));
+      throw error;
     }
   }
 
   /** Replace a whole file: write a temporary copy, keep the old one aside until the new one is in place. */
   private async swapIn(path: string, data: string): Promise<void> {
     await this.ensureFolder(path);
-    await this.files.write(`${path}.tmp`, data);
+    await this.written(path, this.files.write(`${path}.tmp`, data));
     if (await this.files.exists(path)) {
       if (await this.files.exists(`${path}.old`)) await this.files.remove(`${path}.old`);
       await this.files.rename(path, `${path}.old`);
@@ -125,7 +140,8 @@ export class DiskStore implements BlobStorage {
    * Read a whole file, recovering from a swap that was interrupted. `strict`: one that is there but can't be read now
    * (locked, say) throws, rather than reading as no file.
    */
-  private async readWhole(path: string, strict = false): Promise<string | null> {
+  /** The parsed JSON of a file swapped in whole (see writeWhole), parsed once (attachments can be tens of MB). */
+  private async readWhole(path: string, strict = false): Promise<unknown> {
     let locked = false;
     for (const candidate of [path, `${path}.tmp`, `${path}.old`]) {
       if (!(await this.files.exists(candidate))) continue;
@@ -137,8 +153,7 @@ export class DiskStore implements BlobStorage {
         continue;
       }
       try {
-        JSON.parse(text);
-        return text;
+        return JSON.parse(text) as unknown;
       } catch {
         // A torn copy: try the next one.
       }
@@ -150,9 +165,9 @@ export class DiskStore implements BlobStorage {
   // ---- record, joins, wraps ----
 
   async loadChain(): Promise<SignedVersion[] | null> {
-    const text = await this.readWhole(`${this.root}/chain.json`);
-    if (text === null) return null;
-    return (JSON.parse(text) as unknown[]).map(parseSignedVersion);
+    const saved = await this.readWhole(`${this.root}/chain.json`);
+    if (saved === null) return null;
+    return (saved as unknown[]).map(parseSignedVersion);
   }
 
   saveChain(versions: SignedVersion[]): Promise<void> {
@@ -160,10 +175,10 @@ export class DiskStore implements BlobStorage {
   }
 
   async loadJoins(): Promise<Array<{ join: JoinRecord; firstSeen: number }>> {
-    const text = await this.readWhole(`${this.root}/joins.json`);
-    if (text === null) return [];
+    const saved = await this.readWhole(`${this.root}/joins.json`);
+    if (saved === null) return [];
     const out: Array<{ join: JoinRecord; firstSeen: number }> = [];
-    for (const entry of JSON.parse(text) as Array<{ join: unknown; firstSeen: unknown }>) {
+    for (const entry of saved as Array<{ join: unknown; firstSeen: unknown }>) {
       try {
         out.push({ join: parseJoinRecord(entry.join), firstSeen: Number(entry.firstSeen) || Date.now() });
       } catch {
@@ -178,10 +193,10 @@ export class DiskStore implements BlobStorage {
   }
 
   async loadWraps(): Promise<KeyWrap[]> {
-    const text = await this.readWhole(`${this.root}/wraps.json`);
-    if (text === null) return [];
+    const saved = await this.readWhole(`${this.root}/wraps.json`);
+    if (saved === null) return [];
     const out: KeyWrap[] = [];
-    for (const raw of JSON.parse(text) as unknown[]) {
+    for (const raw of saved as unknown[]) {
       try {
         out.push(parseKeyWrap(raw));
       } catch {
@@ -204,8 +219,7 @@ export class DiskStore implements BlobStorage {
 
   /** Null if there is none; throws if it is there but can't be read (better than taking it for none). */
   async loadRoomState<T>(roomId: string, kind = ""): Promise<T | null> {
-    const text = await this.readWhole(this.roomStatePath(roomId, kind), true);
-    return text === null ? null : (JSON.parse(text) as T);
+    return (await this.readWhole(this.roomStatePath(roomId, kind), true)) as T | null;
   }
 
   saveRoomState(roomId: string, state: unknown, kind = ""): Promise<void> {
@@ -417,7 +431,7 @@ export class DiskStore implements BlobStorage {
             while (lines.size > 0) {
               const batch = [...lines];
               await this.ensureFolder(path);
-              await this.files.append(path, `\n${batch.map(([, line]) => line).join("\n")}`);
+              await this.written(path, this.files.append(path, `\n${batch.map(([, line]) => line).join("\n")}`));
               for (const [key] of batch) lines.delete(key);
             }
             this.pendingLines.delete(path);
@@ -441,10 +455,10 @@ export class DiskStore implements BlobStorage {
     const path = this.blobPath(meta);
     await this.queues.get(path);
     // Locked files throw for retry; interrupted swaps recover from their other copies.
-    const text = await this.readWhole(path, true);
-    if (text === null) return null;
+    const saved = await this.readWhole(path, true);
+    if (saved === null) return null;
     try {
-      const env = parseEnvelope(JSON.parse(text));
+      const env = parseEnvelope(saved);
       return env.k === "b" && env.room === meta.room && env.author === meta.author && env.id === meta.id && env.n === meta.n ? env : null;
     } catch {
       return null;
@@ -516,6 +530,7 @@ export class DiskStore implements BlobStorage {
   /** Remove everything this workspace stored on this device (leaving a workspace). */
   async wipe(): Promise<void> {
     await this.flush();
+    this.folders.clear();
     if (await this.files.exists(this.root)) await this.files.rmdir(this.root, true);
   }
 }

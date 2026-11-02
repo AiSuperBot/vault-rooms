@@ -375,6 +375,34 @@ describe("reported file regressions", () => {
     expect(a.folder.health().heldBack).toEqual([]);
   });
 
+  it("keeps passes small: one note's pass skips the file list, unchanged notes aren't hashed, unchanged state isn't saved", async () => {
+    const files = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`n${i}.md`, `note ${i}`]));
+    const { s, a, c } = await pair(files);
+    const [id] = [...c.replica.files().keys()];
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    const list = vi.spyOn(c.replica, "files");
+    const text = vi.spyOn(c.replica, "noteText");
+    const save = vi.spyOn((c.folder as unknown as { o: { saveState: () => Promise<void> } }).o, "saveState");
+    // A note's pass: neither the room's file list nor any other note is gone over.
+    c.folder.remoteChanged(id);
+    await s.settle();
+    expect(list).not.toHaveBeenCalled();
+    expect(text.mock.calls.every(([doc]) => doc === id)).toBe(true);
+    // A whole pass with nothing changed: nothing converted or hashed, and the state isn't written again.
+    text.mockClear();
+    c.folder.remoteChanged();
+    await s.settle();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(text).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    // A real change still goes through, and is saved.
+    await a.vault.writeText("Team/n3.md", "changed");
+    await s.settle();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(c.vault.text("Team/n3.md")).toBe("changed");
+    expect(save).toHaveBeenCalled();
+  });
+
   it("handles repeated save events with direct lookups and no full index or known-path scans", async () => {
     const files = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`n${i}.md`, `note ${i}`]));
     const { a } = await pair(files);
@@ -2406,14 +2434,14 @@ describe("room folder, retries", () => {
     a.vault.failTrash = (path) => path === "Team/Plan.md";
     await c.vault.trash("Team/Plan.md");
     await s.settle();
-    // A change to one note right after: its pass looks at that note, not at every note of the room.
+    // A change to one note right after: its pass looks at that note, not at every file of the room.
     let looked = 0;
-    const noteText = a.replica.noteText.bind(a.replica);
-    a.replica.noteText = (id: string) => (looked++, noteText(id));
+    const list = a.replica.files.bind(a.replica);
+    a.replica.files = () => (looked++, list());
     await c.vault.writeText("Team/n5.md", "note 5, edited\n");
     await s.settle();
     expect(text(a.vault, "Team/n5.md")).toBe("note 5, edited\n");
-    expect(looked).toBeLessThan(5);
+    expect(looked).toBe(0);
   });
 
   it("keeps one copy of a version it couldn't write over, however often it tries again", async () => {

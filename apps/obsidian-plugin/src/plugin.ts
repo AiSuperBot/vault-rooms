@@ -87,7 +87,9 @@ export default class VaultRoomsPlugin extends Plugin {
     this.registerEvent(this.app.vault.on("delete", (file) => this.onVaultDelete(file)));
     this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onVaultRename(file, oldPath)));
     // Editors: bind every open note of a room, whichever pane it is in.
-    for (const event of ["active-leaf-change", "file-open", "layout-change"] as const) this.registerEvent(this.app.workspace.on(event as "layout-change", () => this.syncEditors()));
+    for (const event of ["active-leaf-change", "file-open"] as const) this.registerEvent(this.app.workspace.on(event as "file-open", () => this.syncEditors()));
+    // Fired on every pane drag and sidebar toggle: one check for a burst of them.
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.syncEditorsSoon()));
 
     // A file dropped or pasted into a room's note goes into the room, so the others get it too (Obsidian's default puts
     // attachments in the vault's root folder).

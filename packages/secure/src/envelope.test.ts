@@ -3,7 +3,7 @@ import { utf8 } from "./bytes.js";
 import { newRoomKey } from "./keys.js";
 import { SecureError } from "./errors.js";
 import { blobId, INDEX_DOC, openEnvelope, parseEnvelope, sealBlob, sealPresence, sealSnapshot, sealUpdate, verifyEnvelope, type SealContext } from "./envelope.js";
-import { EnvelopeStore, vvDominates } from "./store.js";
+import { EnvelopeStore, STORE_LIMITS, vvDominates } from "./store.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { randomId } from "./ids.js";
 
@@ -169,5 +169,36 @@ describe("envelope store", () => {
     expect(one.digest(roomId)).toBe(two.digest(roomId));
     two.add(sealUpdate(ctx(writer), doc, 5, utf8("gap")));
     expect(one.digest(roomId)).not.toBe(two.digest(roomId));
+  });
+
+  it("keeps a cached digest only while the room is unchanged, through every kind of change", () => {
+    const { ctx, writer, admin, roomId } = setup();
+    const store = new EnvelopeStore();
+    const fresh = () => (store as unknown as { computeDigest(room: string): string }).computeDigest(roomId);
+    const doc = randomId("f");
+    const update = sealUpdate(ctx(writer), doc, 1, utf8("a"));
+    const blob = sealBlob(ctx(writer), utf8("blob"));
+    const snapshot = sealSnapshot(ctx(admin), doc, 1, { [writer.id]: 1 }, utf8("s"));
+    const steps: Array<() => unknown> = [
+      () => store.add(update),
+      () => store.add(sealUpdate(ctx(admin), doc, 1, utf8("b"))),
+      () => store.add(blob),
+      () => store.add(snapshot),
+      () => store.compact(roomId, doc, [update], { [writer.id]: 1 }),
+      () => store.restoreMarks(roomId, randomId("f"), { [writer.id]: 3 }, {}),
+      () => store.dropBlobs(roomId, [`${writer.id}/${blob.id}`]),
+      () => store.undrop(roomId, `${writer.id}/${blob.id}`),
+      // Refused for room (the room full): its document is listed all the same.
+      () => {
+        const limit = STORE_LIMITS.roomDocBytes;
+        STORE_LIMITS.roomDocBytes = 0;
+        try { store.add(sealUpdate(ctx(writer), randomId("f"), 1, utf8("q"))); } finally { STORE_LIMITS.roomDocBytes = limit; }
+      }
+    ];
+    for (const step of steps) {
+      store.digest(roomId);
+      step();
+      expect(store.digest(roomId)).toBe(fresh());
+    }
   });
 });

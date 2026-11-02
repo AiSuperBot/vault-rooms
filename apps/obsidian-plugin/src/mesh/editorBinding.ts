@@ -183,15 +183,17 @@ export class EditorBinding {
    */
   private bind(view: EditorView, target: BindTarget, disk: string | null): boolean {
     // An editor holds "\n" line endings only; the shared text has to match it character for character.
-    if (target.ytext.toString().includes("\r")) {
+    // Each text read once (a note can be megabytes, and an editor waiting to bind is tried every half second).
+    let shared = target.ytext.toString();
+    if (shared.includes("\r")) {
       if (target.readOnly) return true; // left unbound: a reader can't fix the shared text
-      reconcileYTextWithDiskText(target.ytext, target.ytext.toString().replace(/\r\n?/g, "\n"), "editor");
+      reconcileYTextWithDiskText(target.ytext, shared.replace(/\r\n?/g, "\n"), "editor");
+      shared = target.ytext.toString();
     }
-    if (!safeToBind(view.state.doc.toString(), target.ytext.toString(), disk, target.fromShared)) return false;
+    const now = view.state.doc.toString();
+    if (!safeToBind(now, shared, disk, target.fromShared)) return false;
     const undo = new Y.UndoManager(target.ytext);
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
-    const now = view.state.doc.toString();
-    const shared = target.ytext.toString();
     const extension: Extension = [WHOLE_CHARACTERS, SHARED_UNDO, yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
     try {
       view.dispatch({
