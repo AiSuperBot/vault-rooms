@@ -48,6 +48,7 @@ const PASS_ON_STEP_IN_MS = 10 * 60_000;
 
 interface DocState {
   doc: Y.Doc;
+  pending: Map<string, { env: UpdateEnvelope | SnapshotEnvelope; bytes: Uint8Array }>;
   /** Updates contained in `doc`, per author (contiguous), so a snapshot never claims more than it holds. */
   applied: VersionVector;
   /** Applied updates beyond a gap, per author. */
@@ -75,6 +76,26 @@ export interface ReplicaEvents {
 /** Whether Yjs holds updates of a document whose dependencies haven't arrived (a snapshot then would miss them). */
 function waitsForDependencies(doc: Y.Doc): boolean {
   return doc.store.pendingStructs !== null || doc.store.pendingDs !== null;
+}
+
+/** Check the update's references before Yjs can notify an editor of a partially applied deletion. */
+function dependenciesReady(doc: Y.Doc, bytes: Uint8Array): boolean {
+  const { structs, ds } = Y.decodeUpdate(bytes);
+  const ends = new Map<number, number>();
+  const end = (client: number) => ends.get(client) ?? Y.getState(doc.store, client);
+  for (const struct of structs) {
+    if (struct instanceof Y.Skip) continue;
+    if (struct.id.clock > end(struct.id.client)) return false;
+    ends.set(struct.id.client, Math.max(end(struct.id.client), struct.id.clock + struct.length));
+  }
+  for (const struct of structs) {
+    if (!(struct instanceof Y.Item) || struct.id.clock + struct.length <= Y.getState(doc.store, struct.id.client)) continue;
+    for (const ref of [struct.origin, struct.rightOrigin, struct.parent]) {
+      if (ref instanceof Y.ID && ref.clock >= end(ref.client)) return false;
+    }
+  }
+  for (const [client, ranges] of ds.clients) if (ranges.some(({ clock, len }) => clock + len > end(client))) return false;
+  return true;
 }
 
 /**
@@ -206,7 +227,7 @@ export class RoomReplica {
   }
 
   private async rescueBlob(meta: BlobMeta, key: Uint8Array): Promise<void> {
-    const env = await this.node.store.loadBlob(this.roomId, meta.author, meta.id);
+    const env = await this.node.store.loadBlob(this.roomId, meta.author, meta.id).catch(() => null);
     if (!env || this.destroyed) return;
     try {
       this.blobRescues.push({ oldId: meta.id, bytes: openEnvelope(env, key) });
@@ -261,20 +282,21 @@ export class RoomReplica {
   /** Index entries with a safe path, deleted ones included (marked). Entries whose path fails the check are left out. */
   entries(): Map<string, FileEntry> {
     const out = new Map<string, FileEntry>();
-    for (const [fileId, entry] of this.index.entries()) {
-      if (!isId(fileId, "f") || typeof entry !== "object" || entry === null) continue;
-      const path = safeRoomPath(entry.path);
-      if (path === null || (entry.kind !== "md" && entry.kind !== "bin")) continue;
-      const blob = entry.kind === "bin" ? validBlobRef(entry.blob) : undefined;
-      out.set(fileId, {
-        path,
-        kind: entry.kind,
-        ...(blob ? { blob } : {}),
-        ...(isHash(entry.base) ? { base: entry.base } : {}),
-        ...(entry.deleted === true ? { deleted: true as const } : {})
-      });
+    for (const fileId of this.index.keys()) {
+      const entry = this.entry(fileId);
+      if (entry) out.set(fileId, entry);
     }
     return out;
+  }
+
+  /** One validated index entry, without rebuilding the whole index. Deleted entries are included. */
+  entry(fileId: string): FileEntry | undefined {
+    const entry = this.index.get(fileId);
+    if (!isId(fileId, "f") || typeof entry !== "object" || entry === null) return;
+    const path = safeRoomPath(entry.path);
+    if (path === null || (entry.kind !== "md" && entry.kind !== "bin")) return;
+    const blob = entry.kind === "bin" ? validBlobRef(entry.blob) : undefined;
+    return { path, kind: entry.kind, ...(blob ? { blob } : {}), ...(isHash(entry.base) ? { base: entry.base } : {}), ...(entry.deleted === true ? { deleted: true as const } : {}) };
   }
 
   /** Live index entries with a safe path. */
@@ -293,10 +315,13 @@ export class RoomReplica {
     return this.noteDoc(fileId).getText("content").toString();
   }
 
-  /** Whether everything held for a document has been decrypted into it (nothing waits for a key, or to be read from disk). */
+  /**
+   * Nothing waits for a key or a disk read, and no update is half applied. Updates waiting for their Yjs dependencies
+   * (see DocState.pending) are held whole, so what is applied is whole edits only: safe to write, bind and merge with.
+   */
   isComplete(docId: DocId): boolean {
     if (this.node.store.isUnreadable(this.roomId, docId)) return false;
-    this.loadDoc(docId);
+    if (waitsForDependencies(this.loadDoc(docId).doc)) return false;
     for (const env of this.waiting.values()) if (env.doc === docId) return false;
     return true;
   }
@@ -347,10 +372,12 @@ export class RoomReplica {
     const key = this.keys.get(ref.n);
     if (!key) return null;
     const env = await this.node.store.loadBlob(this.roomId, ref.by, ref.id);
+    // Not here yet (its arrival wakes the folder), or damaged (loadBlob dropped it and asked the peers again).
     if (!env || env.n !== ref.n) return null;
     try {
       return openEnvelope(env, key);
     } catch {
+      this.node.store.invalidateBlob(this.roomId, ref.by, ref.id);
       return null;
     }
   }
@@ -372,7 +399,7 @@ export class RoomReplica {
     const store = this.node.store;
     const doc = new Y.Doc({ gc: true });
     // Marks: updates folded into a snapshot this device checked (and applied, below).
-    state = { doc, applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0 };
+    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0 };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
     const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
@@ -472,23 +499,49 @@ export class RoomReplica {
     } catch {
       return false; // can't be decrypted with the committed key: ignore
     }
-    const typed = checks ? null : quietly(() => this.clashes.typedClash(docId, env, bytes));
-    const before = Y.encodeStateVector(state.doc);
     try {
-      Y.applyUpdate(state.doc, bytes, REMOTE);
+      // Held whole until what it builds on is in (Yjs would apply part of it). Only what depends on a missing update
+      // waits: anything else goes in at once.
+      // shortcut: held updates stay in memory only (their envelopes are stored), bound them if a room ever piles them up.
+      if (!dependenciesReady(state.doc, bytes)) {
+        state.pending.set(envelopeKey(env), { env, bytes });
+        return false;
+      }
+      const before = Y.encodeStateVector(state.doc);
+      type Held = { env: UpdateEnvelope | SnapshotEnvelope; bytes: Uint8Array };
+      const applied: Array<Held & { typed: ReturnType<Clashes["typedClash"]> | null | undefined }> = [];
+      // One transaction: an editor sees the held updates arrive together with what they waited for.
+      state.doc.transact(() => {
+        let next: Held | undefined = { env, bytes };
+        while (next) {
+          const item: Held = next;
+          applied.push({ ...item, typed: checks ? null : quietly(() => this.clashes.typedClash(docId, item.env, item.bytes)) });
+          Y.applyUpdate(state.doc, item.bytes, REMOTE);
+          next = undefined;
+          for (const [key, held] of state.pending) {
+            if (!dependenciesReady(state.doc, held.bytes)) continue;
+            state.pending.delete(key);
+            next = held;
+            break;
+          }
+        }
+      }, REMOTE);
+      // Clash removals stay outside the remote transaction so they are published as local edits.
+      for (const item of applied) {
+        if (item.typed) quietly(() => this.clashes.takeOutTyped(docId, item.typed!));
+        if (this.clashes.hasSaves(docId)) {
+          if (checks) checks.push([item.env, item.bytes]);
+          else quietly(() => this.clashes.check(docId, item.env, item.bytes, Y.decodeStateVector(before)));
+        }
+        // A snapshot's "covers" is only its author's claim: it never counts as applied updates here.
+        if (item.env.k === "u") this.markApplied(state, item.env.author, item.env.clock);
+      }
+      state.sinceSnapshot += applied.length;
+      const after = Y.encodeStateVector(state.doc);
+      return before.length !== after.length || before.some((byte, i) => byte !== after[i]);
     } catch {
-      return false; // not a valid Yjs update: ignore it rather than corrupt the document
+      return false; // not a valid Yjs update
     }
-    if (typed) quietly(() => this.clashes.takeOutTyped(docId, typed));
-    if (this.clashes.hasSaves(docId)) {
-      if (checks) checks.push([env, bytes]);
-      else quietly(() => this.clashes.check(docId, env, bytes, Y.decodeStateVector(before)));
-    }
-    // A snapshot's "covers" is only its author's claim: it never counts as applied updates here.
-    if (env.k === "u") this.markApplied(state, env.author, env.clock);
-    state.sinceSnapshot++;
-    const after = Y.encodeStateVector(state.doc);
-    return before.length !== after.length || before.some((byte, i) => byte !== after[i]);
   }
 
   /** Record that update `clock` of `author` is in the document (`upTo`: every update up to it is). */
@@ -629,8 +682,9 @@ export class RoomReplica {
       const old = [...updates, ...snapshots].filter((env) => !writes(env.author)).map((env) => envelopeKey(env));
       const done = this.passedOn.get(docId);
       if (old.length === 0 || (done && old.every((key) => done.has(key))) || !this.isComplete(docId)) continue;
-      const doc = this.loadDoc(docId).doc;
-      if (waitsForDependencies(doc)) continue;
+      const { doc, pending } = this.loadDoc(docId);
+      // A snapshot now would leave out what still waits for its dependencies.
+      if (pending.size > 0) continue;
       const mine = snapshots.filter((s) => s.author === this.node.deviceId).sort((a, b) => b.seq - a.seq)[0];
       const held = mine ? this.contentsOf(mine) : null;
       if ((held && Y.equalSnapshots(held, Y.snapshot(doc))) || this.snapshot(docId, true)) this.passedOn.set(docId, new Set(old));
@@ -783,7 +837,7 @@ export class RoomReplica {
   snapshot(docId: DocId, always = false): SnapshotEnvelope | null {
     const state = this.docs.get(docId);
     if (!state || !this.canWrite() || !this.sealEpoch()) return null;
-    if (waitsForDependencies(state.doc)) return null;
+    if (state.pending.size > 0 || waitsForDependencies(state.doc)) return null;
     // `always`: even a document held as snapshots only (nothing applied here), as when passing work on.
     if (!always && Object.keys(state.applied).length === 0) return null;
     const seq = this.node.store.maxSnapshotSeq(this.roomId, docId, this.node.deviceId) + 1;

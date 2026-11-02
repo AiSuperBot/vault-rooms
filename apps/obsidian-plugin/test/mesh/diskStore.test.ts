@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   createGenesis,
   INDEX_DOC,
+  MeshNode,
+  RoomReplica,
   keyCommitment,
   newAgreementKeyPair,
   newRoomKey,
@@ -16,6 +18,7 @@ import {
   WorkspaceChain,
   wrapRoomKey
 } from "@vault-rooms/secure";
+import { createRoom, founder, invite, Network } from "@vault-rooms/secure/testkit";
 import { DiskStore, fileNameOf } from "../../src/mesh/diskStore.js";
 import { MemoryFiles } from "./memoryFiles.js";
 
@@ -39,6 +42,113 @@ const docFile = (root: string, room: string, doc: string) => `${root}/docs/${fil
 const lines = (text: string) => text.split("\n").filter((line) => line.trim());
 
 describe("disk store", () => {
+  it.each(["json", "ciphertext", "missing"])("refetches an attachment with a damaged %s cache from an already connected peer", async (damage) => {
+    const { chain, ws, admin } = founder();
+    const { joiner } = invite(chain, admin, { userName: "Reader" });
+    const { roomId, key } = createRoom(chain, admin, "Files", { [joiner.userId]: "read" });
+    const source = new MeshNode(WorkspaceChain.load(chain.all()), admin.id);
+    const blob = sealBlob({ ws, room: roomId, n: 1, key, author: admin.sign }, utf8("original attachment"));
+    source.publish(blob);
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    (await disk.open()).add(blob);
+    await disk.flush();
+    const path = [...files.data.keys()].find((p) => p.includes("/blobs/") && p.endsWith(".json"))!;
+    if (damage === "json") files.data.set(path, '{"k":"b"');
+    else if (damage === "ciphertext") files.data.set(path, JSON.stringify({ ...blob, ct: (blob.ct[0] === "A" ? "B" : "A") + blob.ct.slice(1) }));
+    const damaged = new DiskStore(files, "m");
+    const store = await damaged.open();
+    if (damage === "missing") files.data.delete(path);
+    const receiver = new MeshNode(WorkspaceChain.load(chain.all()), joiner.id, {}, store);
+    const replica = new RoomReplica(receiver, roomId, { sign: joiner.sign, agree: joiner.agree });
+    replica.addOwnKey(1, key);
+    const net = new Network();
+    net.link(source, receiver);
+    try {
+      await net.settle();
+      expect(store.digest(roomId)).toBe(source.store.digest(roomId));
+      const ref = { by: admin.id, id: blob.id, n: 1, size: utf8("original attachment").length };
+      expect(await replica.readBlob(ref)).toBeNull();
+      expect(store.blobKeys(roomId)).toEqual([]);
+      expect(store.gone(roomId)).toEqual([]);
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      await net.settle();
+      await damaged.flush();
+      expect(await replica.readBlob(ref)).toEqual(utf8("original attachment"));
+      expect(store.digest(roomId)).toBe(source.store.digest(roomId));
+      const reopened = await new DiskStore(files, "m").open();
+      expect(await reopened.loadBlob(roomId, admin.id, blob.id)).toEqual(blob);
+    } finally { replica.destroy(); source.stop(); receiver.stop(); }
+  });
+
+  it("keeps a temporarily locked attachment and reads it after unlocking", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const blob = sealBlob(w.ctx, utf8("locked attachment"));
+    store.add(blob);
+    await disk.flush();
+    const before = [...files.data];
+    files.failReads = (path) => path.includes("/blobs/");
+    await expect(store.loadBlob(w.roomId, w.deviceId, blob.id)).rejects.toThrow("can't be read now");
+    expect(store.blobKeys(w.roomId)).toEqual([`${w.deviceId}/${blob.id}`]);
+    expect(store.gone(w.roomId)).toEqual([]);
+    expect([...files.data]).toEqual(before);
+    files.failReads = undefined;
+    expect(await store.loadBlob(w.roomId, w.deviceId, blob.id)).toEqual(blob);
+  });
+
+  it("carries a failed edit into the next successful save before a restart", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const node = new MeshNode(w.chain, w.deviceId, {}, await disk.open());
+    node.persist = (env) => disk.persisted(env);
+    const replica = new RoomReplica(node, w.roomId, { sign: w.sign, agree: w.agree });
+    replica.addOwnKey(1, w.key);
+    const id = randomId("f");
+    replica.editIndex((index) => index.set(id, { path: "Plan.md", kind: "md" }));
+    const text = replica.noteDoc(id).getText("content");
+    text.insert(0, "OLD");
+    await node.stored();
+    files.failNextWriteTo = ".jsonl";
+    text.insert(3, "A");
+    await node.stored();
+    text.insert(4, "B");
+    await node.stored();
+    node.stop();
+    replica.destroy();
+    await disk.flush();
+    const restored = await new DiskStore(files, "m").open();
+    const reopened = new RoomReplica(new MeshNode(WorkspaceChain.load(w.chain.all()), w.deviceId, {}, restored), w.roomId, { sign: w.sign, agree: w.agree });
+    reopened.addOwnKey(1, w.key);
+    expect(restored.envelopesOf(w.roomId, id).updates.map((env) => env.clock)).toEqual([1, 2, 3]);
+    expect(reopened.isComplete(id)).toBe(true);
+    expect(reopened.noteText(id)).toBe("OLDAB");
+    reopened.destroy();
+  });
+
+  it("does not acknowledge an edit arriving during an append until that edit is written", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    const doc = randomId("f");
+    const first = sealUpdate(w.ctx, doc, 1, utf8("first"));
+    const next = sealUpdate(w.ctx, doc, 2, utf8("next"));
+    const append = files.append.bind(files);
+    files.append = async (path, data) => {
+      files.append = append;
+      store.add(next);
+      await append(path, data);
+    };
+    store.add(first);
+    await disk.persisted(first);
+    await disk.persisted(next);
+    expect(lines(await files.read(docFile("m", w.roomId, doc))).map((line) => JSON.parse(line).clock)).toEqual([1, 2]);
+  });
+
   it("round-trips the record, wraps, envelopes and blobs", async () => {
     const w = world();
     const files = new MemoryFiles();

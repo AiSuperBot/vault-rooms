@@ -89,6 +89,19 @@ export default class VaultRoomsPlugin extends Plugin {
     // Editors: bind every open note of a room, whichever pane it is in.
     for (const event of ["active-leaf-change", "file-open", "layout-change"] as const) this.registerEvent(this.app.workspace.on(event as "layout-change", () => this.syncEditors()));
 
+    // A file dropped or pasted into a room's note goes into the room, so the others get it too (Obsidian's default puts
+    // attachments in the vault's root folder).
+    const files = this.app.fileManager;
+    const attachmentPath = files.getAvailablePathForAttachment.bind(files);
+    files.getAvailablePathForAttachment = async (filename, sourcePath) => {
+      const path = await attachmentPath(filename, sourcePath);
+      const note = sourcePath ?? this.app.workspace.getActiveFile()?.path;
+      return note ? this.attachmentInRoom(path, filename, note) : path;
+    };
+    this.register(() => {
+      if (files.getAvailablePathForAttachment !== attachmentPath) files.getAvailablePathForAttachment = attachmentPath;
+    });
+
     this.app.workspace.onLayoutReady(() => {
       if (!this.unloaded) void this.startService();
     });
@@ -163,12 +176,17 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   startService(service?: MeshService): Promise<void> {
-    const started = this.startNow(service);
-    this.starting = started.catch(() => {});
-    return started;
+    return this.lifecycle(() => this.startNow(service));
+  }
+
+  private lifecycle(task: () => Promise<void>): Promise<void> {
+    const run = this.starting.then(task);
+    this.starting = run.catch(() => {});
+    return run;
   }
 
   private async startNow(service?: MeshService): Promise<void> {
+    if (!service && this.service) return;
     this.serviceError = null;
     let svc: MeshService | null;
     try {
@@ -238,8 +256,7 @@ export default class VaultRoomsPlugin extends Plugin {
    */
   restartService(): Promise<void> {
     if (!this.restarting) {
-      const run = this.starting.then(() => this.stopService()).then(() => this.startNow());
-      this.starting = run.catch(() => {});
+      const run = this.lifecycle(async () => { await this.stopService(); await this.startNow(); });
       this.restarting = run.finally(() => (this.restarting = null));
     }
     return this.restarting;
@@ -248,17 +265,19 @@ export default class VaultRoomsPlugin extends Plugin {
   private restarting: Promise<void> | null = null;
 
   async createWorkspace(input: { workspaceName: string; userName: string; deviceName: string }): Promise<void> {
-    const service = await MeshService.create(this.deps(), input);
-    await this.startService(service);
+    return this.lifecycle(async () => this.startNow(await MeshService.create(this.deps(), input)));
   }
 
   async joinWorkspace(input: { link: string; userName: string; deviceName: string; peers?: string[] }): Promise<void> {
-    const service = await MeshService.join(this.deps(), input);
-    await this.startService(service);
+    return this.lifecycle(async () => this.startNow(await MeshService.join(this.deps(), input)));
   }
 
   /** Leave on this computer: stop syncing and delete the workspace data and this device's keys. Folders stay. */
   async leaveWorkspace(): Promise<void> {
+    return this.lifecycle(() => this.leaveNow());
+  }
+
+  private async leaveNow(): Promise<void> {
     const service = this.service;
     await this.stopFolders();
     this.service = null;
@@ -298,6 +317,19 @@ export default class VaultRoomsPlugin extends Plugin {
     let best: { roomId: string; length: number } | null = null;
     for (const [roomId, folder] of this.roomFolders()) if (key.startsWith(`${pathKey(folder)}/`) && (!best || folder.length > best.length)) best = { roomId, length: folder.length };
     return best?.roomId ?? null;
+  }
+
+  /** Where an attachment of `note` goes: `path` (Obsidian's choice) if that is in the note's room, else next to the note. */
+  attachmentInRoom(path: string, filename: string, note: string): string {
+    const room = this.roomAt(note);
+    if (!room || this.roomAt(path) === room) return path;
+    const dir = note.slice(0, note.lastIndexOf("/"));
+    const dot = filename.lastIndexOf(".");
+    const [stem, ext] = dot > 0 ? [filename.slice(0, dot), filename.slice(dot)] : [filename, ""];
+    for (let i = 1; ; i++) {
+      const candidate = `${dir}/${stem}${i > 1 ? ` ${i}` : ""}${ext}`;
+      if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
+    }
   }
 
   /** Why a folder can't be (or become) a room's folder (see folderProblem), rooms shown here counted, but `exceptRoomIds`. */
@@ -357,9 +389,11 @@ export default class VaultRoomsPlugin extends Plugin {
     const replica = this.service?.replica(roomId);
     if (!ws || !room || !replica) return;
     delete room.hidden;
-    if (this.folderProblem(room.folder, [roomId]) !== null || this.app.vault.getAbstractFileByPath(room.folder)) {
-      delete ws.rooms[roomId];
-    }
+    // Its folder back (restored from the trash, say): shown there again, matched with what it last synced. Taken by
+    // something else, or no longer allowed: a fresh folder.
+    const existing = this.app.vault.getAbstractFileByPath(room.folder);
+    if (this.folderProblem(room.folder, [roomId]) !== null || (existing && !(existing instanceof TFolder))) delete ws.rooms[roomId];
+    else if (!existing) await this.app.vault.createFolder(room.folder).catch(() => {});
     await this.saveSettings();
     await this.onReplica(roomId, replica);
   }
@@ -370,12 +404,17 @@ export default class VaultRoomsPlugin extends Plugin {
     const ws = this.settings.mesh.workspace;
     if (!svc || !ws) throw new Error("No workspace.");
     const path = normalizePath(folder);
+    for (const [id, stopped] of this.stopping) {
+      const previous = ws.rooms[id]?.folder;
+      if (previous && (isWithin(path, previous) || isWithin(previous, path))) await stopped;
+    }
+    if (this.service !== svc || this.settings.mesh.workspace !== ws) throw new Error("No workspace.");
     const problem = this.folderProblem(path);
     if (problem) throw new Error(problem);
     const roomId = randomId("r");
     ws.rooms[roomId] = { folder: path };
-    await this.saveSettings();
     try {
+      await this.saveSettings();
       return await svc.createRoom(cleanName(name), members, roomId);
     } catch (error) {
       delete ws.rooms[roomId];
@@ -383,6 +422,9 @@ export default class VaultRoomsPlugin extends Plugin {
       throw error;
     }
   }
+
+  /** Rooms whose new folder is being made (see onReplica). */
+  private placing = new Set<string>();
 
   private async onReplica(roomId: string, replica: RoomReplica | null): Promise<void> {
     const svc = this.service;
@@ -403,7 +445,8 @@ export default class VaultRoomsPlugin extends Plugin {
     // The room's old folder, if it is still stopping, saves its state before the new one reads it.
     await this.stopping.get(roomId);
     if (this.folders.has(roomId) || ws.rooms[roomId]?.hidden) return;
-    if (!ws.rooms[roomId]) {
+    const assigned = !ws.rooms[roomId];
+    if (assigned) {
       // Name the folder after the room, which needs the room key: wait for it rather than invent a name.
       const name = svc.rooms().find((room) => room.id === roomId)?.name;
       if (!name) {
@@ -418,15 +461,28 @@ export default class VaultRoomsPlugin extends Plugin {
         return;
       }
       ws.rooms[roomId] = { folder: free };
+      // Its folder is made below: another call meanwhile mustn't take it for one that went (see folderGone).
+      this.placing.add(roomId);
       await this.saveSettings();
     }
-    const folderPath = ws.rooms[roomId]!.folder;
+    let folderPath = ws.rooms[roomId]!.folder;
     const problem = this.folderProblem(folderPath, [roomId]);
     if (problem) {
+      this.placing.delete(roomId);
       new Notice(`A room can't be shown here: ${problem}`, 10000);
       return;
     }
-    if (!this.app.vault.getAbstractFileByPath(folderPath)) await this.app.vault.createFolder(folderPath).catch(() => {});
+    if (!(this.app.vault.getAbstractFileByPath(folderPath) instanceof TFolder)) {
+      // Renamed outside Obsidian by case only (Windows): followed. Otherwise a folder the room had is gone (deleted, or
+      // renamed outside Obsidian): the room isn't shown, rather than downloaded again next to the renamed copy.
+      const spelled = assigned ? undefined : this.app.vault.getAllLoadedFiles().find((file) => file instanceof TFolder && pathKey(file.path) === pathKey(folderPath));
+      if (spelled) {
+        folderPath = ws.rooms[roomId]!.folder = spelled.path;
+        await this.saveSettings();
+      } else if (!assigned && !this.placing.has(roomId)) return this.folderGone(roomId);
+      else await this.app.vault.createFolder(folderPath).catch(() => {});
+    }
+    this.placing.delete(roomId);
     // Shown meanwhile (by another call), or this replica was let go meanwhile.
     if (this.folders.has(roomId) || svc.replica(roomId) !== replica) return;
     const presence = new RoomPresence({
@@ -509,7 +565,7 @@ export default class VaultRoomsPlugin extends Plugin {
     room.hidden = true;
     await this.saveSettings();
     const name = this.service?.rooms().find((r) => r.id === roomId)?.name ?? room.folder;
-    new Notice(`The folder of "${name}" was deleted on this computer. The room stays shared with the others; it just isn't shown in this vault any more. You can show it again from the Vault Rooms panel.`, 12000);
+    new Notice(`The folder of "${name}" is gone from this vault (deleted, or renamed outside Obsidian). The room stays shared with the others; it just isn't shown in this vault any more. You can show it again from the Vault Rooms panel.`, 12000);
     this.changed();
   }
 
@@ -578,12 +634,16 @@ export default class VaultRoomsPlugin extends Plugin {
       if (folder) await this.app.fileManager.renameFile(folder, oldPath).catch(() => {});
       return;
     }
+    // Followed at once, before stopping (which can take seconds): a second move meanwhile then finds the room.
     for (const [roomId, room] of moved) {
-      const replica = this.service?.replica(roomId);
       this.pausedFolders.add(roomId);
-      await this.unmount(roomId);
+      this.folders.get(roomId)?.folderMoved();
       room.folder = newPath + room.folder.slice(oldPath.length);
-      await this.saveSettings();
+    }
+    await this.saveSettings();
+    for (const [roomId] of moved) {
+      const replica = this.service?.replica(roomId);
+      await this.unmount(roomId);
       // Let the file events of the move pass before watching again.
       window.setTimeout(() => {
         this.pausedFolders.delete(roomId);

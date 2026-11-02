@@ -1,10 +1,41 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { EditorState } from "@codemirror/state";
+import { EditorState, Transaction, type TransactionSpec } from "@codemirror/state";
+import { keymap, type EditorView } from "@codemirror/view";
 import * as Y from "yjs";
-import { safeToBind, WHOLE_CHARACTERS } from "../../src/mesh/editorBinding.js";
+import { EditorBinding, safeToBind, SHARED_UNDO, WHOLE_CHARACTERS, type BindTarget } from "../../src/mesh/editorBinding.js";
 
 describe("binding an editor", () => {
+  it("undoes only this person's typing: Ctrl+Z goes to the shared undo, others' edits stay out of the editor's history", () => {
+    const state = EditorState.create({ doc: "a", extensions: [SHARED_UNDO] });
+    expect(state.facet(keymap).flat().some((binding) => binding.key === "Mod-z")).toBe(true);
+    const remote = state.update({ changes: { from: 1, insert: "R" } });
+    expect(remote.annotation(Transaction.addToHistory)).toBe(false);
+    const typed = remote.state.update({ changes: { from: 2, insert: "t" }, userEvent: "input.type" });
+    expect(typed.annotation(Transaction.addToHistory)).toBeUndefined();
+  });
+
+  it("keeps an existing binding while dependencies wait and delays new bindings", () => {
+    const doc = new Y.Doc();
+    doc.getText("content").insert(0, "OLD");
+    const target = { roomId: "r", fileId: "f", ytext: doc.getText("content"), readOnly: false, complete: false, fromShared: () => true, presence: { facade: () => ({ destroy() {} }) } } as unknown as BindTarget;
+    const bindings = new EditorBinding(() => target, () => {});
+    const view = {
+      state: EditorState.create({ doc: "OLD", extensions: [bindings.extension()] }),
+      dispatch(spec: TransactionSpec) { this.state = this.state.update(spec).state; }
+    };
+    const sync = () => bindings.sync([{ path: "Team/Plan.md", view: view as unknown as EditorView, disk: "OLD" }]);
+    sync();
+    expect(bindings.isBound("r", "f")).toBe(false);
+    target.complete = true; sync();
+    expect(bindings.isBound("r", "f")).toBe(true);
+    const extension = bindings.compartment.get(view.state);
+    target.complete = false; sync();
+    expect(bindings.isBound("r", "f")).toBe(true);
+    expect(bindings.compartment.get(view.state)).toBe(extension);
+    bindings.unbindAll(); doc.destroy();
+  });
+
   it("replaces what the editor shows only when nothing in it can be lost", () => {
     const synced = createHash("sha256").update("old\n").digest("base64url");
     const fromShared = (hash: string) => hash === synced;

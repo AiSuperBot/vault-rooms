@@ -1,10 +1,11 @@
 import { once } from "node:events";
 import { createServer } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as secure from "@vault-rooms/secure";
 import { createJoinRecord, keyCommitment, newRoomKey, nextVersion, parseInviteLink, type WorkspaceState } from "@vault-rooms/secure";
 import { newDevice } from "@vault-rooms/secure/testkit";
 import { MeshService, type MeshDeps, type MeshSettings } from "../../src/mesh/meshService.js";
-import type { SecretStore } from "../../src/mesh/secrets.js";
+import { createDeviceSecrets, loadJoinAttempt, type SecretStore } from "../../src/mesh/secrets.js";
 import { MemoryFiles } from "./memoryFiles.js";
 
 const services: MeshService[] = [];
@@ -37,6 +38,100 @@ async function started(service: MeshService): Promise<MeshService> {
 }
 
 describe("mesh service", () => {
+  it.each(["userName", "deviceName"] as const)("does not persist an invalid %s, and accepts the corrected join", async (field) => {
+    const host = await started(await MeshService.create(deps("NameHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
+    const link = (await host.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${host.listeningPort}`);
+    const d = deps("NameJoin");
+    await expect(MeshService.join(d, { link, userName: "Guest", deviceName: "PC", [field]: "X".repeat(81) })).rejects.toThrow();
+    expect(d.secretValues.size).toBe(0);
+    const joined = await MeshService.join(d, { link, userName: "Guest", deviceName: "PC" });
+    services.push(joined);
+    expect(joined.state.users[joined.me.userId]!.name).toBe("Guest");
+  });
+
+  it("recovers an invalid-name attempt saved by an older build", async () => {
+    const host = await started(await MeshService.create(deps("LegacyHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
+    const link = (await host.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${host.listeningPort}`);
+    const invite = parseInviteLink(link);
+    const d = deps("LegacyJoin");
+    const { secrets } = await createDeviceSecrets();
+    const join = createJoinRecord({ workspaceId: invite.workspaceId, inviteId: invite.inviteId, secret: invite.secret, user: { id: secure.randomId("u"), name: "X".repeat(81) }, deviceName: "PC", deviceKey: secrets.sign, agreementPublicKey: secrets.agree.publicKey, tlsFingerprint: secrets.tls.fingerprint });
+    d.secretValues.set(`vault-rooms-${d.settings.scope}-join`, JSON.stringify({ signSeed: secrets.sign.secretKey, agreeSecret: secrets.agree.secretKey, keyPem: secrets.tls.keyPem, certPem: secrets.tls.certPem, join }));
+    const joined = await MeshService.join(d, { link, userName: "Corrected", deviceName: "PC" });
+    services.push(joined);
+    expect(joined.state.users[joined.me.userId]!.name).toBe("Corrected");
+    expect(d.secretValues.size).toBe(3);
+  });
+
+  it("allows workspace creation again after saving its configuration failed", async () => {
+    const d = deps("CreateRetry");
+    d.save = async () => { throw new Error("disk full"); };
+    await expect(MeshService.create(d, { workspaceName: "Team", userName: "Host", deviceName: "PC" })).rejects.toThrow("disk full");
+    expect(d.settings.workspace).toBeNull();
+    d.save = async () => {};
+    const service = await MeshService.create(d, { workspaceName: "Team", userName: "Host", deviceName: "PC" });
+    services.push(service);
+    const again = (await MeshService.open(d))!;
+    services.push(again);
+    expect(again.me.deviceId).toBe(service.me.deviceId);
+  });
+
+  it("keeps a failed join attempt apart from the active credentials, and resumes it", async () => {
+    const ana = await started(await MeshService.create(deps("LifecycleHost"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" }));
+    const link = (await ana.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${ana.listeningPort}`);
+    const d = deps("LifecycleJoin");
+    const join = vi.spyOn(secure, "joinWorkspace").mockRejectedValueOnce(new Error("unreachable"));
+    try {
+      await expect(MeshService.join(d, { link, userName: "Old", deviceName: "PC" })).rejects.toThrow("unreachable");
+      // Only the attempt is saved: no active keys until the record is stored.
+      expect([...d.secretValues.keys()]).toEqual([`vault-rooms-${d.settings.scope}-join`]);
+      expect(d.settings.workspace).toBeNull();
+      const device = loadJoinAttempt(d.secrets, d.settings.scope)!.join.body.device.id;
+      const service = await MeshService.join(d, { link, userName: "Old", deviceName: "PC" });
+      services.push(service);
+      expect(service.me.deviceId).toBe(device);
+      expect(d.secretValues.size).toBe(3);
+    } finally { join.mockRestore(); }
+  });
+
+  it("saves the workspace as cleared when a join fails after its settings were saved", async () => {
+    const host = await started(await MeshService.create(deps("LateHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
+    const link = (await host.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${host.listeningPort}`);
+    const d = deps("LateJoin");
+    const saved: unknown[] = [];
+    d.save = async () => { saved.push(structuredClone(d.settings.workspace)); };
+    const open = vi.spyOn(MeshService, "open").mockRejectedValueOnce(new Error("store unreadable"));
+    try {
+      await expect(MeshService.join(d, { link, userName: "Guest", deviceName: "PC" })).rejects.toThrow("store unreadable");
+    } finally { open.mockRestore(); }
+    expect(saved.at(-1)).toBeNull();
+    expect(loadJoinAttempt(d.secrets, d.settings.scope)).not.toBeNull();
+  });
+
+  it.each(["record", "settings"])("resumes the exact accepted join after a local %s save failure and restart", async (failure) => {
+    const host = await started(await MeshService.create(deps("ResumeHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
+    const link = (await host.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${host.listeningPort}`);
+    const d = deps("ResumeJoin");
+    if (failure === "record") (d.files as MemoryFiles).failNextWriteTo = "chain.json.tmp";
+    else d.save = async () => { throw new Error("disk full"); };
+    await expect(MeshService.join(d, { link, userName: "Guest", deviceName: "PC" })).rejects.toThrow("disk full");
+    expect(d.settings.workspace).toBeNull();
+    const attempt = loadJoinAttempt(d.secrets, d.settings.scope)!;
+    expect(attempt).not.toBeNull();
+    const device = attempt.join.body.device.id;
+    await until(() => host.node.chain.state.invites[parseInviteLink(link).inviteId]?.used === device);
+    const restarted = { ...d, settings: structuredClone(d.settings), save: async () => {} };
+    const guest = await MeshService.join(restarted, { link, userName: "Guest", deviceName: "PC" });
+    services.push(guest);
+    expect(guest.me.deviceId).toBe(device);
+    expect(loadJoinAttempt(d.secrets, d.settings.scope)).toBeNull();
+    expect(d.secretValues.size).toBe(3);
+    const reopened = (await MeshService.open(restarted))!;
+    services.push(reopened);
+    expect(reopened.me.deviceId).toBe(device);
+    expect(Object.keys(host.node.chain.state.devices)).toHaveLength(2);
+  });
+
   it("creates a workspace, invites someone, and shares an encrypted room with them", async () => {
     const anaDeps = deps("Ana");
     const ana = await started(await MeshService.create(anaDeps, { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));

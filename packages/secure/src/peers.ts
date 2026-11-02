@@ -190,7 +190,7 @@ export class PeerManager {
   private dialAddress(address: Address): void {
     const key = `${address.host}:${address.port}`;
     if (this.stopped || this.dialing.has(key) || this.inBackoff(key)) return;
-    if ([...this.links.values()].some(({ link }) => link.direction === "out" && link.remoteAddress === address.host)) return;
+    if ([...this.links.values()].some(({ link }) => link.direction === "out" && link.endpoint?.host.toLowerCase() === address.host.toLowerCase() && link.endpoint.port === address.port)) return;
     this.dialing.add(key);
     dial(this.config, address.host, address.port)
       .then((link) => {
@@ -251,10 +251,12 @@ export async function joinWorkspace(input: {
   /** For joining as another device of an existing user (invites made "for" that user). */
   existingUserId?: string;
   newUserId: string;
+  /** The exact durable attempt to resume, including its original timestamp and signatures. */
+  join?: JoinRecord;
 }): Promise<{ chain: WorkspaceChain; join: JoinRecord; link: PeerLink }> {
   const { invite } = input;
   const config: TransportConfig = { workspaceId: invite.workspaceId, deviceId: "", deviceKey: input.deviceKey, tls: input.tls, membership: noMembership };
-  const join = createJoinRecord({
+  const join = input.join ?? createJoinRecord({
     workspaceId: invite.workspaceId,
     inviteId: invite.inviteId,
     secret: invite.secret,

@@ -2,13 +2,9 @@ import { App, Modal, Notice, Setting, TFolder } from "obsidian";
 import { cleanName, ROLES, roleIn, type Role } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
 import { personLabel } from "./labels.js";
+import { errorText, pendingAction } from "./actions.js";
 
 const ROLE_LABEL: Record<Role, string> = { read: "Can read", write: "Can edit", manage: "Manages" };
-
-function errorText(error: unknown): string {
-  const text = error instanceof Error ? error.message : String(error);
-  return text.replace(/^forbidden:/, "Not allowed: ");
-}
 
 /** Ask before doing something that can't be undone. Resolves true if confirmed. */
 export function confirmAction(app: App, title: string, body: string, action: string): Promise<boolean> {
@@ -71,14 +67,7 @@ export class CreateWorkspaceModal extends Modal {
         .setCta()
         .onClick(async () => {
           if (!values.workspaceName || !values.userName || !values.deviceName) return new Notice("Please fill in every field.");
-          button.setDisabled(true);
-          try {
-            await this.plugin.createWorkspace(values);
-            this.close();
-          } catch (error) {
-            button.setDisabled(false);
-            new Notice(errorText(error), 8000);
-          }
+          await pendingAction(() => this.plugin.createWorkspace(values), button, () => this.close());
         })
     );
   }
@@ -199,15 +188,11 @@ export class InviteModal extends Modal {
         .setButtonText("Create invite link")
         .setCta()
         .onClick(async () => {
-          button.setDisabled(true);
-          try {
+          await pendingAction(async () => {
             const link = await svc.createInvite(grants, days);
             this.close();
             new LinkModal(this.app, "Invite link", link, `Send this link privately (not in a public channel): whoever has it can join until it is used or expires in ${days} day${days > 1 ? "s" : ""}.`).open();
-          } catch (error) {
-            button.setDisabled(false);
-            new Notice(errorText(error), 8000);
-          }
+          }, button);
         })
     );
   }
@@ -248,20 +233,19 @@ export class NewRoomModal extends Modal {
         .setCta()
         .onClick(async () => {
           if (!values.folder || !values.name) return new Notice("Pick a folder and a name.");
-          button.setDisabled(true);
-          try {
-            await this.plugin.createRoom(values.folder, values.name);
-            this.close();
-          } catch (error) {
-            button.setDisabled(false);
-            new Notice(errorText(error), 8000);
-          }
+          await pendingAction(() => this.plugin.createRoom(values.folder, values.name), button, () => this.close());
         })
     );
   }
 }
 
 export class MembersModal extends Modal {
+  private unsubscribe: (() => void) | null = null;
+  private nameDraft: string | undefined;
+  private chosen: string | undefined;
+  private addRole: Role = "write";
+  /** What the dialog was last drawn from: redrawn only when that changes, so an open dropdown isn't closed under the user. */
+  private shown: [unknown, unknown, string] | null = null;
   constructor(
     private readonly plugin: VaultRoomsPlugin,
     private readonly roomId: string
@@ -270,15 +254,29 @@ export class MembersModal extends Modal {
   }
 
   onOpen(): void {
+    this.unsubscribe = this.plugin.onChange(() => {
+      const svc = this.plugin.service;
+      const now = [svc, svc?.state, JSON.stringify(svc?.rooms().find((r) => r.id === this.roomId) ?? null)];
+      if (!this.shown || now.some((value, i) => value !== this.shown![i])) this.render();
+    });
     this.render();
   }
 
+  onClose(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
+
   private render(): void {
+    const active = this.contentEl.ownerDocument.activeElement as HTMLInputElement | HTMLSelectElement | null;
+    const focus = active && this.contentEl.contains(active) ? active.dataset.focusKey : undefined;
+    const selection = active?.tagName === "INPUT" ? [(active as HTMLInputElement).selectionStart, (active as HTMLInputElement).selectionEnd] : null;
     const svc = this.plugin.service;
     this.contentEl.empty();
-    if (!svc) return;
+    if (!svc) return this.close();
     const room = svc.rooms().find((r) => r.id === this.roomId);
-    if (!room) return this.close();
+    this.shown = [svc, svc.state, JSON.stringify(room ?? null)];
+    if (!room || room.role === undefined) return this.close();
     this.titleEl.setText(`Members of ${room.name ?? "this room"}`);
     const state = svc.state;
     const iManage = room.role === "manage";
@@ -290,64 +288,83 @@ export class MembersModal extends Modal {
       if (iManage) {
         row.addDropdown((dropdown) => {
           for (const option of ROLES) dropdown.addOption(option, ROLE_LABEL[option]);
+          dropdown.selectEl.dataset.focusKey = `member:${userId}`;
           dropdown.setValue(role).onChange(async (value) => {
             await this.run(() => svc.setMember(this.roomId, userId, value as Role));
           });
         });
         if (userId !== svc.me.userId)
-          row.addButton((button) =>
+          row.addButton((button) => {
+            button.buttonEl.dataset.focusKey = `remove:${userId}`;
             button.setButtonText("Remove").onClick(async () => {
               if (await confirmAction(this.app, "Remove from room", `${personLabel(state, userId)} loses access to this room. A new room key is made, so they can't read anything added from now on (they keep what they already have).`, "Remove")) await this.run(() => svc.setMember(this.roomId, userId, null));
-            })
-          );
+            });
+          });
       } else row.setDesc(ROLE_LABEL[role]);
     }
     if (iManage) {
       const candidates = Object.entries(state.users).filter(([userId, user]) => !user.removed && roleIn(state, this.roomId, userId) === undefined);
       if (candidates.length > 0) {
-        let chosen = candidates[0]![0];
-        let role: Role = "write";
+        if (!candidates.some(([id]) => id === this.chosen)) this.chosen = candidates[0]![0];
         new Setting(this.contentEl)
           .setName("Add a person")
           .addDropdown((dropdown) => {
             for (const [userId] of candidates) dropdown.addOption(userId, personLabel(state, userId));
-            dropdown.onChange((value) => (chosen = value));
+            dropdown.selectEl.dataset.focusKey = "add-person";
+            dropdown.setValue(this.chosen!).onChange((value) => (this.chosen = value));
           })
           .addDropdown((dropdown) => {
             for (const option of ROLES) dropdown.addOption(option, ROLE_LABEL[option]);
-            dropdown.setValue(role).onChange((value) => (role = value as Role));
+            dropdown.selectEl.dataset.focusKey = "add-role";
+            dropdown.setValue(this.addRole).onChange((value) => (this.addRole = value as Role));
           })
-          .addButton((button) =>
+          .addButton((button) => {
+            button.buttonEl.dataset.focusKey = "add";
             button.setButtonText("Add").onClick(async () => {
+              const chosen = this.chosen!;
+              const role = this.addRole;
               if (await confirmAction(this.app, "Add to room", `${personLabel(state, chosen)} is added to this room (${ROLE_LABEL[role].toLowerCase()}), and gets everything already in it.`, "Add")) await this.run(() => svc.setMember(this.roomId, chosen, role));
-            })
-          );
+            });
+          });
       }
-      let name = room.name ?? "";
       new Setting(this.contentEl)
         .setName("Room name")
-        .addText((text) => text.setValue(name).onChange((value) => (name = cleanName(value))))
-        .addButton((button) => button.setButtonText("Rename").onClick(() => (name ? this.run(() => svc.renameRoom(this.roomId, name)) : undefined)));
+        .addText((text) => {
+          text.inputEl.dataset.focusKey = "room-name";
+          text.setValue(this.nameDraft ?? room.name ?? "").onChange((value) => (this.nameDraft = value));
+        })
+        .addButton((button) => {
+          button.buttonEl.dataset.focusKey = "rename";
+          button.setButtonText("Rename").onClick(() => {
+            const name = cleanName(this.nameDraft ?? room.name ?? "");
+            return name ? this.run(async () => { await svc.renameRoom(this.roomId, name); this.nameDraft = undefined; }) : undefined;
+          });
+        });
     }
     const actions = new Setting(this.contentEl);
     if (svc.roomsOnlyManagedBy(svc.me.userId).includes(this.roomId)) {
       // Leaving would leave no one to manage it: the record wouldn't take it.
       actions.setDesc("You're this room's only manager: to leave it, make someone else a manager first, or delete the room.");
     } else
-      actions.addButton((button) =>
+      actions.addButton((button) => {
+        button.buttonEl.dataset.focusKey = "leave";
         button.setButtonText("Leave this room").onClick(async () => {
           if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) await this.run(() => svc.leaveRoom(this.roomId));
-        })
-      );
-    if (iManage || svc.isAdmin()) actions.addButton((button) => button.setButtonText("Delete room").setWarning().onClick(() => deleteRoom(this.plugin, this.roomId, () => this.close())));
+        });
+      });
+    if (iManage || svc.isAdmin()) actions.addButton((button) => {
+      button.buttonEl.dataset.focusKey = "delete";
+      button.setButtonText("Delete room").setWarning().onClick(() => deleteRoom(this.plugin, this.roomId, () => this.close()));
+    });
+    if (focus) {
+      const target = Array.from(this.contentEl.querySelectorAll<HTMLInputElement | HTMLSelectElement>("[data-focus-key]")).find((element) => element.dataset.focusKey === focus);
+      target?.focus();
+      if (target?.tagName === "INPUT" && selection) (target as HTMLInputElement).setSelectionRange(selection[0] ?? null, selection[1] ?? null);
+    }
   }
 
   private async run(action: () => Promise<void>): Promise<void> {
-    try {
-      await action();
-    } catch (error) {
-      new Notice(errorText(error), 8000);
-    }
+    await pendingAction(action);
     this.render();
   }
 }

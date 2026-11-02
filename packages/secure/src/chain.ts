@@ -67,6 +67,15 @@ export class WorkspaceChain {
     return [...this.versions];
   }
 
+  /** Independent staging chain sharing only this already-verified prefix's immutable records. */
+  prefix(length: number): WorkspaceChain {
+    if (!Number.isInteger(length) || length < 1 || length > this.length) fail("bad_chain", "prefix");
+    const copy = new WorkspaceChain(this.versions[0]!);
+    copy.versions = this.versions.slice(0, length);
+    copy.hashes = this.hashes.slice(0, length);
+    return copy;
+  }
+
   /**
    * Offer consecutive versions from a peer. They must start right after a version we have (`branch[0].body.prev`
    * is the hash of our version `branch[0].body.v - 1`). With `now` (this peer's clock), a version dated more than
@@ -115,8 +124,9 @@ export class WorkspaceChain {
     const forkState = this.versions[divergeAt - 1]!.body.state;
     const seniority = this.seniority(divergeAt - 1);
     if (!preferBranch(forkState, seniority, theirs, theirHashes[0]!, ours, this.hashes[divergeAt]!)) return { status: "rejected", reason: "loses" };
-    this.versions.splice(divergeAt, ours.length, ...theirs);
-    this.hashes.splice(divergeAt, ours.length, ...theirHashes);
+    this.versions.length = this.hashes.length = divergeAt;
+    for (const version of theirs) this.versions.push(version);
+    for (const hash of theirHashes) this.hashes.push(hash);
     return { status: "replaced", lost: ours, count: theirs.length };
   }
 

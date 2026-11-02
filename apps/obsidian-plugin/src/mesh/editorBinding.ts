@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { Compartment, EditorState, Prec, Transaction, type Annotation, type Extension, type Text } from "@codemirror/state";
-import { EditorView, ViewPlugin } from "@codemirror/view";
+import { EditorView, keymap, ViewPlugin } from "@codemirror/view";
 import * as Y from "yjs";
-import { yCollab } from "y-codemirror.next";
+import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { reconcileYTextWithDiskText } from "../crdtReconcile.js";
 import type { AwarenessFacade, RoomPresence } from "./presence.js";
 
@@ -106,6 +106,16 @@ export function safeToBind(editor: string, shared: string, disk: string | null, 
   return editor === shared || (disk !== null && editor === disk && fromShared(sha(disk)));
 }
 
+/**
+ * Undo in a co-edited note undoes this person's own edits only. Ctrl+Z goes to the shared text's undo, and changes that
+ * aren't typed here (others' edits arriving, the note being tied to the shared text) stay out of the editor's history,
+ * so its undo (from a menu or a command) can't take back someone else's text.
+ */
+export const SHARED_UNDO: Extension = [
+  Prec.highest(keymap.of(yUndoManagerKeymap)),
+  EditorState.transactionExtender.of((tr) => (tr.docChanged && !tr.annotation(Transaction.userEvent) ? { annotations: Transaction.addToHistory.of(false) } : null))
+];
+
 export class EditorBinding {
   readonly compartment = new Compartment();
   private bound = new Map<EditorView, Bound>();
@@ -182,7 +192,7 @@ export class EditorBinding {
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
     const now = view.state.doc.toString();
     const shared = target.ytext.toString();
-    const extension: Extension = [WHOLE_CHARACTERS, yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
+    const extension: Extension = [WHOLE_CHARACTERS, SHARED_UNDO, yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
     try {
       view.dispatch({
         ...(now === shared ? {} : { changes: { from: 0, to: now.length, insert: shared } }),

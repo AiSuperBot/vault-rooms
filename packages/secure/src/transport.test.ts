@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { EventEmitter } from "node:events";
 import * as tls from "node:tls";
 import { b64u, concatBytes, fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
@@ -12,7 +13,7 @@ import { MeshNode } from "./mesh.js";
 import { joinWorkspace, PeerManager } from "./peers.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { createTlsIdentity, type TlsIdentity } from "./tlsIdentity.js";
-import { dial, PeerServer, workspaceTag, type PeerLink, type TransportConfig } from "./transport.js";
+import { dial, PeerServer, Wire, workspaceTag, type PeerLink, type TransportConfig } from "./transport.js";
 
 const cleanups: Array<() => unknown> = [];
 afterEach(async () => {
@@ -49,6 +50,40 @@ async function peer(chain: WorkspaceChain, device: { id: string; sign: ReturnTyp
 }
 
 describe("frames", () => {
+  it("waits for socket drain after write(false), and releases the wait on close", async () => {
+    class SlowSocket extends EventEmitter { writableLength = 0; write() { return false; } destroy() {} }
+    const socket = new SlowSocket();
+    const wire = new Wire(socket as unknown as tls.TLSSocket);
+    wire.write({ t: "test" });
+    let ready = false;
+    const waiting = wire.drained().then(() => { ready = true; });
+    await Promise.resolve();
+    expect(ready).toBe(false);
+    socket.emit("drain");
+    await waiting;
+    expect(ready).toBe(true);
+    wire.write({ t: "test" });
+    const closing = wire.drained();
+    wire.close("cancelled");
+    await closing;
+  });
+
+  it("connects two manually configured peers at one IP on different ports without discovery", async () => {
+    const w = await world();
+    const tlsB = await createTlsIdentity();
+    const { joiner: ben } = invite(w.chain, w.ana, { userName: "Ben", tls: tlsB.fingerprint });
+    const b = await peer(w.chain, ben, tlsB);
+    const c = await peer(w.chain, w.cy, w.tlsC);
+    const addresses = [{ host: "127.0.0.1", port: b.port }];
+    const a = await peer(w.chain, w.ana, w.tlsA, addresses);
+    for (const p of [a, b, c]) p.manager.ownAddresses = () => [];
+    a.manager.start();
+    await until(() => a.manager.connected().includes(ben.id));
+    addresses.push({ host: "127.0.0.1", port: c.port });
+    await until(() => a.manager.connected().includes(w.cy.id));
+    expect(a.manager.connected().sort()).toEqual([ben.id, w.cy.id].sort());
+  }, 15_000);
+
   it("reassemble messages split anywhere and refuse oversized ones", () => {
     const bytes = Buffer.concat([encodeFrame({ a: 1 }), encodeFrame({ b: "two" })]);
     const reader = new FrameReader();
@@ -56,7 +91,7 @@ describe("frames", () => {
     for (let i = 0; i < bytes.length; i += 3) out.push(...reader.push(bytes.subarray(i, i + 3)));
     expect(out).toEqual([{ a: 1 }, { b: "two" }]);
     const small = new FrameReader(10);
-    expect(() => small.push(encodeFrame({ long: "x".repeat(50) }))).toThrow(/frame_too_large/);
+    expect(() => [...small.push(encodeFrame({ long: "x".repeat(50) }))]).toThrow(/frame_too_large/);
   });
 
   it("read a frame that trickles in a byte at a time, and refuse empty ones", () => {
@@ -65,7 +100,7 @@ describe("frames", () => {
     const out: unknown[] = [];
     for (let i = 0; i < bytes.length; i++) out.push(...reader.push(bytes.subarray(i, i + 1)));
     expect(out).toEqual([{ text: "x".repeat(5000) }]);
-    expect(() => new FrameReader().push(Buffer.from([0, 0, 0, 0]))).toThrow(/bad_frame/);
+    expect(() => [...new FrameReader().push(Buffer.from([0, 0, 0, 0]))]).toThrow(/bad_frame/);
   });
 });
 
@@ -147,8 +182,10 @@ describe("TLS transport", () => {
     await expect(dial(config, "127.0.0.1", a.port, { device: w.ana.id, fingerprint: w.tlsC.fingerprint })).rejects.toThrow("certificate_mismatch");
   });
 
-  it("hands on what comes in the same chunk as the answer to its authentication", async () => {
+  it.each([false, true])("hands on a coalesced post-auth frame, including above the auth size limit (%s)", async (large) => {
     const w = await world();
+    const message = large ? { t: "digests", rooms: Object.fromEntries(Array.from({ length: 1000 }, () => [randomId("r"), "A".repeat(43)])) } : { t: "hello", ws: w.ws };
+    if (large) expect(encodeFrame(message).length).toBeGreaterThan(64 * 1024);
     // Ana's side answers and says hello in one write, as a busy computer may.
     const sockets: tls.TLSSocket[] = [];
     const server = tls.createServer({ key: w.tlsA.keyPem, cert: w.tlsA.certPem, minVersion: "TLSv1.3" }, (socket) => {
@@ -156,7 +193,7 @@ describe("TLS transport", () => {
       socket.once("data", () => {
         const ekm = new Uint8Array(socket.exportKeyingMaterial(32, "EXPORTER-vault-rooms-peer-auth", Buffer.alloc(0)));
         const sig = sign(w.ana.sign.secretKey, "peer-auth-ok", concatBytes(ekm, utf8(`ok|${w.cy.id}|${w.ana.id}|${workspaceTag(w.ws)}`)));
-        socket.write(Buffer.concat([encodeFrame({ t: "auth_ok", device: w.ana.id, sig }), encodeFrame({ t: "hello", ws: w.ws })]));
+        socket.write(Buffer.concat([encodeFrame({ t: "auth_ok", device: w.ana.id, sig }), encodeFrame(message)]));
       });
     });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -169,7 +206,7 @@ describe("TLS transport", () => {
     const heard: unknown[] = [];
     link.onMessage((message) => heard.push(message));
     await until(() => heard.length > 0, 2000);
-    expect(heard).toEqual([{ t: "hello", ws: w.ws }]);
+    expect(heard).toEqual([message]);
     link.channel.close("done");
   });
 

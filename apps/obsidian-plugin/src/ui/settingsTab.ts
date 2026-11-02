@@ -3,6 +3,7 @@ import { cleanName } from "@vault-rooms/secure";
 import { PORT_SPAN, type MeshService } from "../mesh/meshService.js";
 import type VaultRoomsPlugin from "../plugin.js";
 import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
+import { pendingAction } from "./actions.js";
 
 /** What leaving means, with a warning when this is the only computer of the only admin. */
 export function leaveWarning(svc: MeshService | null): string {
@@ -129,11 +130,6 @@ export class RoomsSettingTab extends PluginSettingTab {
   }
 
   private async apply(action: () => Promise<void>): Promise<void> {
-    try {
-      await action();
-      new Notice("Saved.");
-    } catch (error) {
-      new Notice((error as Error).message, 8000);
-    }
+    await pendingAction(action, undefined, () => { new Notice("Saved."); });
   }
 }

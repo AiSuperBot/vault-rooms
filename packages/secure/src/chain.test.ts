@@ -6,6 +6,21 @@ import { createRoom, founder, invite, step } from "./testkit.js";
 import { nextVersion, versionHash } from "./workspace.js";
 
 describe("workspace chain", () => {
+  it("stages from a verified prefix without changing the original or accepting invalid signatures", () => {
+    const { chain, admin } = founder();
+    step(chain, admin, (state) => { state.name = "one"; });
+    const prefix = chain.prefix(chain.length);
+    const next = step(chain, admin, (state) => { state.name = "two"; });
+    expect(prefix.head.body.state.name).toBe("one");
+    const forged = structuredClone(next);
+    forged.body.state.name = "forged";
+    expect(prefix.offer([forged]).status).toBe("rejected");
+    expect(prefix.offer([next]).status).toBe("appended");
+    expect(prefix.headHash).toBe(chain.headHash);
+    expect(() => chain.prefix(0)).toThrow();
+    expect(() => chain.prefix(chain.length + 1)).toThrow();
+  });
+
   it("appends in order, ignores duplicates and refuses gaps", () => {
     const { chain, admin } = founder();
     const v1 = step(chain, admin, (state) => (state.name = "One"));

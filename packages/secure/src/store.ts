@@ -102,6 +102,8 @@ export class EnvelopeStore {
   private blobBytes = new Map<string, number>();
   /** Whether this device is a member of a room; set by the mesh node. */
   isMember: (room: string) => boolean = () => true;
+  /** A cached attachment was missing or corrupt: ask peers for another copy. */
+  onMissingBlob?: () => void;
   private unreadable = new Set<string>();
   now: () => number = Date.now;
 
@@ -396,7 +398,19 @@ export class EnvelopeStore {
   /** The ciphertext of a blob held here, or null. */
   async loadBlob(room: string, author: string, id: string): Promise<BlobEnvelope | null> {
     const meta = this.blob(room, author, id);
-    return meta ? this.blobStorage.get(meta) : null;
+    if (!meta) return null;
+    const env = await this.blobStorage.get(meta);
+    if (!env && this.blob(room, author, id) === meta) this.invalidateBlob(room, author, id);
+    return env;
+  }
+
+  /** A damaged cache entry must neither claim to be held nor refuse a replacement as intentionally dropped. */
+  invalidateBlob(room: string, author: string, id: string): void {
+    if (!this.blob(room, author, id)) return;
+    const key = blobKeyOf(author, id);
+    this.dropBlobs(room, [key]);
+    this.undrop(room, key);
+    this.onMissingBlob?.();
   }
 
   /** Blobs held, as "author/id". */
