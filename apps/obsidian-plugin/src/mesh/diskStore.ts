@@ -63,7 +63,7 @@ function lastPart(path: string): string {
  */
 export class DiskStore implements BlobStorage {
   private queues = new Map<string, Promise<void>>();
-  private pendingLines = new Map<string, string[]>();
+  private pendingLines = new Map<string, Map<string, string>>();
   /** The append that will carry each document's pending lines. */
   private batches = new Map<string, Promise<void>>();
   private pendingWrites = new Map<string, Promise<void>>();
@@ -405,21 +405,25 @@ export class DiskStore implements BlobStorage {
   /** Append an envelope to its document's log, in one write with the others waiting for it. */
   private append(env: UpdateEnvelope | SnapshotEnvelope): void {
     const path = this.docPath(env.room, env.doc);
-    const lines = this.pendingLines.get(path);
-    if (lines) {
-      lines.push(JSON.stringify(env));
-    } else {
-      this.pendingLines.set(path, [JSON.stringify(env)]);
+    const lines = this.pendingLines.get(path) ?? new Map<string, string>();
+    this.pendingLines.set(path, lines);
+    lines.set(envelopeKey(env), JSON.stringify(env));
+    if (!this.batches.has(path)) {
       this.batches.set(
         path,
         this.queue(path, async () => {
-          const batch = this.pendingLines.get(path) ?? [];
-          this.pendingLines.delete(path);
-          this.batches.delete(path);
-          if (batch.length === 0) return;
-          await this.ensureFolder(path);
-          // Each batch starts on a new line, so a batch torn by a crash can't swallow the next one.
-          await this.files.append(path, `\n${batch.join("\n")}`);
+          try {
+            // Failed lines stay ahead of later edits, including edits arriving while a write is pending.
+            while (lines.size > 0) {
+              const batch = [...lines];
+              await this.ensureFolder(path);
+              await this.files.append(path, `\n${batch.map(([, line]) => line).join("\n")}`);
+              for (const [key] of batch) lines.delete(key);
+            }
+            this.pendingLines.delete(path);
+          } finally {
+            this.batches.delete(path);
+          }
         })
       );
     }
@@ -436,8 +440,11 @@ export class DiskStore implements BlobStorage {
   async get(meta: BlobMeta): Promise<BlobEnvelope | null> {
     const path = this.blobPath(meta);
     await this.queues.get(path);
+    // Locked files throw for retry; interrupted swaps recover from their other copies.
+    const text = await this.readWhole(path, true);
+    if (text === null) return null;
     try {
-      const env = parseEnvelope(JSON.parse(await this.files.read(path)));
+      const env = parseEnvelope(JSON.parse(text));
       return env.k === "b" && env.room === meta.room && env.author === meta.author && env.id === meta.id && env.n === meta.n ? env : null;
     } catch {
       return null;

@@ -4,6 +4,7 @@ import {
   canonicalJson,
   concurrentReductions,
   createGenesis,
+  createJoinRecord,
   deviceIdFor,
   Discovery,
   foldJoinInto,
@@ -41,7 +42,7 @@ import {
   type WorkspaceState
 } from "@vault-rooms/secure";
 import { DiskStore, type Files } from "./diskStore.js";
-import { createDeviceSecrets, forgetDeviceSecrets, loadDeviceSecrets, type DeviceSecrets, type SecretStore } from "./secrets.js";
+import { clearJoinAttempt, createDeviceSecrets, forgetDeviceSecrets, loadDeviceSecrets, loadJoinAttempt, saveDeviceSecrets, saveJoinAttempt, type DeviceSecrets, type SecretStore } from "./secrets.js";
 
 /** What the plugin keeps in its settings about the workspace (nothing secret). */
 export interface WorkspaceSettings {
@@ -192,7 +193,7 @@ export class MeshService {
 
   static async create(deps: MeshDeps, input: { workspaceName: string; userName: string; deviceName: string }): Promise<MeshService> {
     if (deps.settings.workspace) throw new MeshServiceError("This vault already belongs to a workspace.");
-    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope);
+    const { secrets, certPem } = await createDeviceSecrets();
     const { genesis, workspaceId, userId, deviceId } = createGenesis({
       workspaceName: input.workspaceName,
       userName: input.userName,
@@ -202,33 +203,53 @@ export class MeshService {
       tlsFingerprint: secrets.tls.fingerprint
     });
     await MeshService.diskFor(deps, workspaceId).saveChain([genesis]);
+    saveDeviceSecrets(deps.secrets, deps.settings.scope, secrets);
     deps.settings.workspace = { id: workspaceId, deviceId, userId, certPem, port: DEFAULT_PORT, peers: [], rooms: {} };
-    await deps.save();
+    try { await deps.save(); } catch (error) { deps.settings.workspace = null; throw error; }
     return (await MeshService.open(deps))!;
   }
 
   static async join(deps: MeshDeps, input: { link: string; userName: string; deviceName: string; peers?: string[] }): Promise<MeshService> {
     if (deps.settings.workspace) throw new MeshServiceError("This vault already belongs to a workspace.");
     const invite = parseInviteLink(input.link);
-    const { secrets, certPem } = await createDeviceSecrets(deps.secrets, deps.settings.scope);
+    let attempt = loadJoinAttempt(deps.secrets, deps.settings.scope);
+    if (!attempt || attempt.join.body.ws !== invite.workspaceId || attempt.join.body.invite !== invite.inviteId) {
+      const { secrets } = await createDeviceSecrets();
+      const join = createJoinRecord({ workspaceId: invite.workspaceId, inviteId: invite.inviteId, secret: invite.secret, user: { id: invite.forUser ?? randomId("u"), name: input.userName }, deviceName: input.deviceName, deviceKey: secrets.sign, agreementPublicKey: secrets.agree.publicKey, tlsFingerprint: secrets.tls.fingerprint });
+      saveJoinAttempt(deps.secrets, deps.settings.scope, secrets, join);
+      attempt = { secrets, join };
+    }
+    const { secrets, join } = attempt;
+    const certPem = secrets.tls.certPem;
     const extraPeers = (input.peers ?? []).map(parseAddress).filter((a): a is { host: string; port: number } => a !== null);
     let joined: Awaited<ReturnType<typeof joinWorkspace>>;
     try {
-      joined = await joinWorkspace({ invite, extraPeers, userName: input.userName, deviceName: input.deviceName, deviceKey: secrets.sign, agreementKey: secrets.agree, tls: secrets.tls, newUserId: randomId("u") });
+      joined = await joinWorkspace({ invite, extraPeers, join, userName: input.userName, deviceName: input.deviceName, deviceKey: secrets.sign, agreementKey: secrets.agree, tls: secrets.tls, newUserId: join.body.user.id });
     } catch (error) {
-      forgetDeviceSecrets(deps.secrets, deps.settings.scope);
       throw new MeshServiceError(`Couldn't reach the workspace: ${(error as Error).message}`);
     }
-    const disk = MeshService.diskFor(deps, invite.workspaceId);
-    await disk.saveChain(joined.chain.all());
-    await disk.saveJoins([{ join: joined.join, firstSeen: Date.now() }]);
-    // The invitation's addresses too: where discovery doesn't reach, they are how this device finds the others again.
-    const peers = [...new Set([...(input.peers ?? []), ...invite.peers])];
-    deps.settings.workspace = { id: invite.workspaceId, deviceId: joined.join.body.device.id, userId: joined.join.body.user.id, certPem, port: DEFAULT_PORT, peers, rooms: {} };
-    await deps.save();
-    const service = (await MeshService.open(deps))!;
-    service.adoptFirstLink = joined.link;
-    return service;
+    try {
+      const disk = MeshService.diskFor(deps, invite.workspaceId);
+      await disk.saveChain(joined.chain.all());
+      await disk.saveJoins([{ join: joined.join, firstSeen: Date.now() }]);
+      saveDeviceSecrets(deps.secrets, deps.settings.scope, secrets);
+      // The invitation's addresses too: where discovery doesn't reach, they are how this device finds the others again.
+      const peers = [...new Set([...(input.peers ?? []), ...invite.peers])];
+      deps.settings.workspace = { id: invite.workspaceId, deviceId: joined.join.body.device.id, userId: joined.join.body.user.id, certPem, port: DEFAULT_PORT, peers, rooms: {} };
+      await deps.save();
+      const service = (await MeshService.open(deps))!;
+      service.adoptFirstLink = joined.link;
+      try { clearJoinAttempt(deps.secrets, deps.settings.scope); } catch (error) { deps.log(`clear saved join: ${String(error)}`); }
+      return service;
+    } catch (error) {
+      joined.link.channel.close("join_failed");
+      // Saved settings too: the attempt (kept) is resumed by the next join, not half opened at the next start.
+      if (deps.settings.workspace) {
+        deps.settings.workspace = null;
+        await deps.save().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   private adoptFirstLink: Parameters<PeerManager["adopt"]>[0] | null = null;
@@ -238,7 +259,7 @@ export class MeshService {
     const settings = deps.settings.workspace;
     if (!settings) return null;
     const secrets = loadDeviceSecrets(deps.secrets, deps.settings.scope, settings.certPem);
-    if (!secrets) throw new MeshServiceError("This device's keys are missing (was the vault copied from another computer?). Leave the workspace and join again from this computer.");
+    if (!secrets) throw new MeshServiceError("This device's keys are missing. If this vault is also opened on another computer (a network share, a synced folder), use a vault of this computer's own: leaving here would stop it there. If it was copied from another computer, leave the workspace and join again.");
     if (deviceIdFor(secrets.sign.publicKey) !== settings.deviceId) throw new MeshServiceError("This device's keys don't belong to this vault's workspace. Leave the workspace and join again from this computer.");
     const disk = MeshService.diskFor(deps, settings.id);
     const versions = await disk.loadChain();

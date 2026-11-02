@@ -4,7 +4,7 @@ import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
 import { randomId } from "./ids.js";
 import { keyCommitment, newRoomKey, wrapRoomKey } from "./keys.js";
-import { envelopeKey, openEnvelope, sealSnapshot } from "./envelope.js";
+import { envelopeKey, openEnvelope, sealSnapshot, sealUpdate } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
 import { RoomReplica, type FileEntry, type ReplicaEvents } from "./replica.js";
@@ -77,6 +77,72 @@ function addNote(replica: RoomReplica, path: string, text: string): string {
 }
 
 describe("room replica", () => {
+  for (const dependency of ["delete set", "cross-client origin"]) it(`holds a missing ${dependency} without exposing partial text or losing local typing`, () => {
+    const s = setup();
+    const a = s.member(s.ana), c = s.member(s.cy);
+    s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+    s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "OLD");
+    s.net.pump();
+    const doc = c.replica.noteDoc(id);
+    const source = new Y.Doc();
+    Y.applyUpdate(source, Y.encodeStateAsUpdate(doc));
+    const baseline = Y.encodeStateVector(source);
+    source.getText("content").insert(1, "X");
+    const missing = Y.encodeStateAsUpdate(source, baseline);
+    const next = new Y.Doc();
+    Y.applyUpdate(next, Y.encodeStateAsUpdate(source));
+    const before = Y.encodeStateVector(next);
+    if (dependency === "delete set") next.getText("content").delete(0, 4);
+    else next.getText("content").insert(2, "NEW");
+    const dependent = Y.encodeStateAsUpdate(next, before);
+    const clock = a.node.store.maxClock(s.roomId, id, s.ana.id);
+    const seal = (n: number, bytes: Uint8Array) => sealUpdate({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.ana.sign }, id, clock + n, bytes);
+    const observed: string[] = [];
+    doc.getText("content").observe(() => observed.push(c.replica.noteText(id)));
+    a.node.publish(seal(2, dependent)); s.net.pump();
+    expect(observed).toEqual([]);
+    // Held whole: what is applied is whole edits, safe to write and bind.
+    expect(c.replica.isComplete(id)).toBe(true);
+    expect(c.replica.snapshot(id, true)).toBeNull();
+    doc.getText("content").insert(3, "!");
+    expect(c.replica.noteText(id)).toBe("OLD!");
+    a.node.publish(seal(1, missing)); s.net.pump();
+    const expected = dependency === "delete set" ? "!" : "OXNEWLD!";
+    expect(c.replica.noteDoc(id)).toBe(doc);
+    expect(c.replica.isComplete(id)).toBe(true);
+    expect(c.replica.noteText(id)).toBe(expected);
+    expect(observed).toEqual(["OLD!", expected]);
+    source.destroy(); next.destroy();
+  });
+
+  it("applies an independent update while another waits for its dependency", () => {
+    const s = setup();
+    const a = s.member(s.ana), c = s.member(s.cy);
+    s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+    s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "OLD");
+    s.net.pump();
+    const base = Y.encodeStateAsUpdate(c.replica.noteDoc(id));
+    const edit = (change: (text: Y.Text) => void, on = base) => {
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, on);
+      const before = Y.encodeStateVector(doc);
+      change(doc.getText("content"));
+      return { update: Y.encodeStateAsUpdate(doc, before), state: Y.encodeStateAsUpdate(doc) };
+    };
+    const missing = edit((text) => text.insert(1, "X"));
+    const dependent = edit((text) => text.insert(2, "Y"), missing.state);
+    const independent = edit((text) => text.insert(3, "!"));
+    const clock = a.node.store.maxClock(s.roomId, id, s.ana.id);
+    const seal = (n: number, bytes: Uint8Array) => sealUpdate({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.ana.sign }, id, clock + n, bytes);
+    a.node.publish(seal(2, dependent.update));
+    a.node.publish(seal(3, independent.update)); s.net.pump();
+    expect(c.replica.noteText(id)).toBe("OLD!");
+    a.node.publish(seal(1, missing.update)); s.net.pump();
+    expect(c.replica.noteText(id)).toBe("OXYLD!");
+  });
+
   it("co-edits a note: both sides converge, including edits made while apart", () => {
     const s = setup();
     const a = s.member(s.ana);

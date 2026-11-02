@@ -10,7 +10,7 @@ import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, veri
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
-import { activeDevice, parseSignedVersion, roleIn, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, parseSignedVersion, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 /**
  * A mesh node: this device's copy of the workspace (record, pending joins, key wraps, encrypted room content) and
@@ -22,6 +22,8 @@ import { activeDevice, parseSignedVersion, roleIn, type SignedVersion, type Work
 
 export interface Channel {
   send(message: PeerMessage): void;
+  /** Resolves when the transport can accept another bulk batch, or closes. */
+  drained?(): Promise<void>;
   close(reason: string): void;
   /** Called once the other side is a member and the session is running (a transport lifts its pre-membership limits). */
   ready?(): void;
@@ -34,9 +36,9 @@ type DocSummary = { vv: VersionVector; snaps: string[] };
 
 export type PeerMessage =
   /** First message on a session: where my workspace record stands (`head` -1: I have none yet, I'm joining). */
-  | { t: "hello"; ws: string; head: number; recent: Recent }
+  | { t: "hello"; ws: string; head: number; recent: Recent; items?: string[] }
   /** Consecutive workspace versions, starting right after one the receiver has (or at genesis for a joiner). */
-  | { t: "versions"; versions: unknown[] }
+  | { t: "versions"; versions: unknown[]; end?: number; hash?: string }
   | { t: "joins"; joins: unknown[] }
   | { t: "wraps"; wraps: unknown[] }
   /** Summaries of the rooms I hold. */
@@ -82,6 +84,7 @@ const MAX_PENDING = 2000;
 const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
+const MAX_BRANCH_BYTES = 256 << 20;
 
 function hashOf(purpose: string, value: unknown): string {
   return b64u(hashTagged(purpose, utf8(canonicalJson(value))));
@@ -190,6 +193,7 @@ export class MeshNode {
   private answeredAt = 0;
   private answersSince = 0;
   private stopped = false;
+  private resyncTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     chain: WorkspaceChain,
@@ -201,6 +205,7 @@ export class MeshNode {
     this.chain = chain;
     this.store = store ?? new EnvelopeStore();
     this.store.isMember = (room) => this.isMemberOf(room);
+    this.store.onMissingBlob = () => this.resync();
     this.store.now = now;
     this.memberRooms = this.currentMemberRooms();
     this.alone = !this.othersActive();
@@ -331,7 +336,13 @@ export class MeshNode {
 
   /** Compare rooms with every peer again (e.g. after forgetting that a blob was dropped). */
   resync(): void {
-    for (const session of this.sessions) session.resync();
+    if (this.stopped || this.resyncTimer) return;
+    // Ask for their summaries so they send what we lack; one request covers a burst of missing files.
+    this.resyncTimer = setTimeout(() => {
+      this.resyncTimer = null;
+      for (const session of this.sessions) session.askAgain();
+    }, 100);
+    this.resyncTimer.unref?.();
   }
 
   pendingJoinRecords(): JoinRecord[] {
@@ -511,6 +522,8 @@ export class MeshNode {
   /** Stop: nothing more is sent, stored or retried (the owner closes the connections). */
   stop(): void {
     this.stopped = true;
+    if (this.resyncTimer) clearTimeout(this.resyncTimer);
+    this.resyncTimer = null;
   }
 
   /** Whether an envelope made here (or the one with this key, see envelopeKey) is still waiting to be stored, so isn't sent yet. */
@@ -610,6 +623,13 @@ export class PeerSession {
   private earlyHello: Record<string, unknown> | null = null;
   /** Our hello was sent and its answer hasn't ended yet (see MeshNode.recordCompared). */
   private awaiting = false;
+  private branch: { chain: WorkspaceChain; start: number; end: number; hash: string; bytes: number; timer: ReturnType<typeof setTimeout> } | null = null;
+  private outbound: Promise<void> = Promise.resolve();
+  private queuedSends = 0;
+  private roomSends = new Map<string, () => Promise<void>>();
+  private sendingRooms = false;
+  /** Its hello said it reads versions in parts, judged as one branch (see hello); otherwise it gets them as 0.3.6 sends them. */
+  private fragments = false;
 
   constructor(
     private readonly node: MeshNode,
@@ -627,7 +647,7 @@ export class PeerSession {
   private begin(answered = true): void {
     this.ready = true;
     this.channel.ready?.();
-    this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+    this.send(this.hello());
     this.awaiting = answered;
     const items = this.node.addressBook().slice(0, MAX_ADDRESSES);
     if (items.length > 0) this.send({ t: "addresses", items });
@@ -640,7 +660,7 @@ export class PeerSession {
   /** @internal Ask again where the other side's record stands: its answer counts anew (see MeshNode.recompare). */
   askAgain(): void {
     if (!this.ready) return;
-    this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+    this.send(this.hello());
     this.awaiting = true;
   }
 
@@ -649,13 +669,60 @@ export class PeerSession {
     if (this.ready) this.sendDigests();
   }
 
+  /**
+   * `items` says what this side reads beyond 0.3.6: "fragments", versions sent in parts with `end` and `hash`. 0.3.6
+   * takes a hello with `items` (a key its messages may have) and drops a versions message with keys it doesn't know.
+   */
+  private hello(): PeerMessage {
+    return { t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent(), items: ["fragments"] };
+  }
+
   send(message: PeerMessage): void {
-    if (!this.closed) this.channel.send(message);
+    if (message.t === "versions" && message.versions.length > 0 && message.end === undefined) {
+      const versions = message.versions as SignedVersion[];
+      const last = versions[versions.length - 1]!;
+      const batches = chunks(versions, MAX_ITEMS).flatMap((chunk) => versionBatches(chunk, PROVEN_MAX_FRAME - (1 << 20)));
+      // `end` and `hash` only to a side that said it reads them: 0.3.6 drops a message with keys it doesn't know.
+      const whole = this.fragments ? { end: last.body.v, hash: versionHash(last) } : {};
+      return this.enqueue(async () => {
+        for (const batch of batches) {
+          if (this.closed) return;
+          this.channel.send({ t: "versions", versions: batch, ...whole });
+          if (this.channel.drained) await this.channel.drained();
+        }
+      });
+    }
+    // Live edits and cursors go at once, not behind a room's bulk transfer.
+    if (message.t === "push") {
+      if (!this.closed) this.channel.send(message);
+      return;
+    }
+    this.enqueue(async () => {
+      if (this.closed) return;
+      this.channel.send(message);
+      if (this.channel.drained) await this.channel.drained();
+    });
+  }
+
+  private enqueue(task: () => Promise<void>): void {
+    if (!this.channel.drained) { void task().catch((error) => this.reject(errorText(error))); return; }
+    if (++this.queuedSends > 1000) { this.queuedSends--; return this.close("outbound_full"); }
+    const start = () => (this.closed ? undefined : task());
+    // Nothing queued: sent at once, so a message just before a close still goes (a revoked device learns it is).
+    const run = this.queuedSends === 1 ? Promise.resolve(start()) : this.outbound.then(start);
+    this.outbound = run.catch((error) => this.reject(errorText(error))).finally(() => this.queuedSends--);
+  }
+
+  private clearBranch(): void {
+    if (this.branch) clearTimeout(this.branch.timer);
+    this.branch = null;
   }
 
   close(reason: string): void {
     if (this.closed) return;
     this.closed = true;
+    this.clearBranch();
+    this.roomSends.clear();
     this.ready = false;
     this.node.detach(this);
     this.channel.close(reason);
@@ -693,7 +760,7 @@ export class PeerSession {
   }
 
   private handle(raw: unknown): void {
-    const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
+    const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
     // An answer to our hello always ends with digests: the records have been compared (see MeshNode.recordCompared).
     if (this.awaiting && message.t === "digests") {
       this.awaiting = false;
@@ -705,7 +772,8 @@ export class PeerSession {
         if (!this.allow("hello", 3, 30_000)) return;
         return this.onHello(message);
       case "versions":
-        return this.offer(this.parseVersions(message.versions));
+        this.offer(message);
+        return;
       case "joins":
         return this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this));
       case "wraps":
@@ -751,12 +819,14 @@ export class PeerSession {
         if (!this.allow("hello", 3, 30_000)) return;
         this.earlyHello = message;
         this.channel.widen?.();
-        return this.send({ t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent() });
+        return this.send(this.hello());
       case "versions": {
         // Only after such a hello, and only versions that extend our record, each message as it comes (a branch that
         // would replace part of it comes from members alone); anything else ends the session.
-        const versions = this.earlyHello ? this.parseVersions(message.versions) : [];
-        const result = versions.length === (message.versions as unknown[]).length ? this.node.offerVersions(versions, this, true) : null;
+        if (!this.earlyHello) return this.close("not_a_member");
+        if (!Array.isArray(message.versions) || message.versions.some((version) => parseSignedVersion(version).body.v === 0)) return this.close("not_a_member");
+        const result = this.offer(message, true);
+        if (this.branch) return;
         if (!result || (result.status !== "appended" && result.status !== "duplicate")) return this.close("not_a_member");
         break;
       }
@@ -797,6 +867,7 @@ export class PeerSession {
 
   /** A hello's head, and the newest version both sides have (-1 if none of its latest versions is ours). */
   private readHello(message: Record<string, unknown>): { theirHead: number; theirHeadHash?: string; common: number } {
+    if (Array.isArray(message.items) && message.items.includes("fragments")) this.fragments = true;
     const theirHead = v.int(message.head, "hello.head", -1, 1e12);
     if (!Array.isArray(message.recent) || message.recent.length > RECENT) v.bad("hello.recent");
     let common = -1;
@@ -818,12 +889,7 @@ export class PeerSession {
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
       const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
-      // As the previous release sends them, 500 versions a message: the other side judges a branch by what one message
-      // holds. Only a message too large for the frames it reads from us is cut by size (it would fail whole): 64 MiB, or
-      // 16 MiB while its record doesn't list this device yet.
-      const knowsUs = theirHead === -1 || (common >= 0 && this.node.chain.versionAt(common)?.body.state.devices[this.node.deviceId] !== undefined);
-      const fits = (knowsUs ? MAX_FRAME : PROVEN_MAX_FRAME) - (1 << 20);
-      for (const chunk of chunks(versions, MAX_ITEMS)) for (const batch of versionBatches(chunk, fits)) this.send({ t: "versions", versions: batch });
+      this.send({ t: "versions", versions });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
@@ -837,10 +903,48 @@ export class PeerSession {
     return raw.map(parseSignedVersion).filter((version) => version.body.v > 0);
   }
 
-  private offer(versions: SignedVersion[]): void {
+  private offer(message: Record<string, unknown>, appendOnly = false): OfferResult | undefined {
+    const versions = this.parseVersions(message.versions);
     if (versions.length === 0) return;
-    const result = this.node.offerVersions(versions, this);
+    let complete = versions;
+    if (message.end !== undefined || message.hash !== undefined) {
+      const end = v.int(message.end, "versions.end", 1, 1e12);
+      const hash = v.hash(message.hash, "versions.hash");
+      const first = versions[0]!.body.v;
+      if (!this.branch && versions[versions.length - 1]!.body.v === end) {
+        if (versionHash(versions[versions.length - 1]!) !== hash) v.bad("versions.hash");
+      } else {
+        if (!this.branch || this.branch.end !== end || this.branch.hash !== hash) {
+          this.clearBranch();
+          if (first > this.node.chain.length || end < first || end - first >= MAX_JOIN_VERSIONS) v.bad("versions.range");
+          const chain = this.node.chain.prefix(first);
+          const timer = setTimeout(() => { this.reject("versions:incomplete"); this.close("versions:incomplete"); }, 30_000);
+          timer.unref?.();
+          this.branch = { chain, start: first, end, hash, bytes: 0, timer };
+        }
+        const branch = this.branch;
+        branch.bytes += Buffer.byteLength(JSON.stringify(versions), "utf8");
+        if (branch.bytes > MAX_BRANCH_BYTES || versions[versions.length - 1]!.body.v > end || (appendOnly && first < this.node.chain.length)) {
+          this.clearBranch();
+          v.bad("versions.range");
+        }
+        const checked = branch.chain.offer(versions, this.node.now(), true);
+        if (checked.status !== "appended" && checked.status !== "duplicate") {
+          this.clearBranch();
+          const reason = checked.status === "rejected" ? checked.reason : "fork";
+          this.reject(`versions:${reason}`);
+          return { status: "rejected", reason };
+        }
+        if (checked.status === "appended") branch.timer.refresh();
+        if (branch.chain.head.body.v < end) return;
+        this.clearBranch();
+        if (branch.chain.headHash !== hash) v.bad("versions.hash");
+        complete = branch.chain.since(branch.start);
+      }
+    }
+    const result = this.node.offerVersions(complete, this, appendOnly);
     if (result.status === "rejected" && result.reason !== "loses") this.reject(`versions:${result.reason}`);
+    return result;
   }
 
   /** Every room of the record that isn't deleted: peers relay rooms they aren't in, as ciphertext. */
@@ -858,17 +962,42 @@ export class PeerSession {
 
   private onDigests(raw: unknown): void {
     const theirs = v.idMap(raw, "digests", "r", 10_000);
-    for (const room of this.rooms()) if (theirs[room] === undefined || theirs[room] !== this.node.store.digest(room)) this.sendRoom(room);
+    this.enqueue(async () => {
+      for (const room of this.rooms()) {
+        if (this.closed) return;
+        if (theirs[room] === this.node.store.digest(room)) continue;
+        this.sendRoom(room);
+        if (this.channel.drained) await this.channel.drained();
+      }
+    });
   }
 
   private sendRoom(room: string): void {
     const store = this.node.store;
     const docs: Record<string, DocSummary> = {};
-    for (const doc of store.docs(room)) docs[doc] = { vv: store.vv(room, doc), snaps: store.snapshotKeys(room, doc) };
-    this.send({ t: "room", room, docs, blobs: [...store.blobKeys(room), ...store.gone(room).map(([key]) => key)] });
+    // As large as a member reads. These are hints: what is left out is sent again, never lost.
+    let remaining = MAX_FRAME - (1 << 20);
+    const fits = (value: unknown) => {
+      const bytes = Buffer.byteLength(JSON.stringify(value), "utf8") + 1;
+      if (bytes > remaining) return false;
+      remaining -= bytes;
+      return true;
+    };
+    // Blob keys first: one left out makes the other side send a whole attachment again.
+    const blobs: string[] = [];
+    for (const key of [...store.blobKeys(room), ...store.gone(room).map(([key]) => key)]) {
+      if (blobs.length >= 100_000 || !fits(key)) break;
+      blobs.push(key);
+    }
+    for (const doc of store.docs(room).slice(0, 100_000)) {
+      const summary = { vv: store.vv(room, doc), snaps: store.snapshotKeys(room, doc).slice(0, 100) };
+      if (!fits({ [doc]: summary })) break;
+      docs[doc] = summary;
+    }
+    this.channel.send({ t: "room", room, docs, blobs });
   }
 
-  /** The other side told us exactly what it holds of a room: send what it lacks. */
+  /** Send history absent from the other side's bounded hints (omitted entries count as unknown). */
   private onRoom(message: Record<string, unknown>): void {
     const room = v.id(message.room, "room.room", "r");
     if (!this.rooms().includes(room)) return;
@@ -885,45 +1014,63 @@ export class PeerSession {
       for (const env of store.missingFor(room, doc, summary.vv)) missing.push(env);
     }
     // Envelopes still being stored go out on their own once they are.
-    this.sendBatched(missing.filter((env) => !this.node.isUnpersisted(env)));
     const blobs = store.blobsOf(room).filter((meta) => !theirBlobs.has(`${meta.author}/${meta.id}`));
-    if (blobs.length > 0) void this.sendBlobs(room, blobs);
+    const send = async () => {
+      await this.sendBatched(missing.filter((env) => !this.node.isUnpersisted(env)));
+      if (blobs.length > 0) await this.sendBlobs(room, blobs);
+    };
+    if (!this.channel.drained) return this.enqueue(send);
+    // One pending response per room, even while a slow peer asks about every room.
+    this.roomSends.set(room, send);
+    if (this.sendingRooms) return;
+    this.sendingRooms = true;
+    this.enqueue(async () => {
+      try {
+        while (!this.closed && this.roomSends.size > 0) {
+          const [id, next] = this.roomSends.entries().next().value!;
+          this.roomSends.delete(id);
+          await next();
+        }
+      } finally {
+        this.sendingRooms = false;
+        this.roomSends.clear();
+      }
+    });
   }
 
   /** Blobs are read from storage one at a time and sent in their own batches. */
   private async sendBlobs(room: string, blobs: Array<{ author: string; id: string }>): Promise<void> {
-    const out = this.batches();
     for (const { author, id } of blobs) {
       if (this.closed) return;
-      const env = await this.node.store.loadBlob(room, author, id);
-      if (env && !this.node.isUnpersisted(env)) out.add(env);
+      let env;
+      try { env = await this.node.store.loadBlob(room, author, id); }
+      catch (error) { this.reject(`blob_read:${errorText(error)}`); continue; }
+      if (env && !this.node.isUnpersisted(env)) {
+        this.channel.send({ t: "envelopes", items: [env] });
+        if (this.channel.drained) await this.channel.drained();
+      }
     }
-    out.flush();
   }
 
-  private sendBatched(envs: StoredEnvelope[]): void {
-    const out = this.batches();
-    for (const env of envs) out.add(env);
-    out.flush();
-  }
-
-  /** Envelopes go out in messages the other side takes: at most MAX_ITEMS items and about MAX_BATCH_BYTES bytes each. */
-  private batches(): { add(env: StoredEnvelope): void; flush(): void } {
+  /** Keep at most one bounded batch in the socket, then wait for drain before sending another. */
+  private async sendBatched(envs: StoredEnvelope[]): Promise<void> {
     let batch: StoredEnvelope[] = [];
     let bytes = 0;
-    const flush = () => {
-      if (batch.length > 0) this.send({ t: "envelopes", items: batch });
-      batch = [];
-      bytes = 0;
-    };
-    return {
-      add: (env) => {
-        batch.push(env);
-        bytes += env.ct.length;
-        if (batch.length >= MAX_ITEMS || bytes > MAX_BATCH_BYTES) flush();
-      },
-      flush
-    };
+    for (const env of envs) {
+      if (this.closed) return;
+      batch.push(env);
+      bytes += env.ct.length;
+      if (batch.length >= MAX_ITEMS || bytes > MAX_BATCH_BYTES) {
+        this.channel.send({ t: "envelopes", items: batch });
+        batch = [];
+        bytes = 0;
+        if (this.channel.drained) await this.channel.drained();
+      }
+    }
+    if (batch.length > 0 && !this.closed) {
+      this.channel.send({ t: "envelopes", items: batch });
+      if (this.channel.drained) await this.channel.drained();
+    }
   }
 }
 
@@ -968,7 +1115,7 @@ export class JoinHandshake {
   receive(raw: unknown): void {
     if (this.done) return;
     try {
-      const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
+      const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
       if (message.t === "hello") {
         if (message.ws !== this.workspaceId) fail("other_workspace");
         this.targetHead = v.int(message.head, "hello.head", 0, MAX_JOIN_VERSIONS);

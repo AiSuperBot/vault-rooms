@@ -1,7 +1,9 @@
 import { ItemView, Notice, setIcon, TFolder, type WorkspaceLeaf } from "obsidian";
 import { activeDevice, roleIn } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
-import { deviceLabel, personLabel } from "./labels.js";
+import { deviceLabel, membershipLabels, personLabel } from "./labels.js";
+import { pendingAction } from "./actions.js";
+import { updateChildren } from "./updateChildren.js";
 import { confirmAction, CreateWorkspaceModal, deleteRoom, InviteModal, JoinModal, LinkModal, MembersModal, NewRoomModal, UNMANAGED } from "./modals.js";
 
 export const ROOMS_VIEW = "vault-rooms-panel";
@@ -10,13 +12,12 @@ const ROLE_LABEL = { read: "can read", write: "can edit", manage: "manage" } as 
 
 const count = (n: number, thing: string) => `${n} ${thing}${n === 1 ? "" : "s"}`;
 
-function errorText(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).replace(/^forbidden:/, "Not allowed: ");
-}
-
 export class RoomsView extends ItemView {
   private unsubscribe: (() => void) | null = null;
   private renderTimer: number | null = null;
+  private rowVersions = new Map<string, string>();
+  private seenRows = new Set<string>();
+  private membership: object | null = null;
 
   constructor(
     leaf: WorkspaceLeaf,
@@ -55,18 +56,31 @@ export class RoomsView extends ItemView {
     }, 150);
   }
 
-  private async act(action: () => Promise<unknown>): Promise<void> {
-    try {
-      await action();
-    } catch (error) {
-      new Notice(errorText(error), 8000);
-    }
+  private async act(action: () => Promise<unknown>, button?: HTMLButtonElement): Promise<void> {
+    await pendingAction(action, button);
     this.render();
   }
 
   private render(): void {
-    const root = this.contentEl;
-    root.empty();
+    const root = document.createElement("div");
+    this.seenRows.clear();
+    this.build(root);
+    updateChildren(this.contentEl, root);
+    this.contentEl.addClass("vault-rooms-panel");
+    for (const key of this.rowVersions.keys()) if (!this.seenRows.has(key)) this.rowVersions.delete(key);
+  }
+
+  private row(root: HTMLElement, key: string, value: unknown): HTMLDivElement | null {
+    this.seenRows.add(key);
+    const signature = JSON.stringify(value);
+    const row = root.createDiv();
+    row.dataset.key = key;
+    if (this.rowVersions.get(key) === signature) { row.setAttribute("data-keep", ""); return null; }
+    this.rowVersions.set(key, signature);
+    return row;
+  }
+
+  private build(root: HTMLElement): void {
     root.addClass("vault-rooms-panel");
     const svc = this.plugin.service;
     // Whatever stopped the workspace, or sharing, from starting: shown until it starts, whether or not the rest shows.
@@ -80,7 +94,7 @@ export class RoomsView extends ItemView {
       };
       if (!svc) {
         buttons.createEl("button", { text: "Leave the workspace on this computer" }).onclick = async () => {
-          if (await confirmAction(this.app, "Leave the workspace", "This deletes the workspace data and this computer's keys from this vault. Your files stay. You can join again with a new invite.", "Leave")) await this.act(() => this.plugin.leaveWorkspace());
+          if (await confirmAction(this.app, "Leave the workspace", "This deletes the workspace data and this computer's keys from this vault. Your files stay. You can join again with a new invite.\n\nIf this vault is also opened on another computer (a network share, or a synced folder), don't: the data is the other computer's, and Vault Rooms would stop working there. Use a vault of this computer's own instead.", "Leave")) await this.act(() => this.plugin.leaveWorkspace());
         };
         return;
       }
@@ -96,6 +110,8 @@ export class RoomsView extends ItemView {
     }
 
     const state = svc.state;
+    if (this.membership !== state) { this.membership = state; this.rowVersions.clear(); }
+    const { devicesByUser } = membershipLabels(state);
     const me = state.users[svc.me.userId];
     const label = (userId: string) => personLabel(state, userId);
     const roomName = (roomId: string) => `"${svc.rooms().find((room) => room.id === roomId)?.name ?? `a room you aren't in (${roomId.slice(1, 5)})`}"`;
@@ -125,22 +141,30 @@ export class RoomsView extends ItemView {
     const hidden = new Set(this.plugin.hiddenRooms());
     if (rooms.length === 0) root.createEl("p", { cls: "vault-rooms-muted", text: canCreate ? "No rooms yet. Share a folder to start one." : "No rooms shared with you yet." });
     for (const room of rooms) {
-      const row = root.createDiv({ cls: "vault-rooms-room" });
+      const folder = this.plugin.folderOf(room.id);
+      const health = this.plugin.roomHealth(room.id);
+      const missing = svc.replica(room.id)?.epochsMissing().length;
+      const row = this.row(root, `room:${room.id}`, [room, folder, health, missing, hidden.has(room.id)]);
+      if (!row) continue;
+      row.addClass("vault-rooms-room");
       const title = row.createDiv({ cls: "vault-rooms-room-title" });
       setIcon(title.createSpan({ cls: "vault-rooms-icon" }), "folder-lock");
       title.createSpan({ text: room.name ?? (room.role ? "Waiting for the room key…" : `A room you aren't in (${room.id.slice(1, 5)})`) });
-      const folder = this.plugin.folderOf(room.id);
       row.createDiv({ cls: "vault-rooms-muted", text: `${room.role ? `You ${ROLE_LABEL[room.role]}` : "You aren't in it"} · ${Object.keys(room.members).length} people${folder ? ` · ${folder}` : hidden.has(room.id) ? " · not shown in this vault" : ""}` });
       if (!room.managed) row.createDiv({ cls: "vault-rooms-error", text: UNMANAGED });
-      if (svc.replica(room.id)?.epochsMissing().length) row.createDiv({ cls: "vault-rooms-muted", text: "Some content is waiting for a key from a member who's online." });
-      const health = this.plugin.roomHealth(room.id);
+      if (missing) row.createDiv({ cls: "vault-rooms-muted", text: "Some content is waiting for a key from a member who's online." });
       const actions = row.createDiv({ cls: "vault-rooms-actions" });
+      actions.dataset.key = "actions";
       if (health?.stopped) row.createDiv({ cls: "vault-rooms-error", text: `Not syncing here: ${health.stopped}.` });
       else if (health?.failing.length) row.createDiv({ cls: "vault-rooms-error", text: `${count(health.failing.length, "file")} couldn't be written or read here (in use by another program, or the disk full?): tried again by itself.` });
-      if (health?.heldBack.length) row.createDiv({ cls: "vault-rooms-muted", text: `${count(health.heldBack.length, "file")} of yours ${health.heldBack.length === 1 ? "stays" : "stay"} as ${health.heldBack.length === 1 ? "it is" : "they are"} here, not shared (too large, or the room's storage full).` });
+      if (health?.heldBack.length) row.createDiv({ cls: "vault-rooms-muted", text: `${count(health.heldBack.length, "file")} of yours ${health.heldBack.length === 1 ? "stays" : "stay"} here without being shared. Open Details for the reason.` });
       if (health && (health.stopped || health.failing.length || health.heldBack.length)) {
         actions.createEl("button", { text: "Try again" }).onclick = () => this.act(() => this.plugin.retryRoom(room.id));
-        actions.createEl("button", { text: "Details" }).onclick = () => new Notice([...health.failing.map((path) => `Failing: ${path}`), ...health.heldBack.map((path) => `Not shared: ${path}`)].slice(0, 20).join("\n") || (health.stopped ?? ""), 15000);
+        actions.createEl("button", { text: "Details" }).onclick = () => {
+          const reasons = new Map(health.rejected?.map(({ path, reason }) => [path, reason]));
+          const details = [...health.failing.slice(0, 20).map((path) => `Failing: ${path}`), ...health.heldBack.slice(0, 20).map((path) => `Not shared: ${path}${reasons.has(path) ? `: ${reasons.get(path)}` : ""}`)];
+          new Notice(details.slice(0, 20).join("\n") || (health.stopped ?? ""), 15000);
+        };
       }
       if (room.role) actions.createEl("button", { text: "Members" }).onclick = () => new MembersModal(this.plugin, room.id).open();
       else actions.createEl("button", { text: "Delete room" }).onclick = () => deleteRoom(this.plugin, room.id, () => this.render());
@@ -162,10 +186,12 @@ export class RoomsView extends ItemView {
     if (svc.isAdmin()) peopleHead.createEl("button", { text: "Invite someone" }).onclick = () => new InviteModal(this.plugin).open();
     for (const [userId, user] of Object.entries(state.users)) {
       if (user.removed) continue;
-      const row = root.createDiv({ cls: "vault-rooms-person" });
+      const devices = devicesByUser.get(userId) ?? [];
+      const row = this.row(root, `person:${userId}`, devices.map(([id]) => online.has(id)));
+      if (!row) continue;
+      row.addClass("vault-rooms-person");
       row.createDiv({ cls: "vault-rooms-person-name", text: `${label(userId)}${userId === svc.me.userId ? " (you)" : ""}${user.admin ? " · admin" : ""}` });
-      for (const [deviceId, device] of Object.entries(state.devices)) {
-        if (device.user !== userId || device.revoked) continue;
+      for (const [deviceId, device] of devices) {
         const line = row.createDiv({ cls: "vault-rooms-device" });
         const isMe = deviceId === svc.me.deviceId;
         line.createSpan({ cls: `vault-rooms-dot ${isMe || online.has(deviceId) ? "is-online" : ""}` });
@@ -210,10 +236,10 @@ It is the last computer of the managers of ${orphaned.join(", ")}: no one could 
     const addresses = svc.addresses();
     root.createDiv({ cls: "vault-rooms-muted", text: addresses.length ? `Reachable at ${addresses.join(", ")}` : svc.listeningPort ? `Listening on port ${svc.listeningPort}` : "Not reachable: other computers can't connect to this one now." });
     if (svc.isMember())
-      root.createEl("button", { text: "Add another computer of mine" }).onclick = () =>
+      root.createEl("button", { text: "Add another computer of mine" }).onclick = (event) =>
         this.act(async () => {
           const link = await svc.createDeviceInvite();
           new LinkModal(this.app, "Add another computer", link, "Open this link in Obsidian on your other computer (in the vault you want to use there). It works once, within a day.").open();
-        });
+        }, event.currentTarget as HTMLButtonElement);
   }
 }

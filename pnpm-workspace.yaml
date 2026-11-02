@@ -5,14 +5,7 @@ onlyBuiltDependencies:
   - esbuild
 confirmModulesPurge: false
 allowBuilds:
-  better-sqlite3: set this to true or false
   esbuild: true
-# fast-uri <3.1.8 has URI-normalization advisories. It reaches this
-# repo only through the standalone relay's fastify -> @fastify/ajv-compiler chain, never the shipped
-# plugin bundle (main.js contains no fastify/ajv), but `pnpm audit --prod` is a release gate.
-# Constrained to the 3.x line on purpose: fast-uri 4.x is a major bump under fastify/ajv and is not
-# something to take while cutting a release.
 overrides:
-  fast-uri: "^3.1.8"
   # Obsidian is external in main.js; this fixes the SDK/build copy, not the app-provided runtime.
   "obsidian>moment": "2.31.0"

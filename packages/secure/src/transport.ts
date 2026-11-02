@@ -28,6 +28,8 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
 
 const EXPORTER_LABEL = "EXPORTER-vault-rooms-peer-auth";
 const AUTH_TIMEOUT_MS = 10_000;
+/** How long a member we didn't know yet, once it has shown it holds our record, may take to catch up and be let in. */
+const CATCH_UP_MS = 120_000;
 const AUTH_MAX_FRAME = 64 << 10;
 const PING_EVERY_MS = 15_000;
 const SILENCE_LIMIT_MS = 45_000;
@@ -50,6 +52,8 @@ export interface TransportConfig {
 export interface PeerLink {
   remoteDevice: string;
   remoteAddress: string;
+  /** Dialled endpoint, retained even when a hostname resolves to another spelling of the address. */
+  endpoint?: { host: string; port: number };
   direction: "in" | "out";
   /** The other side isn't in the membership yet: it is joining (only true on the accepting side). */
   joining: boolean;
@@ -76,7 +80,7 @@ export function verifyAcceptor(state: WorkspaceState, workspaceId: string, diale
 }
 
 /** One TLS socket carrying frames; becomes a PeerLink once authenticated. */
-class Wire {
+export class Wire {
   private reader = new FrameReader(AUTH_MAX_FRAME);
   private handlers: Array<(message: unknown) => void> = [];
   /**
@@ -90,25 +94,30 @@ class Wire {
   private lastHeard = Date.now();
   private lastSent = Date.now();
   private timer: ReturnType<typeof setInterval> | null = null;
+  private blocked = false;
+  private drains = new Set<() => void>();
 
   constructor(readonly socket: tls.TLSSocket) {
     socket.on("data", (chunk: Buffer) => {
       this.lastHeard = Date.now();
-      let messages: unknown[];
       try {
-        messages = this.reader.push(chunk);
+        for (const message of this.reader.push(chunk)) {
+          if (this.closed) return;
+          if (typeof message === "object" && message !== null && (message as { t?: unknown }).t === "ping") continue;
+          if (this.early) this.early.push(message);
+          else for (const handler of this.handlers) handler(message);
+        }
       } catch {
         return this.close("bad_frame");
-      }
-      for (const message of messages) {
-        if (this.closed) return;
-        if (typeof message === "object" && message !== null && (message as { t?: unknown }).t === "ping") continue;
-        if (this.early) this.early.push(message);
-        else for (const handler of this.handlers) handler(message);
       }
     });
     socket.on("close", () => this.close("socket_closed"));
     socket.on("error", () => this.close("socket_error"));
+    socket.on("drain", () => {
+      this.blocked = false;
+      for (const resolve of this.drains) resolve();
+      this.drains.clear();
+    });
   }
 
   /** The other side is a member (or a peer we dialled and checked): full-size frames and heartbeats. */
@@ -140,7 +149,14 @@ class Wire {
     if (this.closed) return;
     if (this.socket.writableLength > MAX_BUFFERED) return this.close("peer_not_reading");
     this.lastSent = Date.now();
-    this.socket.write(encodeFrame(message));
+    if (!this.socket.write(encodeFrame(message))) this.blocked = true;
+  }
+
+  /** Bulk senders wait here after each bounded batch; even a fast socket yields to timers and input. */
+  drained(): Promise<void> {
+    if (this.closed) return Promise.resolve();
+    if (!this.blocked) return new Promise((resolve) => setImmediate(resolve));
+    return new Promise((resolve) => this.drains.add(resolve));
   }
 
   close(reason: string): void {
@@ -148,11 +164,13 @@ class Wire {
     this.closed = true;
     if (this.timer) clearInterval(this.timer);
     this.socket.destroy();
+    for (const resolve of this.drains) resolve();
+    this.drains.clear();
     for (const handler of this.closeHandlers) handler(reason);
   }
 
   /** A joining device's link stays limited until the mesh session calls `channel.ready()` (then `onReady` runs). */
-  link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void): PeerLink {
+  link(remoteDevice: string, direction: "in" | "out", joining: boolean, unverifiedAcceptor?: PeerLink["unverifiedAcceptor"], onReady?: () => void, onWiden?: () => void): PeerLink {
     if (!joining) this.promote();
     this.handlers = [];
     this.early = [];
@@ -164,9 +182,12 @@ class Wire {
       unverifiedAcceptor,
       channel: {
         send: (message: PeerMessage) => this.write(message),
+        drained: () => this.drained(),
         close: (reason: string) => this.close(reason),
         widen: () => {
-          if (!this.promoted) this.reader.setLimit(PROVEN_MAX_FRAME);
+          if (this.promoted) return;
+          this.reader.setLimit(PROVEN_MAX_FRAME);
+          onWiden?.();
         },
         ready: () => {
           this.promote();
@@ -259,7 +280,13 @@ export class PeerServer {
         // join makes it a member and the session starts.
         clearTimeout(deadline);
         deadline = setTimeout(() => finish("join_timeout"), AUTH_TIMEOUT_MS);
-        this.onPeer(wire.link(device, "in", true, undefined, () => finish()));
+        // A member we don't know yet has shown it holds our record: its catch-up may take longer than a join (the mesh
+        // still drops one that stops making progress).
+        const caughtUp = () => {
+          clearTimeout(deadline);
+          deadline = setTimeout(() => finish("join_timeout"), CATCH_UP_MS);
+        };
+        this.onPeer(wire.link(device, "in", true, undefined, () => finish(), caughtUp));
       } catch {
         finish("auth_malformed");
       }
@@ -308,11 +335,11 @@ export function dial(config: TransportConfig, host: string, port: number, expect
             if (acceptor !== expect.device || !device || !verify(device.sign, "peer-auth-ok", authBytes("ok", ekm, config.deviceId, acceptor, tag), sig)) return fail("auth_signature");
             settled = true;
             clearTimeout(deadline);
-            resolve(wire.link(acceptor, "out", false));
+            resolve({ ...wire.link(acceptor, "out", false), endpoint: { host, port } });
           } else {
             settled = true;
             clearTimeout(deadline);
-            resolve(wire.link(acceptor, "out", false, { device: acceptor, fingerprint, ekm, sig }));
+            resolve({ ...wire.link(acceptor, "out", false, { device: acceptor, fingerprint, ekm, sig }), endpoint: { host, port } });
           }
         } catch {
           fail("auth_malformed");

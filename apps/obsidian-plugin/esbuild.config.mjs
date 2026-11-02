@@ -24,16 +24,8 @@ const lib0ShimPlugin = {
 const result = await esbuild.build({
   entryPoints: ["src/main.ts"],
   bundle: true,
-  // Embed SQLite WASM because plugin releases ship only standard artifacts.
-  loader: { ".wasm": "binary" },
-  // The plugin always uses ws' pure-JS fallbacks. Folding these documented ws switches removes
-  // process.env probes and unreachable optional-native require() branches from the shipped bundle.
-  define: {
-    "process.env.WS_NO_BUFFER_UTIL": "true",
-    "process.env.WS_NO_UTF_8_VALIDATE": "true"
-  },
   plugins: [lib0ShimPlugin],
-  external: ["obsidian", "electron", "bufferutil", "utf-8-validate", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr", ...builtins],
+  external: ["obsidian", "electron", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr", ...builtins],
   format: "cjs",
   platform: "node",
   target: "es2018",

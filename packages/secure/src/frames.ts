@@ -32,8 +32,7 @@ export class FrameReader {
     this.maxFrame = maxFrame;
   }
 
-  push(chunk: Buffer): unknown[] {
-    const out: unknown[] = [];
+  *push(chunk: Buffer): Generator<unknown> {
     let offset = 0;
     while (offset < chunk.length || (this.body !== null && this.bodyGot === this.body.length)) {
       if (this.body === null) {
@@ -55,12 +54,13 @@ export class FrameReader {
       if (this.bodyGot < this.body.length) break;
       const body = this.body;
       this.body = null;
+      let message: unknown;
       try {
-        out.push(JSON.parse(body.toString("utf8")));
+        message = JSON.parse(body.toString("utf8"));
       } catch {
         fail("bad_frame");
       }
+      yield message;
     }
-    return out;
   }
 }

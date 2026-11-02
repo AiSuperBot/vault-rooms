@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
+import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
 import { folderProblem, RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
 import { MemoryVault } from "./memoryVault.js";
@@ -119,6 +119,273 @@ function setup(raeRole: "read" | "write" = "read") {
 }
 
 const text = (vault: MemoryVault, path: string) => vault.text(path);
+
+describe("reported file regressions", () => {
+  it("retries a rejected guarded write and reconciles a timestamp-preserving edit", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "OLD" });
+    const before = c.vault.stat("Team/Plan.md");
+    c.vault.files.set("Team/Plan.md", new Uint8Array(Buffer.from("NEW")));
+    expect(c.vault.stat("Team/Plan.md")).toEqual(before);
+    await a.vault.writeText("Team/Plan.md", "NET");
+    await s.settle();
+    expect(c.vault.text("Team/Plan.md")).toBe("NEW");
+    expect(c.folder.health().failing).toContain("Plan.md");
+    const deadline = Date.now() + 8000;
+    while (c.folder.health().failing.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.values()].map((bytes) => Buffer.from(bytes).toString()).sort()).toEqual(["NET", "NEW"]);
+    expect(c.folder.health().failing).toEqual([]);
+  });
+
+  it.each([160, 200, 6800])("holds a new note at its original path when the room has only %s bytes free", async (remaining) => {
+    const { s, a, c } = await pair({});
+    const limit = STORE_LIMITS.roomDocBytes;
+    try {
+      STORE_LIMITS.roomDocBytes = remaining;
+      await a.vault.writeText("Team/New.md", "hello".repeat(1000));
+      await s.settle();
+      expect(a.vault.text("Team/New.md")).toBe("hello".repeat(1000));
+      expect(a.vault.files.size).toBe(1);
+      expect(c.replica.files().size).toBe(0);
+      expect(a.folder.health().rejected).toEqual([{ path: "New.md", reason: expect.stringContaining("storage is full") }]);
+      STORE_LIMITS.roomDocBytes = limit;
+      a.folder.retryNow();
+      await s.settle();
+      expect(c.vault.text("Team/New.md")).toBe("hello".repeat(1000));
+      expect(a.folder.health().heldBack).toEqual([]);
+    } finally { STORE_LIMITS.roomDocBytes = limit; }
+  });
+
+  it("takes a file spelled otherwise on disk for the tracked one, as Windows keeps a folder's old case", async () => {
+    const { s, a, c } = await pair({ "projects/x.md": "x" });
+    await a.vault.rename("Team/projects/x.md", "Team/Projects/x.md");
+    await s.settle();
+    // After a restart on Windows, Cy's disk still has the folder as "projects": her vault lists the file that way.
+    const bytes = c.vault.files.get("Team/Projects/x.md")!;
+    c.vault.files.delete("Team/Projects/x.md");
+    c.vault.files.set("Team/projects/x.md", bytes);
+    c.folder.retryNow();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.replica.files().values()].map((entry) => entry.path)).toEqual(["Projects/x.md"]);
+      expect([...pc.vault.files.keys()].filter((path) => path.includes("conflict"))).toEqual([]);
+    }
+    expect([...c.vault.files.keys()]).toEqual(["Team/Projects/x.md"]);
+    expect(c.vault.text("Team/Projects/x.md")).toBe("x");
+  });
+
+  it("still deletes for everyone a file deleted just before its room's folder was moved", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "x", "Other.md": "y" });
+    await a.vault.trash("Team/Plan.md"); // its deletion waits a moment
+    // The folder is moved: the plugin says so, then stops the room (to start it at its new place).
+    a.folder.folderMoved();
+    for (const [path, bytes] of [...a.vault.files]) {
+      a.vault.files.delete(path);
+      a.vault.files.set(path.replace("Team/", "Moved/"), bytes);
+    }
+    a.vault.folders.delete("Team");
+    await a.folder.stop();
+    await s.settle();
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["Other.md"]);
+    expect(a.gone).toEqual([]);
+  });
+
+  it("tells once that a change can't be shared, not on every save while it can't", async () => {
+    const { s, a } = await pair({ "Plan.md": "small" });
+    const limit = STORE_LIMITS.roomDocBytes;
+    try {
+      STORE_LIMITS.roomDocBytes = 10;
+      for (const text of ["one long change", "two long changes", "three long changes"]) {
+        await a.vault.writeText("Team/Plan.md", text);
+        await s.settle();
+      }
+      expect(a.notices.filter((notice) => notice.includes("couldn't be shared"))).toHaveLength(1);
+    } finally { STORE_LIMITS.roomDocBytes = limit; }
+  });
+
+  it("preserves a local edit with unchanged size and timestamp when its shared file is deleted", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "OLD" });
+    const before = c.vault.stat("Team/Plan.md");
+    c.vault.files.set("Team/Plan.md", new Uint8Array(Buffer.from("NEW")));
+    expect(c.vault.stat("Team/Plan.md")).toEqual(before);
+    await a.vault.trash("Team/Plan.md");
+    await s.settle();
+    expect(c.vault.trashed).not.toContain("Team/Plan.md");
+    expect(c.vault.text("Team/Plan.md")).toBe("NEW");
+    expect(a.vault.text("Team/Plan.md")).toBe("NEW");
+  });
+
+  it("reports and retries a failed read when an untracked file is renamed into a supported type", async () => {
+    const { s, a, c } = await pair({});
+    await a.vault.writeText("Team/New.tmp", "renamed content");
+    await s.settle();
+    a.vault.failReads = (path) => path === "Team/New.md";
+    await a.vault.rename("Team/New.tmp", "Team/New.md");
+    await s.settle();
+    expect(a.folder.health().failing).toContain("New.md");
+    a.vault.failReads = undefined;
+    const deadline = Date.now() + 8000;
+    while (a.folder.health().failing.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+    await s.settle();
+    expect(c.vault.text("Team/New.md")).toBe("renamed content");
+    expect(a.folder.health().failing).toEqual([]);
+    expect(a.folder.health().heldBack).toEqual([]);
+  });
+
+  for (const when of ["startup", "addition", "rename"] as const) it(`keeps case-distinct physical files on ${when}`, async () => {
+    const initial: Record<string, string> = when === "startup" ? { "A.md": "UPPER", "a.md": "lower" } : when === "rename" ? { "A.md": "UPPER", "other.md": "lower" } : { "A.md": "UPPER" };
+    const { s, a, c } = await pair(initial);
+    if (when === "addition") await a.vault.writeText("Team/a.md", "lower");
+    if (when === "rename") await a.vault.rename("Team/other.md", "Team/a.md");
+    await s.settle();
+    for (const pc of [a, c]) {
+      const entries = [...pc.replica.files()];
+      expect(entries).toHaveLength(2);
+      expect(new Set(entries.map(([, entry]) => entry.path.toLowerCase())).size).toBe(2);
+      expect(entries.map(([id]) => pc.replica.noteText(id)).sort()).toEqual(["UPPER", "lower"]);
+      expect(entries.map(([, entry]) => pc.vault.text(`Team/${entry.path}`)).sort()).toEqual(["UPPER", "lower"]);
+    }
+  });
+
+  for (const bound of [false, true]) it(`keeps OLD in an ${bound ? "open editor" : "unbound note"} while dependencies wait, then writes XNEW directly`, async () => {
+    const { s, a, c } = await pair({ "Plan.md": "OLD" });
+    const id = [...a.replica.files().keys()][0]!;
+    const observed: string[] = [];
+    if (bound) {
+      c.bound.add(id);
+      c.replica.noteDoc(id).getText("content").observe(() => {
+        const value = c.replica.noteText(id);
+        observed.push(value);
+        void c.vault.writeText("Team/Plan.md", value);
+      });
+    }
+    const source = new Y.Doc();
+    Y.applyUpdate(source, Y.encodeStateAsUpdate(a.replica.noteDoc(id)));
+    const baseline = Y.encodeStateVector(source);
+    source.transact(() => { source.getText("content").delete(0, 3); source.getText("content").insert(0, "X"); });
+    const missing = Y.encodeStateAsUpdate(source, baseline);
+    const afterX = Y.encodeStateVector(source);
+    source.getText("content").insert(1, "NEW");
+    const dependent = Y.encodeStateAsUpdate(source, afterX);
+    const clock = a.node.store.maxClock(s.roomId, id, s.ana.id);
+    const seal = (n: number, bytes: Uint8Array) => sealUpdate({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.ana.sign }, id, clock + n, bytes);
+    const from = c.vault.written.length;
+    a.node.publish(seal(2, dependent));
+    await s.settle();
+    expect(c.replica.isComplete(id)).toBe(true); // held whole: nothing half applied
+    expect(c.folder.noteIdAt("Team/Plan.md")).toBe(id);
+    expect(c.replica.noteText(id)).toBe("OLD");
+    expect(observed).toEqual([]);
+    expect(c.vault.text("Team/Plan.md")).toBe("OLD");
+    a.node.publish(seal(1, missing));
+    await s.settle();
+    expect(c.replica.isComplete(id)).toBe(true);
+    if (bound) expect(observed).toEqual(["XNEW"]);
+    expect(c.vault.written.slice(from).filter((file) => file.path === "Team/Plan.md").map((file) => file.text)).toEqual(["XNEW"]);
+  });
+
+  for (const correction of ["rename", "delete"]) it(`clears an invalid local name after ${correction}`, async () => {
+    const { s, a } = await pair();
+    await a.vault.writeText("Team/bad?.md", "kept");
+    await s.settle();
+    expect(a.folder.health().heldBack).toContain("bad?.md");
+    if (correction === "rename") await a.vault.rename("Team/bad?.md", "Team/good.md");
+    else await a.vault.trash("Team/bad?.md");
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual([]);
+    if (correction === "rename") expect(a.replica.noteText(a.folder.noteIdAt("Team/good.md")!)).toBe("kept");
+  });
+
+  it("keeps an untracked case variant as a local copy when a reader receives a case-only rename", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team"), r = s.make(s.rae, "Team");
+    await a.vault.writeText("Team/A.md", "UPPER");
+    s.giveKey(a, s.ana); s.giveKey(a, s.rae); a.replica.refreshKeys();
+    await a.folder.start(); s.net.link(a.node, r.node); await s.settle();
+    r.replica.refreshKeys(); await r.folder.start(); await s.settle();
+    await r.vault.writeText("Team/a.md", "local lower"); await s.settle();
+    await a.vault.rename("Team/A.md", "Team/a.md"); await s.settle();
+    expect(r.vault.text("Team/a.md")).toBe("UPPER");
+    const copy = [...r.vault.files.keys()].find((path) => path !== "Team/a.md" && r.vault.text(path) === "local lower");
+    expect(copy).toBeDefined();
+    expect(r.folder.health().failing).toEqual([]);
+    await s.settle();
+    expect(r.vault.text(copy!)).toBe("local lower");
+  });
+
+  for (const path of ["Plan.md", "scan.pdf"]) it(`retries a failed tracked save read of ${path} without another event`, async () => {
+    const { s, a, c } = await pair({ [path]: "old" });
+    let locked = true;
+    a.vault.failReads = (file) => locked && file === `Team/${path}`;
+    await a.vault.writeText(`Team/${path}`, "new");
+    await a.folder.settled();
+    expect(a.folder.health().failing).toContain(path);
+    locked = false;
+    await until(() => a.folder.health().failing.length === 0);
+    await s.settle();
+    expect(c.vault.text(`Team/${path}`)).toBe("new");
+  });
+
+  for (const path of ["Plan.md", "scan.pdf"]) it(`holds back an oversized tracked ${path} without reading content`, async () => {
+    const { s, a, c } = await pair({ [path]: "old" });
+    const stat = a.vault.stat.bind(a.vault);
+    vi.spyOn(a.vault, "stat").mockImplementation((file) => { const info = stat(file); return info && file === `Team/${path}` ? { ...info, size: 1024 ** 3 } : info; });
+    const reads = vi.spyOn(a.vault, path.endsWith(".md") ? "readText" : "readBytes");
+    await a.vault.writeText(`Team/${path}`, "huge replacement");
+    await s.settle();
+    expect(reads).not.toHaveBeenCalled();
+    expect(a.folder.health().heldBack).toContain(path);
+    expect(c.vault.text(`Team/${path}`)).toBe("old");
+  });
+
+  it("keeps a shareable recovery copy when its directory leaves no suffix space", async () => {
+    const path = `${"a".repeat(119)}/${"b".repeat(119)}/${"c".repeat(119)}/${"d".repeat(32)}.md`;
+    expect(safeRoomPath(path)).toBe(path);
+    const { s, a, c } = await pair({ [path]: "base" });
+    a.folder.noteClashed([...a.replica.files().keys()][0]!, "saved local version");
+    await s.settle();
+    const copy = [...a.replica.files().values()].find((entry) => entry.path.includes("(conflict"))!;
+    expect(safeRoomPath(copy.path)).toBe(copy.path);
+    expect(a.vault.text(`Team/${copy.path}`)).toBe("saved local version");
+    expect(c.vault.text(`Team/${copy.path}`)).toBe("saved local version");
+  });
+
+  it("keeps new size, type and quota rejections in health until fixed or removed", async () => {
+    const { s, a } = await pair();
+    const stat = a.vault.stat.bind(a.vault);
+    let oversized = true;
+    vi.spyOn(a.vault, "stat").mockImplementation((path) => { const info = stat(path); return info && oversized && path.endsWith("large.pdf") ? { ...info, size: 1024 ** 3 } : info; });
+    await a.vault.writeText("Team/large.pdf", "small now");
+    await a.vault.writeText("Team/run.exe", "unshared");
+    await s.settle();
+    expect(a.folder.health().heldBack.sort()).toEqual(["large.pdf", "run.exe"]);
+    expect(a.folder.health().rejected?.map((item) => item.reason).join(" ")).toMatch(/too large.*type/);
+    oversized = false;
+    a.folder.retryNow();
+    await a.vault.trash("Team/run.exe");
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual([]);
+    const edit = vi.spyOn(a.replica, "editIndex").mockReturnValue("refused");
+    await a.vault.writeText("Team/quota.md", "kept here");
+    await s.settle();
+    expect(a.folder.health().rejected).toEqual([{ path: "quota.md", reason: expect.stringContaining("storage is full") }]);
+    edit.mockRestore();
+    a.folder.retryNow();
+    await s.settle();
+    expect(a.folder.health().heldBack).toEqual([]);
+  });
+
+  it("handles repeated save events with direct lookups and no full index or known-path scans", async () => {
+    const files = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`n${i}.md`, `note ${i}`]));
+    const { a } = await pair(files);
+    const allFiles = vi.spyOn(a.replica, "files");
+    const known = (a.folder as unknown as { known: Map<string, unknown> }).known;
+    const scans = vi.spyOn(known, Symbol.iterator);
+    for (const path of Object.keys(files)) await a.folder.onLocalWrite(`Team/${path}`);
+    expect(allFiles).not.toHaveBeenCalled();
+    expect(scans).not.toHaveBeenCalled();
+  });
+});
 
 describe("room folder", () => {
   it("shares a folder's files and keeps both sides in step", async () => {
@@ -2299,6 +2566,26 @@ describe("room folder, blocked renames", () => {
     await c.vault.writeText("Team/New.md", "from Cy\n");
     await s.settle();
     expect(a.folder.health().failing).toContain("scan.pdf");
+  });
+
+  it("keeps telling of a file that couldn't be taken in at start, whatever else syncs, and takes it in later", async () => {
+    const { s, a, c } = await pair();
+    await a.folder.stop();
+    // Saved while Obsidian was closed, and held by another program when it starts.
+    a.vault.files.set("Team/scan.pdf", new Uint8Array([1, 2, 3]));
+    a.vault.failReads = (path) => path === "Team/scan.pdf";
+    const again = s.make(s.ana, "Team", a.vault, a);
+    s.net.link(again.node, c.node);
+    await again.folder.start();
+    await s.settle();
+    expect(again.folder.health().failing).toContain("scan.pdf");
+    await c.vault.writeText("Team/New.md", "from Cy");
+    await s.settle();
+    expect(again.folder.health().failing).toContain("scan.pdf");
+    a.vault.failReads = undefined;
+    await until(() => again.folder.health().failing.length === 0);
+    await s.settle();
+    expect([...c.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["New.md", "scan.pdf"]);
   });
 
   it("doesn't read a new local file too large to share", async () => {

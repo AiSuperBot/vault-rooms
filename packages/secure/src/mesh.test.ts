@@ -1,14 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
+import * as Y from "yjs";
 import { fromUtf8, utf8 } from "./bytes.js";
 import { MAX_FORK_DEPTH, WorkspaceChain } from "./chain.js";
 import { randomBytes } from "./crypto.js";
-import { INDEX_DOC, openEnvelope, sealBlob, sealPresence, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
+import { INDEX_DOC, openEnvelope, sealBlob, sealPresence, sealSnapshot, sealUpdate, type Envelope, type StoredEnvelope } from "./envelope.js";
 import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
-import { keyCommitment, newRoomKey, unwrapRoomKey, wrapRoomKey } from "./keys.js";
+import { keyCommitment, newRoomKey, sealRoomName, unwrapRoomKey, wrapRoomKey } from "./keys.js";
 import { JoinHandshake, MeshNode, versionBatches, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
+import { RoomReplica } from "./replica.js";
 import { createRoom, fold, founder, invite, Network, step, type TestDevice } from "./testkit.js";
-import { nextVersion, rebaseChange } from "./workspace.js";
+import { activeDevice, nextVersion, rebaseChange } from "./workspace.js";
 
 function nodeFor(chain: WorkspaceChain, device: TestDevice, log: string[] = []): MeshNode {
   return new MeshNode(WorkspaceChain.load(chain.all()), device.id, { rejected: (reason) => log.push(reason) });
@@ -29,6 +31,295 @@ function setup() {
 }
 
 describe("mesh", () => {
+  it("coalesces repair requests and cancels them when stopped", () => {
+    const { chain, ana, cy } = setup();
+    const node = nodeFor(chain, ana);
+    const sent: PeerMessage[] = [];
+    node.connect({ send: (message) => sent.push(message), close: () => {} }, cy.id);
+    sent.length = 0;
+    vi.useFakeTimers();
+    try {
+      for (let i = 0; i < 50; i++) node.resync();
+      vi.advanceTimersByTime(99);
+      expect(sent).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(sent.map((message) => message.t)).toEqual(["hello"]);
+      node.resync();
+      node.stop();
+      vi.advanceTimersByTime(100);
+      expect(sent.map((message) => message.t)).toEqual(["hello"]);
+    } finally { node.stop(); vi.useRealTimers(); }
+  });
+
+  it("bounds aggregate summary bytes and still transfers history absent from its hints", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const source = nodeFor(chain, ana);
+    const receiver = nodeFor(chain, cy);
+    const doc = randomId("f");
+    const env = sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, doc, 1, utf8("omitted history"));
+    source.publish(env);
+    const sent: PeerMessage[] = [];
+    const receiving = receiver.connect({ send: (message) => sent.push(message), close: () => {} }, ana.id);
+    const digest = vi.spyOn(receiver.store, "digest").mockReturnValue("A".repeat(43));
+    const docs = vi.spyOn(receiver.store, "docs").mockReturnValue([...Array.from({ length: 9000 }, () => randomId("f")), doc]);
+    const snaps = vi.spyOn(receiver.store, "snapshotKeys").mockReturnValue(Array.from({ length: 100 }, (_, i) => `s/${roomId}/${doc}/${ana.id}/${i + 1}`));
+    try {
+      receiving.receive({ t: "digests", rooms: {} });
+    } finally { docs.mockRestore(); snaps.mockRestore(); digest.mockRestore(); }
+    const summary = sent.find((message) => message.t === "room")!;
+    expect(Buffer.byteLength(JSON.stringify(summary), "utf8")).toBeLessThan(64 << 20);
+    expect(summary.t === "room" && Object.hasOwn(summary.docs as object, doc)).toBe(false);
+    const sending = source.connect({ send: (message) => receiving.receive(message), close: () => {} }, cy.id);
+    sending.receive(summary);
+    expect(receiver.store.envelopesOf(roomId, doc).updates).toEqual([env]);
+    expect(receiver.store.digest(roomId)).toBe(source.store.digest(roomId));
+    sending.close("done");
+    receiving.close("done");
+  });
+
+  it("sends versions as 0.3.6 does unless the hello said it reads parts, and live edits past a stuck queue", async () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const ahead = WorkspaceChain.load(chain.all());
+    step(ahead, ana, (state) => { state.name = "later"; });
+    step(ahead, ana, (state) => { state.name = "later still"; });
+    for (const items of [undefined, ["fragments"]]) {
+      const sent: PeerMessage[] = [];
+      // Never drains: everything queued waits behind the first message.
+      const session = nodeFor(ahead, ana).connect({ send: (message) => sent.push(message), drained: () => new Promise(() => {}), close: () => {} }, cy.id);
+      session.receive({ t: "hello", ws, head: chain.head.body.v, recent: [[chain.head.body.v, chain.headHash]], ...(items ? { items } : {}) });
+      await Promise.resolve();
+      expect(sent.map((message) => message.t)).toEqual(["hello"]);
+      session.send({ t: "push", env: sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, INDEX_DOC, 1, utf8("live")) });
+      expect(sent.map((message) => message.t)).toEqual(["hello", "push"]);
+      session.close("done");
+    }
+    // The answer itself: no `end` without the hello's say-so (0.3.6 drops a versions message with keys it doesn't know).
+    for (const items of [undefined, ["fragments"]]) {
+      const sent: PeerMessage[] = [];
+      const session = nodeFor(ahead, ana).connect({ send: (message) => sent.push(message), close: () => {} }, cy.id);
+      session.receive({ t: "hello", ws, head: chain.head.body.v, recent: [[chain.head.body.v, chain.headHash]], ...(items ? { items } : {}) });
+      await Promise.resolve();
+      // Versions that fit go in one message: 0.3.6 judges each message as a branch on its own.
+      const versions = sent.filter((message) => message.t === "versions");
+      expect(versions).toHaveLength(1);
+      expect("end" in versions[0]!).toBe(items !== undefined);
+      session.close("done");
+    }
+  });
+
+  it("caps blob hints at the count accepted by the receiving parser", () => {
+    const { chain, ana, cy, roomId } = setup();
+    const source = nodeFor(chain, ana);
+    const sent: PeerMessage[] = [];
+    const session = source.connect({ send: (message) => sent.push(message), close: () => {} }, cy.id);
+    const keys = vi.spyOn(source.store, "blobKeys").mockReturnValue(Array.from({ length: 100_001 }, () => `${ana.id}/${"A".repeat(43)}`));
+    try { session.receive({ t: "digests", rooms: {} }); } finally { keys.mockRestore(); }
+    const summary = sent.find((message) => message.t === "room")!;
+    expect(summary.t === "room" && summary.blobs.length).toBe(100_000);
+    const receiver = nodeFor(chain, cy).connect({ send: () => {}, close: () => {} }, ana.id);
+    receiver.receive(summary);
+    expect(receiver.isClosed).toBe(false);
+    session.close("done");
+    receiver.close("done");
+  });
+
+  it("keeps a progressing branch beyond 30 seconds, but reconnects after an idle transfer", () => {
+    const { chain, ana, ben, cy } = setup();
+    step(chain, ana, (state) => { state.users[ben.userId]!.admin = true; });
+    const start = chain.length;
+    const theirs = WorkspaceChain.load(chain.all());
+    step(theirs, ben, (state) => { state.name = "one"; });
+    step(theirs, ben, (state) => { state.name = "two"; });
+    step(theirs, ben, (state) => { state.devices[cy.id]!.revoked = true; });
+    step(chain, ana, (state) => { state.name = "senior branch"; });
+    const whole = WorkspaceChain.load(chain.all());
+    expect(whole.offer(theirs.since(start)).status).toBe("replaced");
+    const receiver = nodeFor(chain, ana);
+    const session = receiver.connect({ send: () => {}, close: () => {} }, ben.id);
+    vi.useFakeTimers();
+    try {
+      for (const version of theirs.since(start)) {
+        session.receive({ t: "versions", versions: [version], end: theirs.head.body.v, hash: theirs.headHash });
+        vi.advanceTimersByTime(20_000);
+      }
+      expect(session.isClosed).toBe(false);
+      expect(receiver.chain.headHash).toBe(whole.headHash);
+      const idle = nodeFor(chain, ana).connect({ send: () => {}, close: () => {} }, ben.id);
+      const first = { t: "versions", versions: [theirs.versionAt(start)], end: theirs.head.body.v, hash: theirs.headHash };
+      idle.receive(first);
+      vi.advanceTimersByTime(20_000);
+      idle.receive(first); // Replays do not extend the progress deadline.
+      vi.advanceTimersByTime(10_001);
+      expect(idle.isClosed).toBe(true);
+    } finally { session.close("done"); vi.useRealTimers(); }
+  });
+
+  it("checks only incoming versions when replaying or staging history", () => {
+    const { chain, ana, ben } = setup();
+    for (let i = 0; i < 40; i++) step(chain, ana, (state) => { state.name = `change ${i}`; });
+    const receiver = nodeFor(chain, ana);
+    const session = receiver.connect({ send: () => {}, close: () => {} }, ben.id);
+    const start = chain.length;
+    step(chain, ana, (state) => { state.name = "next"; });
+    step(chain, ana, (state) => { state.name = "last"; });
+    const load = vi.spyOn(WorkspaceChain, "load");
+    try {
+      for (let i = 0; i < 10; i++) session.receive({ t: "versions", versions: [receiver.chain.head], end: receiver.chain.head.body.v, hash: receiver.chain.headHash });
+      for (const version of chain.since(start)) session.receive({ t: "versions", versions: [version], end: chain.head.body.v, hash: chain.headHash });
+      expect(receiver.chain.headHash).toBe(chain.headHash);
+      expect(load).not.toHaveBeenCalled();
+    } finally { session.close("done"); load.mockRestore(); }
+  });
+
+  it("sends 1000 rooms and their contents after backpressure without overflowing the job queue", async () => {
+    const { chain, ws, admin } = founder();
+    const { joiner } = invite(chain, admin);
+    const key = newRoomKey();
+    step(chain, admin, (state) => {
+      for (let i = 0; i < 1000; i++) {
+        const id = randomId("r");
+        state.rooms[id] = { creator: admin.userId, name: sealRoomName(ws, id, 1, key, `Room ${i}`), members: { [admin.userId]: "manage" }, epochs: [{ n: 1, commit: keyCommitment(ws, id, 1, key) }] };
+      }
+    });
+    const source = nodeFor(chain, admin);
+    const receiver = nodeFor(chain, joiner);
+    for (const room of Object.keys(chain.state.rooms)) source.publish(sealUpdate({ ws, room, n: 1, key, author: admin.sign }, INDEX_DOC, 1, utf8("content")));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const summaries: string[] = [];
+    const session = source.connect({
+      send(message) {
+        if (message.t === "room") summaries.push(message.room);
+        if (message.t === "envelopes") for (const env of message.items as StoredEnvelope[]) receiver.publish(env);
+      },
+      drained: () => gate,
+      close: () => release()
+    }, joiner.id);
+    try {
+      session.receive({ t: "digests", rooms: {} });
+      for (const room of Object.keys(chain.state.rooms)) session.receive({ t: "room", room, docs: {}, blobs: [] });
+      expect(session.isClosed).toBe(false);
+      release();
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(summaries).toHaveLength(1000);
+      for (const room of summaries) expect(receiver.store.digest(room)).toBe(source.store.digest(room));
+      expect(session.isClosed).toBe(false);
+    } finally { session.close("done"); }
+  });
+
+  it("chooses the same authenticated branch whole, split at 500, or split by bytes with its revocation last", () => {
+    const { chain, ana, ben, cy } = setup();
+    step(chain, ana, (state) => { state.users[ben.userId]!.admin = true; });
+    const start = chain.length;
+    const theirs = WorkspaceChain.load(chain.all());
+    for (let i = 0; i < 500; i++) step(theirs, ben, (state) => { state.name = `change ${i}`; });
+    step(theirs, ben, (state) => { state.devices[cy.id]!.revoked = true; });
+    step(chain, ana, (state) => { state.name = "senior branch"; });
+    const branch = theirs.since(start);
+    const whole = WorkspaceChain.load(chain.all());
+    expect(whole.offer(branch).status).toBe("replaced");
+    for (const parts of [[branch.slice(0, 500), branch.slice(500)], versionBatches(branch, 25_000)]) {
+      const log: string[] = [];
+      const node = nodeFor(chain, ana, log);
+      const session = node.connect({ send: () => {}, close: () => {} }, ben.id);
+      parts.forEach((versions, i) => {
+        session.receive({ t: "versions", versions, end: theirs.head.body.v, hash: theirs.headHash });
+        if (i < parts.length - 1) expect(node.chain.headHash).toBe(chain.headHash);
+      });
+      expect(log).toEqual([]);
+      expect(node.chain.headHash).toBe(whole.headHash);
+      expect(activeDevice(node.effective(), cy.id)).toBeNull();
+    }
+    const net = new Network();
+    const receiver = nodeFor(chain, ana);
+    net.link(nodeFor(theirs, ben), receiver);
+    net.pump();
+    expect(receiver.chain.headHash).toBe(whole.headHash);
+  });
+
+  it("does not apply an incomplete or incorrectly signed branch", () => {
+    const { chain, ana, ben } = setup();
+    const log: string[] = [];
+    const node = nodeFor(chain, ana, log);
+    const later = WorkspaceChain.load(chain.all());
+    step(later, ana, (state) => { state.name = "one"; });
+    step(later, ana, (state) => { state.name = "two"; });
+    const session = node.connect({ send: () => {}, close: () => {} }, ben.id);
+    session.receive({ t: "versions", versions: later.since(chain.length).slice(0, 1), end: later.head.body.v, hash: later.headHash });
+    expect(node.chain.headHash).toBe(chain.headHash);
+    const bad = structuredClone(later.head);
+    bad.body.state.name = "forged";
+    session.receive({ t: "versions", versions: [bad], end: later.head.body.v, hash: later.headHash });
+    expect(node.chain.headHash).toBe(chain.headHash);
+    expect(log.some((reason) => reason.startsWith("versions:"))).toBe(true);
+  });
+
+  it("catches up with 101 concurrent writers' snapshots without losing history", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const writers = [ana];
+    for (let i = 0; i < 100; i++) writers.push(invite(chain, ana, { userName: `Writer ${i}`, rooms: { [roomId]: "write" } }).joiner);
+    const a = nodeFor(chain, ana);
+    const id = randomId("f");
+    const index = new Y.Doc();
+    index.getMap("files").set(id, { path: "Writers.md", kind: "md" });
+    a.publish(sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, INDEX_DOC, 1, Y.encodeStateAsUpdate(index)));
+    writers.forEach((writer, i) => {
+      const doc = new Y.Doc();
+      doc.getText("content").insert(0, `writer ${i}\n`);
+      expect(a.publish(sealSnapshot({ ws, room: roomId, n: 1, key, author: writer.sign }, id, 1, { [writer.id]: 1 }, Y.encodeStateAsUpdate(doc)))).toBe(true);
+      doc.destroy();
+    });
+    const log: string[] = [];
+    const c = nodeFor(chain, cy, log);
+    const net = new Network();
+    net.link(a, c);
+    net.pump();
+    expect(c.store.snapshotKeys(roomId, id)).toHaveLength(101);
+    expect(c.store.digest(roomId)).toBe(a.store.digest(roomId));
+    expect(log).toEqual([]);
+    const replica = new RoomReplica(c, roomId, { sign: cy.sign, agree: cy.agree });
+    replica.addOwnKey(1, key);
+    const content = replica.noteText(id);
+    for (let i = 0; i < 101; i++) expect(content).toContain(`writer ${i}\n`);
+    expect(replica.isComplete(id)).toBe(true);
+    replica.destroy();
+  });
+
+  it("awaits a slow transport through more than 128 MiB of catch-up, with bounded batches", async () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    const c = nodeFor(chain, cy);
+    const bytes = new Uint8Array(6 << 20);
+    for (let i = 1; i <= 21; i++) expect(a.publish(sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, INDEX_DOC, i, bytes))).toBe(true);
+    let queued = 0;
+    let largest = 0;
+    let sent = 0;
+    let turns = 0;
+    let closed = false;
+    const channel: Channel = {
+      send(message) {
+        if (message.t !== "envelopes") return;
+        const envs = message.items as StoredEnvelope[];
+        queued += envs.reduce((n, env) => n + env.ct.length, 0);
+        largest = Math.max(largest, queued);
+        if (queued > 128 << 20) closed = true;
+        for (const env of envs) { expect(c.publish(env)).toBe(true); sent++; }
+      },
+      drained: async () => { await new Promise((resolve) => setTimeout(resolve, 1)); queued = 0; turns++; },
+      close: () => { closed = true; }
+    };
+    const session = a.connect(channel, cy.id);
+    session.receive({ t: "room", room: roomId, docs: {}, blobs: [] });
+    const until = Date.now() + 20_000;
+    while (sent < 21 && !closed && Date.now() < until) await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(sent).toBe(21);
+    expect(turns).toBeGreaterThan(10);
+    expect(largest).toBeLessThan(17 << 20);
+    expect(closed).toBe(false);
+    expect(c.store.digest(roomId)).toBe(a.store.digest(roomId));
+    session.close("done");
+  }, 30_000);
+
   it("delivers live updates between two members", () => {
     const { chain, ana, cy, roomId, key, seal } = setup();
     const net = new Network();
@@ -176,6 +467,20 @@ describe("mesh", () => {
     expect(a.connectedDevices()).toEqual([]);
     expect(a.publish(seal(cy, 1, "after revocation"))).toBe(false);
     expect(a.store.envelopesOf(roomId, INDEX_DOC).updates).toHaveLength(0);
+  });
+
+  it("tells a device it was revoked before letting it go, over a channel that queues", async () => {
+    const { chain, ws, ana, cy } = setup();
+    const a = nodeFor(chain, ana);
+    const sent: PeerMessage[] = [];
+    let closed = false;
+    const session = a.connect({ send: (message) => { if (!closed) sent.push(message); }, drained: () => Promise.resolve(), close: () => { closed = true; } }, cy.id);
+    session.receive({ t: "hello", ws, head: chain.head.body.v, recent: [[chain.head.body.v, chain.headHash]] });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    sent.length = 0;
+    a.offerVersions([nextVersion(a.workspaceId, a.chain.head, ana.sign, (state) => (state.devices[cy.id]!.revoked = true))]);
+    expect(closed).toBe(true);
+    expect(sent.map((message) => message.t)).toContain("versions");
   });
 
   it("passes presence on without storing it, and without looping", () => {
