@@ -511,6 +511,37 @@ describe("mesh", () => {
     expect(texts(deeNode, roomId, deeKey)).toEqual(["before Dee"]);
   });
 
+  it("takes back what a revoked computer got in through one that didn't know yet, and keeps what came before", () => {
+    const { chain, ana, ben, cy, roomId, seal } = setup();
+    const base = chain.head.body.at;
+    let clock = base + 1_000;
+    // Ben's computer is cut off from Ana's: only Cy's reaches it.
+    const b = new MeshNode(WorkspaceChain.load(chain.all()), ben.id, {}, undefined, () => clock);
+    const c = nodeFor(chain, cy);
+    const taken: string[][] = [];
+    b.events.lateWork = (_room, docs, takeOut) => {
+      taken.push(docs);
+      takeOut();
+    };
+    const net = new Network();
+    net.link(b, c);
+    net.pump();
+    expect(c.publish(seal(cy, 1, "before"))).toBe(true);
+    net.pump();
+    // Ana revokes Cy's computer; Ben's doesn't hear of it, and takes in what Cy's makes after.
+    // (Behind another change: every new version is looked at.)
+    const renamed = nextVersion(chain.workspaceId, chain.head, ana.sign, (state) => (state.users[ana.userId]!.name = "Ana B"), base + 1_500);
+    const revoked = nextVersion(chain.workspaceId, renamed, ana.sign, (state) => (state.devices[cy.id]!.revoked = true), base + 2_000);
+    clock = base + 3_000;
+    expect(c.publish(seal(cy, 2, "after"))).toBe(true);
+    net.pump();
+    expect(b.store.envelopesOf(roomId, INDEX_DOC).updates).toHaveLength(2);
+    // Once Ben's computer has the revocation, what came after it is gone again; what came before stays.
+    expect(b.offerVersions([renamed, revoked]).status).toBe("appended");
+    expect(taken).toEqual([[INDEX_DOC]]);
+    expect(b.store.envelopesOf(roomId, INDEX_DOC).updates.map((env) => env.clock)).toEqual([1]);
+  });
+
   it("drops a revoked device and refuses its later writes", () => {
     const { chain, ana, cy, roomId, seal } = setup();
     const net = new Network();
