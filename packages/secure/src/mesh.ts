@@ -2,7 +2,7 @@ import { b64u, utf8 } from "./bytes.js";
 import { canonicalJson } from "./canonical.js";
 import { MAX_FORK_DEPTH, WorkspaceChain, type OfferResult } from "./chain.js";
 import { hashTagged } from "./crypto.js";
-import { envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
+import { blobKeyOf, envelopeKey, isBlobKey, isDocId, parseEnvelope, verifyEnvelope, type DocId, type Envelope, type PresenceEnvelope, type StoredEnvelope } from "./envelope.js";
 import { fail, SecureError } from "./errors.js";
 import { MAX_FRAME, PROVEN_MAX_FRAME } from "./frames.js";
 import { isId } from "./ids.js";
@@ -10,7 +10,7 @@ import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, veri
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
-import { activeDevice, parseSignedVersion, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, parseSignedVersion, roleAtLeast, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 /**
  * A mesh node: this device's copy of the workspace (record, pending joins, key wraps, encrypted room content) and
@@ -72,6 +72,11 @@ export interface MeshEvents {
   sessions?(): void;
   /** The record has just been compared with a member's (see MeshNode.recordCompared). */
   compared?(): void;
+  /**
+   * Work that came after its author lost write is about to be taken out of these documents (see takeBackLateWork):
+   * `takeOut` does it (called at once if no one listens), so an owner can keep what it needs of them first.
+   */
+  lateWork?(room: string, docs: DocId[], takeOut: () => void): void;
 }
 
 const RECENT = 64;
@@ -84,6 +89,8 @@ const MAX_PENDING = 2000;
 const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
+/** Arrival times kept (see MeshNode.takeBackLateWork): the newest this many. */
+const MAX_ARRIVALS = 500_000;
 /** Every key a peer message may carry (each kind checks its own). */
 const MESSAGE_KEYS = ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"];
 const MAX_BRANCH_BYTES = 256 << 20;
@@ -217,6 +224,58 @@ export class MeshNode {
     this.store.now = now;
     this.memberRooms = this.currentMemberRooms();
     this.alone = !this.othersActive();
+    this.checkedHead = chain.head.body.v;
+  }
+
+  /** When each envelope from a peer arrived here, this session (see takeBackLateWork); the newest MAX_ARRIVALS. */
+  private arrivals = new Map<string, number>();
+  /** The last version of the record looked at for write taken away (see takeBackLateWork). */
+  private checkedHead: number;
+
+  /**
+   * A computer that didn't know yet that someone lost write (asleep, cut off from the others) still took their work in:
+   * a revoked computer reaching it, say. Once the record here says so, what arrived from them after the version that
+   * took write away is taken out again, so this computer neither keeps it nor passes it on as anyone's (as passOnOldWork
+   * does with what they made while they could write, which everyone else has too). Only for what arrived in this
+   * session: arrival times aren't stored.
+   */
+  private takeBackLateWork(): void {
+    const head = this.chain.head.body.v;
+    const from = Math.min(this.checkedHead, head);
+    this.checkedHead = head;
+    if (this.arrivals.size === 0 || from >= head) return;
+    let before = this.chain.versionAt(from)!.body.state;
+    for (const version of this.chain.since(from + 1)) {
+      const after = version.body.state;
+      for (const [room, record] of Object.entries(before.rooms)) {
+        if (record.deleted) continue;
+        const writers = (state: WorkspaceState) => Object.keys(state.devices).filter((id) => { const device = activeDevice(state, id); return device !== null && roleAtLeast(roleIn(state, room, device.user), "write"); });
+        const still = new Set(writers(after));
+        for (const device of writers(before)) if (!still.has(device)) this.takeBack(room, device, version.body.at);
+      }
+      before = after;
+    }
+  }
+
+  private takeBack(room: string, device: string, at: number): void {
+    const late = (env: StoredEnvelope) => env.author === device && (this.arrivals.get(envelopeKey(env)) ?? -Infinity) > at;
+    const removals: Array<[DocId, StoredEnvelope[]]> = [];
+    for (const doc of this.store.docs(room)) {
+      const { updates, snapshots } = this.store.envelopesOf(room, doc);
+      const remove = [...updates, ...snapshots].filter(late);
+      if (remove.length > 0) removals.push([doc, remove]);
+    }
+    const blobs = this.store.blobsOf(room).filter((meta) => meta.author === device && (this.arrivals.get(`${room}/b/${blobKeyOf(meta.author, meta.id)}`) ?? -Infinity) > at).map((meta) => blobKeyOf(meta.author, meta.id));
+    this.store.dropBlobs(room, blobs);
+    if (removals.length === 0) return;
+    let done = false;
+    const takeOut = () => {
+      if (done) return;
+      done = true;
+      for (const [doc, remove] of removals) this.store.compact(room, doc, remove, {});
+    };
+    this.events.lateWork?.(room, removals.map(([doc]) => doc), takeOut);
+    takeOut();
   }
 
   get workspaceId(): string {
@@ -295,6 +354,7 @@ export class MeshNode {
   }
 
   private membershipChanged(): void {
+    this.takeBackLateWork();
     // Joins the record now covers, or that turned invalid, are dropped; pending ones get another chance.
     for (const [hash, entry] of [...this.joins, ...this.pendingJoins]) {
       this.joins.delete(hash);
@@ -500,6 +560,10 @@ export class MeshNode {
     if (result === "conflict") this.events.rejected?.("equivocation", env.author);
     if (result === "quota") this.events.rejected?.(`quota:${env.room}`, env.author);
     if (result !== "added") return false;
+    if (from) {
+      this.arrivals.set(envelopeKey(env), this.now());
+      if (this.arrivals.size > MAX_ARRIVALS) this.arrivals.delete(this.arrivals.keys().next().value!);
+    }
     this.events.envelope?.(env);
     const mine = !from && env.author === this.deviceId;
     if (!mine || !this.persist) this.push(env, from, told);
