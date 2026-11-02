@@ -7,6 +7,7 @@ import { keyCommitment, newRoomKey, wrapRoomKey } from "./keys.js";
 import { envelopeKey, openEnvelope, sealSnapshot, sealUpdate } from "./envelope.js";
 import { MeshNode } from "./mesh.js";
 import { pathKey, safeRoomPath } from "./paths.js";
+import { cleanName } from "./validate.js";
 import { RoomReplica, type FileEntry, type ReplicaEvents } from "./replica.js";
 import { EnvelopeStore, STORE_LIMITS } from "./store.js";
 import { createRoom, founder, invite, Network, step, type TestDevice } from "./testkit.js";
@@ -16,8 +17,13 @@ describe("room paths", () => {
   it("accept ordinary names, in any script", () => {
     for (const ok of ["Plan.md", "Design/Notes.md", "תכנית עבודה.md", "a b/c-d_e (1).png", "日本語/メモ.md"]) expect(safeRoomPath(ok)).toBe(ok.normalize("NFC"));
   });
+  it("keep accepting names files were shared under, direction marks included, which names of people refuse", () => {
+    // Pasted along with Hebrew or Arabic text: such files keep syncing on every computer, updated or not.
+    for (const ok of ["דוח‏.md", "a‎.md", "a؜.md", "a b.md"]) expect(safeRoomPath(ok)).toBe(ok);
+    expect(cleanName("Team‏  ")).toBe("Team");
+  });
   it("refuse anything that could leave the room folder or reach Obsidian's configuration", () => {
-    for (const bad of ["../evil.md", "a/../../b.md", "/etc/passwd", "C:/Windows/x", "C:x", ".obsidian/plugins/x/main.js", "Notes/.obsidian/app.json", ".trash/x", "a\\b", "a//b", "", "con.md", "Notes/NUL", "lpt1.txt", "end.", "end ", "a:b", "tab\there", `${"x".repeat(121)}.md`]) {
+    for (const bad of ["../evil.md", "a/../../b.md", "/etc/passwd", "C:/Windows/x", "C:x", ".obsidian/plugins/x/main.js", "Notes/.obsidian/app.json", ".trash/x", "a\\b", "a//b", "", "con.md", "Notes/NUL", "lpt1.txt", "end.", "end ", "a:b", "tab\there", "a‮b.md", "a​b.md", `${"x".repeat(121)}.md`]) {
       expect(safeRoomPath(bad), bad).toBeNull();
     }
     expect(safeRoomPath(42)).toBeNull();

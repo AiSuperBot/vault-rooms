@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { INDEX_DOC, isMarkdownPath, isWithin, MAX_BYTES, MAX_NOTE_BYTES, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
+import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
+import { isShareable, normalizeNote, sha, suffixed } from "./roomPaths.js";
 import { reconcileYTextByLines } from "../crdtReconcile.js";
 
 /**
@@ -88,6 +88,8 @@ export interface RoomHealth {
   /** Files whose version here couldn't be shared (too large, the room's storage full): kept as they are here. */
   heldBack: string[];
   rejected?: Array<{ path: string; reason: string }>;
+  /** Files still to be written here, or whose shared content hasn't all arrived yet (0 when in step). */
+  syncing: number;
 }
 
 export interface RoomFolderOptions {
@@ -120,35 +122,6 @@ export interface RoomFolderOptions {
   now?: () => Date;
 }
 
-/**
- * The file types a room shares. Anything else (programs, scripts, shortcuts, web pages, documents that can carry
- * macros) is neither shared from this computer nor written to it when someone else adds one, so a member can't plant
- * something that runs when opened.
- */
-export const SHARED_EXTENSIONS = new Set([
-  "md", "canvas", "base", "txt", "csv", "tsv", "json",
-  "pdf", "epub", "docx", "xlsx", "pptx", "odt", "ods", "odp",
-  "png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "tif", "tiff", "heic",
-  "mp3", "wav", "m4a", "ogg", "oga", "opus", "flac", "mp4", "m4v", "webm", "mov", "mkv", "ogv",
-  "zip"
-]);
-
-/**
- * Why a vault folder can't be (or become) a room's folder: a name some computers can't use (a dot folder anywhere in it
- * included), or inside, around or the same as one of `others` (the folders of the rooms shown here), compared as the
- * disk compares names. Used both to offer folders and to share one.
- */
-export function folderProblem(path: string, others: string[]): string | null {
-  if (safeRoomPath(path) === null) return `"${path}" can't be shared (dot folders and some characters can't be used).`;
-  const clash = others.find((folder) => isWithin(path, folder) || isWithin(folder, path));
-  return clash === undefined ? null : `"${path}" overlaps the folder of another room ("${clash}").`;
-}
-
-export function isShareable(path: string): boolean {
-  const dot = path.lastIndexOf(".");
-  return dot > path.lastIndexOf("/") + 1 && SHARED_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
-}
-
 const DELETED = "\u0000deleted";
 /** Work on files that failed (a file in use, a full disk) is tried again after this, doubling up to the maximum. */
 const RETRY_FIRST_MS = 1_000;
@@ -157,20 +130,17 @@ const RETRY_MAX_MS = 300_000;
 const IDLE_NOTE_MS = 5 * 60_000;
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
 const RECENT_EDIT_MS = 10 * 60_000;
+/**
+ * A note someone else is typing in, not open here, is written at most this often: each write is the whole file, and
+ * Obsidian indexes it again. Only the file waits; the shared note here is current all along.
+ */
+const NOTE_WRITE_GAP_MS = 1_500;
+/** A pass with at least this many files to go shows its progress (see RoomHealth.syncing). */
+const SHOWN_PASS = 50;
 
-/** Notes are compared and shared with "\n" line endings, as Obsidian's editor holds them (and saves them, once edited). */
-export function normalizeNote(text: string): string {
-  return text.includes("\r") ? text.replace(/\r\n?/g, "\n") : text;
-}
-
-function sha(bytes: Uint8Array | string): string {
-  return createHash("sha256").update(typeof bytes === "string" ? Buffer.from(bytes, "utf8") : bytes).digest("base64url");
-}
-
-function splitName(path: string): { stem: string; ext: string } {
-  const slash = path.lastIndexOf("/");
-  const dot = path.lastIndexOf(".");
-  return dot > slash + 1 ? { stem: path.slice(0, dot), ext: path.slice(dot) } : { stem: path, ext: "" };
+/** Two index entries a pass writes alike (the same name, kind and attachment version). */
+function sameEntry(a: FileEntry | undefined, b: FileEntry): boolean {
+  return a !== undefined && a.path === b.path && a.kind === b.kind && a.blob?.id === b.blob?.id && a.blob?.by === b.blob?.by;
 }
 
 function code(error: unknown): string {
@@ -182,27 +152,14 @@ function movingMark(from: string, to: string): string {
   return `${from}\u0000${to}`;
 }
 
-/** A portable suffixed name, shortened to fit; use the room root when its directory leaves no space. */
-function suffixed(path: string, tag: string): string | null {
-  const slash = path.lastIndexOf("/");
-  const dir = path.slice(0, slash + 1);
-  const { stem, ext } = splitName(path.slice(slash + 1));
-  const suffix = ` (${tag})`;
-  const room = Math.min(MAX_SEGMENT, MAX_PATH - dir.length) - suffix.length - ext.length;
-  if (room < 1) return dir ? suffixed(path.slice(slash + 1), tag) : null;
-  // Never half of a character made of two (a surrogate pair).
-  const cut = stem.slice(0, room).replace(/[\uD800-\uDBFF]$/, "").trimEnd();
-  return (cut ? safeRoomPath(`${dir}${cut}${suffix}${ext}`) : null) ?? (dir ? suffixed(path.slice(slash + 1), tag) : null);
-}
-
 export class RoomFolder {
   private known = new Map<string, Known>();
   private knownPaths = new Map<string, string>();
   /** Tracked ids by pathKey (see idAt). */
   private knownKeys = new Map<string, string>();
-  /** The last desired() and the index version it was built from (see materializeNow). */
   /** Which files use each attachment version, for the index version it was built from (see blobArrived). */
   private blobFiles: { version: number; users: Map<string, string[]> } | null = null;
+  /** The last desired() and the index version it was built from (see materializeNow). */
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
   /** `known` changed since it was last saved (see saveNow). */
   private stateChanged = false;
@@ -266,6 +223,19 @@ export class RoomFolder {
   private stopped = false;
   /** Clash copies to keep, by file id (see noteClashed): written by the next pass, before the note itself. */
   private toKeep = new Map<string, string[]>();
+  /** Notes written from the shared state, by file id: when (see NOTE_WRITE_GAP_MS). */
+  private noteWrites = new Map<string, number>();
+  /** Notes whose writing waits for NOTE_WRITE_GAP_MS, and the pass that writes them. */
+  private later = new Set<string>();
+  private laterTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The room index changed: the next pass looks at what changed in it, and at removals and renames. */
+  private indexChanged = false;
+  /** Files whose shared content isn't all here yet (part of a note can't be read, an attachment hasn't arrived). */
+  private incomplete = new Set<string>();
+  /** Files a long pass still has to look at, and what the panel was last told (see reportProgress). */
+  private left = 0;
+  private reported = 0;
+  private reportedAt = 0;
   /** What RoomReplica.savesChanged was when the saves were last stored. */
   private savesStored = -1;
   /** The stored saves couldn't be read when the folder started: read again before they are stored, never written over. */
@@ -334,6 +304,8 @@ export class RoomFolder {
   /** Stop tracking a file (gone, or no longer the room's), and whatever was held back of it. */
   private forget(id: string): void {
     this.unindex(id);
+    this.incomplete.delete(id);
+    this.noteWrites.delete(id);
     if (this.known.delete(id)) this.stateChanged = true;
     // An editor tied to it is tied again (to the copy shared under a new id, say), not left feeding a deleted note.
     const bound = this.o.isBound(id);
@@ -365,6 +337,11 @@ export class RoomFolder {
     return normalizeNote(await this.o.vault.readText(path));
   }
 
+  /** A file as a note (its text) or as bytes, by what it is shared as. */
+  private readAs(path: string, asNote: boolean): Promise<string | Uint8Array> {
+    return asNote ? this.readNote(path) : this.o.vault.readBytes(path);
+  }
+
   /** One file's trouble (locked, a folder in the way, ...) mustn't stop the others. */
   private async safely(what: string, task: () => Promise<void>): Promise<boolean> {
     try {
@@ -382,7 +359,20 @@ export class RoomFolder {
   /** How the folder's syncing goes, from its own work: for the panel, so trouble stays visible after a notice is gone. */
   health(): RoomHealth {
     const pathOf = (id: string) => this.known.get(id)?.path ?? this.queuedEntries.get(id) ?? id;
-    return { stopped: this.loadProblem, failing: [...this.failing.keys()], heldBack: [...new Set([...this.heldBack.keys()].map(pathOf).concat([...this.rejected.keys()]))], ...(this.rejected.size ? { rejected: [...this.rejected].map(([path, reason]) => ({ path, reason })) } : {}) };
+    return { stopped: this.loadProblem, failing: [...this.failing.keys()], heldBack: [...new Set([...this.heldBack.keys()].map(pathOf).concat([...this.rejected.keys()]))], ...(this.rejected.size ? { rejected: [...this.rejected].map(([path, reason]) => ({ path, reason })) } : {}), syncing: this.syncing() };
+  }
+
+  private syncing(): number {
+    return this.incomplete.size + (this.left >= SHOWN_PASS ? this.left : 0);
+  }
+
+  /** Tell the panel how many files are left (see RoomHealth.syncing): at once when that starts or ends, else once a second. */
+  private reportProgress(): void {
+    const syncing = this.syncing();
+    if (syncing === this.reported || (this.reported !== 0 && syncing !== 0 && Date.now() - this.reportedAt < 1_000)) return;
+    this.reported = syncing;
+    this.reportedAt = Date.now();
+    this.o.healthChanged?.();
   }
 
   /** Try again now what failed (rather than when its next retry is due). */
@@ -436,8 +426,8 @@ export class RoomFolder {
 
   stop(): Promise<void> {
     this.stopped = true;
-    for (const timer of [this.materializeTimer, this.saveTimer, this.deleteTimer, this.retryTimer]) if (timer) clearTimeout(timer);
-    this.materializeTimer = this.saveTimer = this.deleteTimer = this.retryTimer = null;
+    for (const timer of [this.materializeTimer, this.saveTimer, this.deleteTimer, this.retryTimer, this.laterTimer]) if (timer) clearTimeout(timer);
+    this.materializeTimer = this.saveTimer = this.deleteTimer = this.retryTimer = this.laterTimer = null;
     return this.run(async () => {
       // Never loaded: the saved state stays as it was.
       if (!this.started) return;
@@ -472,7 +462,8 @@ export class RoomFolder {
 
   /** Call when the room index or a note (`docId`: only that one) changed remotely, or a key arrived. */
   remoteChanged(docId?: string): void {
-    if (docId !== undefined && docId !== INDEX_DOC) this.dirty.add(docId);
+    if (docId === INDEX_DOC) this.indexChanged = true;
+    else if (docId !== undefined) this.dirty.add(docId);
     else this.everything = true;
     if (this.stopped || this.materializeTimer) return;
     this.materializeTimer = setTimeout(() => {
@@ -491,19 +482,47 @@ export class RoomFolder {
     });
   }
 
-  /** Wait until everything queued so far has run (tests, shutdown). */
+  /**
+   * Wait until everything queued so far has run (tests), notes waiting for NOTE_WRITE_GAP_MS included. Rounds are
+   * capped: work that keeps making more (a bug) ends the wait rather than hanging it.
+   */
   async settled(): Promise<void> {
-    if (this.materializeTimer) {
-      clearTimeout(this.materializeTimer);
-      this.materializeTimer = null;
-      this.queuePass();
+    for (let round = 0; round < 20; round++) {
+      if (this.materializeTimer) {
+        clearTimeout(this.materializeTimer);
+        this.materializeTimer = null;
+        this.queuePass();
+      }
+      if (this.laterTimer) {
+        clearTimeout(this.laterTimer);
+        this.laterTimer = null;
+        this.noteWrites.clear();
+        this.writeLaterNow();
+      }
+      if (this.deleteTimer) {
+        clearTimeout(this.deleteTimer);
+        this.deleteTimer = null;
+        void this.run(() => this.flushDeletions());
+      }
+      await this.queue;
+      if (!this.materializeTimer && !this.laterTimer && !this.deleteTimer) return;
     }
-    if (this.deleteTimer) {
-      clearTimeout(this.deleteTimer);
-      this.deleteTimer = null;
-      void this.run(() => this.flushDeletions());
-    }
-    await this.queue;
+  }
+
+  /** A note to write once NOTE_WRITE_GAP_MS has passed since it was last written (`wait` from now). */
+  private writeLater(id: string, wait: number): void {
+    this.later.add(id);
+    if (this.laterTimer || this.stopped) return;
+    this.laterTimer = setTimeout(() => {
+      this.laterTimer = null;
+      this.writeLaterNow();
+    }, wait);
+  }
+
+  private writeLaterNow(): void {
+    for (const id of this.later) this.dirty.add(id);
+    this.later.clear();
+    this.queuePass();
   }
 
   /**
@@ -521,8 +540,9 @@ export class RoomFolder {
     return false;
   }
 
-  /** Clash copies asked for (see noteClashed) are written, and the replica told, so what gave way can go. */
-  /** Returns whether every copy that could be written was (one that failed is tried again, see retrySoon). */
+  /**
+   * Clash copies asked for (see noteClashed) are written, and the replica told, so what gave way can go. Returns whether every copy that could be written was (one that failed is tried again, see retrySoon).
+   */
   private async keepClashCopies(): Promise<boolean> {
     let done = true;
     for (const [id, versions] of [...this.toKeep]) {
@@ -547,11 +567,6 @@ export class RoomFolder {
       }
     }
     return done;
-  }
-
-  /** Whether a note's local version is held back (couldn't be shared): the editor shouldn't be bound to it. */
-  isHeldBack(fileId: string): boolean {
-    return this.heldBack.has(fileId);
   }
 
   /** An editor's change to a note couldn't be shared: leave the note as it is here until its file can be shared again. */
@@ -614,8 +629,8 @@ export class RoomFolder {
    * Remember a file as synced. What this computer made for it counts only once stored: edits of its note, and `made`,
    * the envelopes (by key) it just made for the file's entry (`created`: a new entry); and so does what it received for
    * its note. Until then the file is marked (see Known.unstored), and the mark is checked again whenever state is saved.
+   * `content`: for a note whose `hash` is of the shared text, what the shared note held then (see Known.content).
    */
-  /** `content`: for a note whose `hash` is of the shared text, what the shared note held then (see Known.content). */
   private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false, content?: string): void {
     const replica = this.o.replica;
     this.keptAside.delete(pathKey(path));
@@ -679,7 +694,8 @@ export class RoomFolder {
       name: "its name can't be used on every computer (too long, or with characters some systems refuse)"
     }[why];
     this.rejectLocal(relative, reason);
-    this.tellOnce(`${why}:${relative}`, `"${relative}" stays on this computer only: ${reason}.`);
+    // Once per kind: a folder of office files would stack a notice per file. The panel lists every one.
+    this.tellOnce(`not shared:${why}`, `"${relative}" stays on this computer only: ${reason}. Others like it are listed under the room in the Vault Rooms panel.`);
   }
 
   private rejectLocal(path: string, reason: string): void {
@@ -713,14 +729,22 @@ export class RoomFolder {
     }
   }
 
-  private writeText(relative: string, text: string, expected?: (current: string) => boolean): Promise<boolean> {
+  /**
+   * Write shared content as ours, only if what is there now has the hash `basedOn` (when given) and `unless` doesn't
+   * hold (checked as it is written). Returns whether it wrote.
+   */
+  private writeShared(relative: string, content: string | Uint8Array, basedOn?: string, unless?: () => boolean): Promise<boolean> {
     const path = this.vaultPath(relative);
-    return this.expecting(path, sha(text), () => this.o.vault.writeText(path, text, expected), (wrote) => wrote);
+    const write = () =>
+      typeof content === "string"
+        ? this.o.vault.writeText(path, content, (current) => !unless?.() && (basedOn === undefined || sha(normalizeNote(current)) === basedOn))
+        : this.o.vault.writeBytes(path, content, basedOn === undefined ? undefined : (current) => sha(current) === basedOn);
+    return this.expecting(path, sha(content), write, (wrote) => wrote);
   }
 
-  private writeBytes(relative: string, bytes: Uint8Array, expected?: (current: Uint8Array) => boolean): Promise<boolean> {
-    const path = this.vaultPath(relative);
-    return this.expecting(path, sha(bytes), () => this.o.vault.writeBytes(path, bytes, expected), (wrote) => wrote);
+  /** A copy kept next to a file (not marked as ours: the vault event shares it, or localOnly keeps it here). */
+  private writeCopy(vaultPath: string, content: string | Uint8Array): Promise<boolean> {
+    return typeof content === "string" ? this.o.vault.writeText(vaultPath, content) : this.o.vault.writeBytes(vaultPath, content);
   }
 
   private trash(relative: string): Promise<void> {
@@ -746,7 +770,10 @@ export class RoomFolder {
 
   /** A free name next to `relative` for a copy of a file that would otherwise be lost (one safe path segment). */
   private copyName(relative: string, label: string): string {
-    const stamp = (this.o.now?.() ?? new Date()).toISOString().slice(0, 16).replace("T", " ").replace(":", "");
+    // In this computer's time, as people read clocks here.
+    const at = this.o.now?.() ?? new Date();
+    const two = (n: number) => String(n).padStart(2, "0");
+    const stamp = `${at.getFullYear()}-${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}${two(at.getMinutes())}`;
     const device = this.o.deviceName.replace(/[\\/:*?"<>|.]/g, "").trim().slice(0, 40) || "this computer";
     for (let i = 1; ; i++) {
       const candidate = suffixed(relative, `${label} ${device} ${stamp}${i > 1 ? ` ${i}` : ""}`);
@@ -763,10 +790,9 @@ export class RoomFolder {
     const name = this.copyName(relative, "conflict");
     if (!this.o.replica.canWrite()) this.localOnly.add(this.vaultPath(name));
     // Writers share the copy as a local addition; readers keep it on this computer.
-    if (typeof content === "string") await this.o.vault.writeText(this.vaultPath(name), content);
-    else await this.o.vault.writeBytes(this.vaultPath(name), content);
+    await this.writeCopy(this.vaultPath(name), content);
     this.keptAside.set(pathKey(relative), { hash, name });
-    this.o.notify(`"${relative}" was changed here and by someone else at the same time. Your version is kept as "${name}".`);
+    this.o.notify(`"${relative}" was changed here and by someone else at the same time. Your version is kept as "${name}"${this.o.replica.canWrite() ? ", which the others get too" : ""}: compare the two, and delete the one you don't need.`);
     return name;
   }
 
@@ -819,8 +845,10 @@ export class RoomFolder {
   private async materializeNow(): Promise<void> {
     if (this.stopped || !this.started) return;
     const { everything, dirty, retrying } = this;
-    this.everything = this.retrying = false;
+    const tidy = everything || this.indexChanged;
+    this.everything = this.retrying = this.indexChanged = false;
     this.dirty = new Set();
+    if (everything) this.incomplete.clear();
     this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     let done = await this.keepClashCopies();
@@ -831,10 +859,14 @@ export class RoomFolder {
     const replica = this.o.replica;
     // Built anew by a whole pass, and whenever the index changed: a pass for one note doesn't go over every file.
     const version = replica.docVersion(INDEX_DOC);
-    if (everything || this.desiredCache?.version !== version) this.desiredCache = { version, desired: this.desired() };
-    const desired = this.desiredCache.desired;
+    const previous = this.desiredCache;
+    const desired = everything || previous?.version !== version ? this.desired() : previous.desired;
+    this.desiredCache = { version, desired };
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
-    if (everything && replica.isComplete(INDEX_DOC)) {
+    // Files a tidy pass moves are looked at by it too: their content may have changed while they waited for the move.
+    const moved: string[] = [];
+    if (tidy && replica.isComplete(INDEX_DOC)) {
+      for (const [id, entry] of desired) if (this.known.has(id) && this.known.get(id)!.path !== entry.path) moved.push(id);
       const entries = replica.entries();
       let whole = true;
       for (const [id, known] of [...this.known]) {
@@ -854,11 +886,25 @@ export class RoomFolder {
     }
     // Whose each local name is, once the renames are done: a file still tracked as another's (whose rename or removal
     // is still to come, a file in the way being in use) is never taken for this one, nor written over.
-    const owners = everything ? new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const)) : this.knownKeys;
-    // A pass for some notes goes over those only (desired is looked up, not walked).
-    const ids = everything ? desired.keys() : new Set([...dirty, ...this.toKeep.keys()].filter((id) => desired.has(id)));
+    const owners = tidy ? new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const)) : this.knownKeys;
+    // A pass for some notes goes over those only, and one for a change of the index over the files it changed (desired
+    // is compared with the one before, not each file looked at).
+    const some = new Set([...dirty, ...this.toKeep.keys(), ...moved]);
+    // Files no longer to be written here (deleted, moved to another room) aren't waited for.
+    for (const id of this.incomplete) if (!desired.has(id)) this.incomplete.delete(id);
+    if (!everything && previous && previous.desired !== desired) for (const [id, entry] of desired) if (!sameEntry(previous.desired.get(id), entry)) some.add(id);
+    const ids = everything || !previous ? [...desired.keys()] : [...some].filter((id) => desired.has(id));
+    const now = Date.now();
+    this.left = ids.length;
     for (const id of ids) {
+      this.left--;
+      this.reportProgress();
       const entry = desired.get(id)!;
+      const wait = (this.noteWrites.get(id) ?? -Infinity) + NOTE_WRITE_GAP_MS - now;
+      if (wait > 0 && !everything && entry.kind === "md" && !this.toKeep.has(id)) {
+        this.writeLater(id, wait);
+        continue;
+      }
       const owner = owners.get(pathKey(entry.path));
       // One that failed (a file in use, say), or must wait for another, is tried again by the next retry.
       if ((owner !== undefined && owner !== id) || !(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
@@ -879,6 +925,9 @@ export class RoomFolder {
       this.failing.clear();
       this.o.healthChanged?.();
     }
+    this.left = 0;
+    this.reportProgress();
+    if (this.noteWrites.size > 1_000) for (const [id, at] of this.noteWrites) if (now - at >= NOTE_WRITE_GAP_MS) this.noteWrites.delete(id);
     this.saveSoon();
     // Notes untouched for a while are let go (memory): loaded again when they change or are opened.
     this.o.replica.releaseIdle(IDLE_NOTE_MS, (id) => this.o.isBound(id) || this.toKeep.has(id));
@@ -936,7 +985,6 @@ export class RoomFolder {
     }
   }
 
-  /** A file here whose name differs from `relative` only in case (the same file on Windows and macOS), if untracked. */
   /** Local names by pathKey: listed once per pass, then kept current by vault events (see noteLocal). */
   private localNamesNow(): Map<string, Set<string>> {
     if (!this.localNames) {
@@ -946,6 +994,7 @@ export class RoomFolder {
     return this.localNames;
   }
 
+  /** A file here whose name differs from `relative` only in case (the same file on Windows and macOS), if untracked. */
   private untrackedCaseVariant(relative: string): string | null {
     for (const other of this.localNamesNow().get(pathKey(relative)) ?? []) if (other !== relative && !this.idAt(other) && this.o.vault.stat(this.vaultPath(other))) return other;
     return null;
@@ -967,6 +1016,7 @@ export class RoomFolder {
 
   private async applyContent(id: string, entry: FileEntry): Promise<void> {
     const replica = this.o.replica;
+    this.incomplete.delete(id);
     const path = this.vaultPath(entry.path);
     const known = this.known.get(id);
     if (entry.kind === "md" && this.o.isBound(id)) return;
@@ -993,7 +1043,11 @@ export class RoomFolder {
       content = replica.contentKey(id);
       if (known?.content === content && !replica.hasUnsent(id) && !this.toKeep.has(id) && unchanged(this.o.vault.stat(path))) return;
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
-      if (!replica.isComplete(id) || replica.hasUnsent(id)) return;
+      if (!replica.isComplete(id)) {
+        this.incomplete.add(id);
+        return;
+      }
+      if (replica.hasUnsent(id)) return;
       remote = normalizeNote(replica.noteText(id));
       // Remembered with the text only when the text is all of what the store holds (it may lag a moment behind).
       content = replica.syncedKey(id);
@@ -1004,7 +1058,11 @@ export class RoomFolder {
       if (known?.blob === entry.blob?.id && unchanged(this.o.vault.stat(path))) return;
       remote = entry.blob ? await replica.readBlob(entry.blob) : null;
     }
-    if (remote === null) return; // the attachment hasn't arrived yet: its arrival brings a pass
+    // The attachment hasn't arrived yet: its arrival brings a pass.
+    if (remote === null) {
+      this.incomplete.add(id);
+      return;
+    }
     const remoteHash = sha(remote);
     const stat = this.o.vault.stat(path);
     if (stat && !this.fitsBeforeRead(entry.path, entry.kind === "md", id)) return;
@@ -1030,7 +1088,7 @@ export class RoomFolder {
       if (entry.kind === "bin" && known.mine && entry.blob && entry.blob.id !== known.blob && entry.base !== known.blob) await this.keepAside(entry.path, await this.o.vault.readBytes(path));
       return this.write(id, entry, remote, remoteHash, known.hash, content);
     }
-    const local = entry.kind === "md" ? await this.readNote(path) : await this.o.vault.readBytes(path);
+    const local = await this.readAs(path, entry.kind === "md");
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     if (!known || (localHash === known.hash && !doubtful)) {
@@ -1049,15 +1107,15 @@ export class RoomFolder {
     await this.write(id, entry, remote, remoteHash, localHash, content);
   }
 
-  /** Write the shared version, only if the file is still what the decision was based on (checked as it is written). */
-  /** `content`: the note's content key, when `remote` is all of what its store holds (see RoomReplica.syncedKey). */
+  /**
+   * Write the shared version, only if the file is still what the decision was based on (checked as it is written).
+   * `content`: the note's content key, when `remote` is all of what its store holds (see RoomReplica.syncedKey).
+   */
   private async write(id: string, entry: FileEntry, remote: string | Uint8Array, remoteHash: string, basedOn?: string, content?: string): Promise<void> {
     // Changed meanwhile (saved again while its copy was being kept, say), or an editor bound meanwhile (which owns the
     // note now): left as it is and looked at again next time.
-    const wrote =
-      typeof remote === "string"
-        ? await this.writeText(entry.path, remote, (current) => !this.o.isBound(id) && (basedOn === undefined || sha(normalizeNote(current)) === basedOn))
-        : await this.writeBytes(entry.path, remote, basedOn === undefined ? undefined : (current) => sha(current) === basedOn);
+    const wrote = await this.writeShared(entry.path, remote, basedOn, () => this.o.isBound(id));
+    if (wrote && entry.kind === "md") this.noteWrites.set(id, Date.now());
     if (wrote) this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     else if (!this.o.isBound(id)) {
       const known = this.known.get(id);
@@ -1080,7 +1138,7 @@ export class RoomFolder {
     // Forgotten only once the file is dealt with: one that can't be read or trashed now (in use, say) stays tracked, and
     // is tried again, rather than being left behind untracked and shared again as a new file.
     if (!stat) return this.forget(id);
-    const current = (entry ? entry.kind === "md" : isMarkdownPath(known.path)) ? await this.readNote(path) : await this.o.vault.readBytes(path);
+    const current = await this.readAs(path, entry ? entry.kind === "md" : isMarkdownPath(known.path));
     const unchanged = !busy && sha(current) === known.hash;
     if (unchanged) {
       await this.trash(known.path);
@@ -1110,7 +1168,10 @@ export class RoomFolder {
     const present = new Set(paths.map((path) => path.slice(this.prefix.length)));
     for (const path of this.rejected.keys()) if (!present.has(path)) { this.rejected.delete(path); this.o.healthChanged?.(); }
     let done = true;
+    this.left = paths.length;
     for (const path of paths) {
+      this.left--;
+      this.reportProgress();
       if (this.o.inOtherRoom?.(path) || this.localOnly.has(path)) continue;
       const relative = this.relative(path);
       if (relative === null) {
@@ -1128,6 +1189,8 @@ export class RoomFolder {
       }
       if (this.known.size > before) track(relative);
     }
+    this.left = 0;
+    this.reportProgress();
     return done;
   }
 
@@ -1180,12 +1243,8 @@ export class RoomFolder {
         // Nothing of the reader's is lost: their version stays next to the shared one, on this computer only.
         const copy = this.copyName(entry.path, "your copy");
         this.localOnly.add(this.vaultPath(copy));
-        if (typeof local === "string") await this.o.vault.writeText(this.vaultPath(copy), local);
-        else await this.o.vault.writeBytes(this.vaultPath(copy), local);
-        const wrote =
-          typeof remote === "string"
-            ? await this.writeText(entry.path, remote, (current) => sha(normalizeNote(current)) === localHash)
-            : await this.writeBytes(entry.path, remote, (current) => sha(current) === localHash);
+        await this.writeCopy(this.vaultPath(copy), local);
+        const wrote = await this.writeShared(entry.path, remote, localHash);
         if (!wrote) return; // changed again meanwhile: looked at again next time
         this.readOnlyNotice(`You can only read this room, so "${entry.path}" was put back. Your version is kept as "${copy}" on this computer only.`);
       }
@@ -1278,7 +1337,7 @@ export class RoomFolder {
     // an earlier version): a note's text never goes out as an attachment, nor the reverse.
     const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
     if (!this.fitsBeforeRead(relative, asNote, id)) return;
-    const content = asNote ? await this.readNote(vaultPath) : await this.o.vault.readBytes(vaultPath);
+    const content = await this.readAs(vaultPath, asNote);
     const hash = sha(content);
     if (this.isEcho(vaultPath, hash)) return;
     // Someone else deleted it, and it couldn't be trashed here yet: the removal, tried again, settles it (sharing it

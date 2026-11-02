@@ -5,6 +5,7 @@ import { JoinHandshake, type MeshNode, type PeerSession } from "./mesh.js";
 import { dial, verifyAcceptor, type PeerLink, type TransportConfig } from "./transport.js";
 import { activeDevice, type WorkspaceState } from "./workspace.js";
 import type { KeyPair } from "./crypto.js";
+import { fail } from "./errors.js";
 import type { TlsIdentity } from "./tlsIdentity.js";
 
 /**
@@ -145,10 +146,8 @@ export class PeerManager {
     const members = this.node.effective();
     for (const item of items as unknown[]) {
       if (!Array.isArray(item) || typeof item[0] !== "string" || typeof item[1] !== "string" || !PEER_PATTERN.test(item[1])) continue;
-      const [device, address] = item as [string, string];
-      const at = address.lastIndexOf(":");
-      const port = Number(address.slice(at + 1));
-      if (port >= 1 && port <= 65535 && activeDevice(members, device)) this.candidate(device, address.slice(0, at).replace(/^\[|\]$/g, ""), port);
+      const address = parseAddress(item[1]);
+      if (address && activeDevice(members, item[0])) this.candidate(item[0], address.host, address.port);
     }
   }
 
@@ -230,6 +229,16 @@ export class PeerManager {
   }
 }
 
+/** "host:port" or "[v6 host]:port", as addresses are written in links, settings and address books; null if it isn't one. */
+export function parseAddress(text: string): Address | null {
+  const trimmed = text.trim();
+  const at = trimmed.lastIndexOf(":");
+  if (at <= 0) return null;
+  const host = trimmed.slice(0, at).replace(/^\[|\]$/g, "");
+  const port = Number(trimmed.slice(at + 1));
+  return host && Number.isInteger(port) && port >= 1 && port <= 65535 ? { host, port } : null;
+}
+
 /** An empty membership, for a device that has no workspace record yet. */
 export function noMembership(): WorkspaceState {
   return { name: "joining", roomCreation: "admins", users: {}, devices: {}, invites: {}, rooms: {} };
@@ -267,18 +276,15 @@ export async function joinWorkspace(input: {
     tlsFingerprint: input.tls.fingerprint
   });
   config.deviceId = join.body.device.id;
-  const addresses: Address[] = [
-    ...invite.peers.map((peer) => {
-      const at = peer.lastIndexOf(":");
-      return { host: peer.slice(0, at).replace(/^\[|\]$/g, ""), port: Number(peer.slice(at + 1)) };
-    }),
-    ...(input.extraPeers ?? [])
-  ];
+  const addresses: Address[] = [...invite.peers.map(parseAddress).filter((address) => address !== null), ...(input.extraPeers ?? [])];
   const errors: string[] = [];
+  // A computer that answered and still let us go refused the invite (expired, used, withdrawn), rather than being away.
+  let reached = false;
   for (const address of addresses) {
     let link: PeerLink | null = null;
     try {
       const open = (link = await dial(config, address.host, address.port));
+      reached = true;
       const chain = await new Promise<WorkspaceChain>((resolve, reject) => {
         const handshake = new JoinHandshake(open.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
         open.onMessage((message) => handshake.receive(message));
@@ -297,5 +303,5 @@ export async function joinWorkspace(input: {
       link?.channel.close("join_failed");
     }
   }
-  throw new Error(`could not join: ${errors.join("; ") || "no peer addresses"}`);
+  fail(reached ? "join_refused" : "join_unreachable", `could not join: ${errors.join("; ") || "no peer addresses"}`);
 }

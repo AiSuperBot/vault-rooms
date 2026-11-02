@@ -1,5 +1,5 @@
 import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
-import { cleanName } from "@vault-rooms/secure";
+import { cleanName, parseAddress } from "@vault-rooms/secure";
 import { PORT_SPAN, type MeshService } from "../mesh/meshService.js";
 import type VaultRoomsPlugin from "../plugin.js";
 import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
@@ -91,28 +91,34 @@ export class RoomsSettingTab extends PluginSettingTab {
     new Setting(containerEl)
       .setName("Port")
       .setDesc(`The first port other computers connect to: the first free one of it and the next ${PORT_SPAN - 1} is used${svc?.listeningPort ? ` (now ${svc.listeningPort})` : ""}, never another. Every computer needs an inbound firewall rule for Obsidian on these ports (local network only). Takes effect after restarting Obsidian.`)
-      .addText((text) =>
-        text.setValue(String(ws.port)).onChange(async (value) => {
-          const port = Number(value);
-          if (!Number.isInteger(port) || port < 1024 || port > 65535 - PORT_SPAN + 1) return;
+      .addText((text) => {
+        text.setValue(String(ws.port));
+        text.inputEl.addEventListener("change", async () => {
+          const port = Number(text.getValue().trim());
+          if (!Number.isInteger(port) || port < 1024 || port > 65535 - PORT_SPAN + 1) {
+            new Notice(`A port is a whole number from 1024 to ${65535 - PORT_SPAN + 1}. Kept ${ws.port}.`, 8000);
+            text.setValue(String(ws.port));
+            return;
+          }
           ws.port = port;
           delete ws.boundPort;
           await this.plugin.saveSettings();
-        })
-      );
+        });
+      });
 
     new Setting(containerEl)
       .setName("Computers to connect to by address")
       .setDesc("Only needed where automatic discovery doesn't reach (multicast blocked): one host:port per line.")
-      .addTextArea((text) =>
-        text.setValue(ws.peers.join("\n")).onChange(async (value) => {
-          ws.peers = value
-            .split(/\s+/)
-            .map((line) => line.trim())
-            .filter(Boolean);
+      .addTextArea((text) => {
+        text.setValue(ws.peers.join("\n"));
+        text.inputEl.addEventListener("change", async () => {
+          const lines = text.getValue().split(/\s+/).filter(Boolean);
+          const wrong = lines.filter((line) => parseAddress(line) === null);
+          if (wrong.length > 0) new Notice(`Not an address (host:port), left out: ${wrong.join(", ")}`, 8000);
+          ws.peers = lines.filter((line) => !wrong.includes(line));
           await this.plugin.saveSettings();
-        })
-      );
+        });
+      });
 
     new Setting(containerEl)
       .setName("Leave the workspace on this computer")
@@ -123,8 +129,7 @@ export class RoomsSettingTab extends PluginSettingTab {
           .setWarning()
           .onClick(async () => {
             if (!(await confirmAction(this.app, "Leave the workspace", leaveWarning(svc), "Leave"))) return;
-            await this.plugin.leaveWorkspace();
-            this.display();
+            await pendingAction(() => this.plugin.leaveWorkspace(), button, () => this.display());
           })
       );
   }

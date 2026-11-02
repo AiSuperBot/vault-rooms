@@ -153,6 +153,8 @@ export class RoomReplica {
   private waitingDocs = new Set<DocId>();
   /** When each loaded document was last used (see releaseIdle). */
   private lastUsed = new Map<DocId, number>();
+  /** This device's newest snapshot and what it holds (see snapshot): known without decrypting it. */
+  private sealed: { env: SnapshotEnvelope; contents: Y.Snapshot } | null = null;
   /** See indexNow. */
   private indexCache: { version: number; entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } | null = null;
   /** Local edits made while this device lacked the room's newest key; published as soon as it arrives. */
@@ -571,7 +573,8 @@ export class RoomReplica {
       this.events.doc?.(env.doc);
       return;
     }
-    if (this.applyEnvelope(state, env.doc, env)) this.changed(env.doc, state);
+    // Our own new snapshot coming back as it is stored: the note holds it already (it was made from it just now).
+    if (env !== this.sealed?.env && this.applyEnvelope(state, env.doc, env)) this.changed(env.doc, state);
     if (env.k === "s") {
       // A writer's snapshot does the job of ours: one per note, not one per person typing in it.
       if (this.writes(env.author)) {
@@ -843,6 +846,7 @@ export class RoomReplica {
 
   /** The Yjs snapshot (state vector and deletions) of a held snapshot envelope, or null if it can't be read. */
   private contentsOf(snapshot: SnapshotEnvelope): Y.Snapshot | null {
+    if (snapshot === this.sealed?.env) return this.sealed.contents;
     const key = this.keys.get(snapshot.n);
     if (!key) return null;
     const probe = new Y.Doc({ gc: true });
@@ -970,6 +974,8 @@ export class RoomReplica {
     }
     state.sinceSnapshot = 0;
     state.snapshotBytes = env.ct.length;
+    // What it holds is what the note holds now: its echo and compaction needn't decrypt it (a large note's is MBs).
+    this.sealed = { env, contents: Y.snapshot(state.doc) };
     if (!this.node.publish(env)) return null;
     this.compact(docId);
     return env;

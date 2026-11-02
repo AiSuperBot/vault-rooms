@@ -11,12 +11,11 @@
     "@codemirror/state": "6.5.0",
     "@codemirror/view": "6.38.6",
     "@vault-rooms/secure": "workspace:*",
-    "esbuild": "^0.25.8",
     "obsidian": "1.13.1",
     "y-codemirror.next": "0.3.5",
     "yjs": "13.6.31"
   },
   "devDependencies": {
-    "builtin-modules": "^4.0.0"
+    "esbuild": "^0.25.8"
   }
 }

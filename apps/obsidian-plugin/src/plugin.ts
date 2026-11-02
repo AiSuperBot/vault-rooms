@@ -6,7 +6,8 @@ import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
 import { adapterFiles, ObsidianVault } from "./mesh/obsidianVault.js";
 import { RoomPresence } from "./mesh/presence.js";
-import { folderProblem, normalizeNote, RoomFolder, type RoomFolderState, type RoomHealth } from "./mesh/roomFolder.js";
+import { RoomFolder, type RoomFolderState, type RoomHealth } from "./mesh/roomFolder.js";
+import { folderProblem, normalizeNote } from "./mesh/roomPaths.js";
 import { isScope, obsidianSecrets } from "./mesh/secrets.js";
 import { JoinModal } from "./ui/modals.js";
 import { ROOMS_VIEW, RoomsView } from "./ui/roomsView.js";
@@ -315,11 +316,19 @@ export default class VaultRoomsPlugin extends Plugin {
       .map(([roomId, room]) => [roomId, room.folder]);
   }
 
+  /** Room folders' keys with the "/" after them, by folder (asked for every file of every pass: a few strings, kept). */
+  private folderKeys = new Map<string, string>();
+
   /** The room whose folder holds a vault path (the innermost, if folders were ever nested), compared like the disk does. */
   private roomAt(path: string): string | null {
     const key = pathKey(path);
     let best: { roomId: string; length: number } | null = null;
-    for (const [roomId, folder] of this.roomFolders()) if (key.startsWith(`${pathKey(folder)}/`) && (!best || folder.length > best.length)) best = { roomId, length: folder.length };
+    for (const [roomId, room] of Object.entries(this.settings.mesh.workspace?.rooms ?? {})) {
+      if (room.hidden) continue;
+      let folderKey = this.folderKeys.get(room.folder);
+      if (folderKey === undefined) this.folderKeys.set(room.folder, (folderKey = `${pathKey(room.folder)}/`));
+      if (key.startsWith(folderKey) && (!best || room.folder.length > best.length)) best = { roomId, length: room.folder.length };
+    }
     return best?.roomId ?? null;
   }
 
@@ -427,6 +436,9 @@ export default class VaultRoomsPlugin extends Plugin {
     }
   }
 
+  /** Rooms this computer's user is leaving from here: no notice when access ends (see onReplica). */
+  readonly leaving = new Set<string>();
+
   /** Rooms whose new folder is being made (see onReplica). */
   private placing = new Set<string>();
 
@@ -442,7 +454,10 @@ export default class VaultRoomsPlugin extends Plugin {
       if (again) return this.onReplica(roomId, again);
       // Keep the folder assignment: if access comes back, the room returns to the same folder.
       const folder = ws.rooms[roomId]?.folder;
-      if (folder && !ws.rooms[roomId]?.hidden) new Notice(`You no longer have access to the room in "${folder}". Its files stay on this computer but no longer sync.`, 10000);
+      // Nothing to tell of a room left from here; a deleted room is said to be deleted, not taken away.
+      const deleted = svc.state.rooms[roomId]?.deleted;
+      const left = this.leaving.delete(roomId);
+      if (folder && !ws.rooms[roomId]?.hidden && !left) new Notice(`${deleted ? `The room in "${folder}" was deleted.` : `You no longer have access to the room in "${folder}".`} Its files stay on this computer but no longer sync.`, 10000);
       this.changed();
       return;
     }

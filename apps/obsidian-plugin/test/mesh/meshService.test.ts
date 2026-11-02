@@ -82,7 +82,7 @@ describe("mesh service", () => {
     const d = deps("LifecycleJoin");
     const join = vi.spyOn(secure, "joinWorkspace").mockRejectedValueOnce(new Error("unreachable"));
     try {
-      await expect(MeshService.join(d, { link, userName: "Old", deviceName: "PC" })).rejects.toThrow("unreachable");
+      await expect(MeshService.join(d, { link, userName: "Old", deviceName: "PC" })).rejects.toThrow("No computer of the workspace answered");
       // Only the attempt is saved: no active keys until the record is stored.
       expect([...d.secretValues.keys()]).toEqual([`vault-rooms-${d.settings.scope}-join`]);
       expect(d.settings.workspace).toBeNull();

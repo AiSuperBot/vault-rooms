@@ -1,4 +1,3 @@
-import { timingSafeEqual } from "node:crypto";
 import { fail } from "./errors.js";
 
 const encoder = new TextEncoder();
@@ -38,11 +37,6 @@ export function concatBytes(...parts: Uint8Array[]): Uint8Array {
     offset += part.length;
   }
   return out;
-}
-
-/** Constant time for equal lengths; different lengths are simply unequal. */
-export function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /** Unsigned 32-bit big-endian, for length prefixes in hashed or authenticated data. */
