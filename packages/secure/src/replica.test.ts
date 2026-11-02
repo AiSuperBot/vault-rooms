@@ -116,6 +116,23 @@ describe("room replica", () => {
     source.destroy(); next.destroy();
   });
 
+  it("makes one snapshot per note for everyone typing in it, not one per person", () => {
+    const s = setup();
+    const a = s.member(s.ana), c = s.member(s.cy);
+    s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+    s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "x");
+    s.net.pump();
+    const type = (n: number) => { for (let i = 0; i < n; i++) c.replica.edit(id, (doc) => doc.getText("content").insert(0, "c")); s.net.pump(); };
+    type(150);
+    const before = c.node.store.maxSnapshotSeq(s.roomId, id, s.cy.id);
+    expect(a.replica.snapshot(id)).not.toBeNull();
+    s.net.pump();
+    // Ana's snapshot counts for Cy too: Cy's next one is 200 updates after it, not after Cy's own.
+    type(90);
+    expect(c.node.store.maxSnapshotSeq(s.roomId, id, s.cy.id)).toBe(before);
+  });
+
   it("applies an independent update while another waits for its dependency", () => {
     const s = setup();
     const a = s.member(s.ana), c = s.member(s.cy);

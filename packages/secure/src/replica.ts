@@ -54,6 +54,8 @@ interface DocState {
   /** Applied updates beyond a gap, per author. */
   extra: Map<string, Set<number>>;
   sinceSnapshot: number;
+  /** The size of the newest snapshot seen of it: a large note is snapshotted less often (see publishLocal). */
+  snapshotBytes: number;
 }
 
 export interface ReplicaEvents {
@@ -121,6 +123,8 @@ function validBlobRef(value: unknown): BlobRef | undefined {
 export class RoomReplica {
   private keys = new Map<number, Uint8Array>();
   private docs = new Map<DocId, DocState>();
+  /** See docVersion. */
+  private changes = new Map<DocId, number>();
   private waiting = new Map<string, UpdateEnvelope | SnapshotEnvelope>();
   /** Local edits made while this device lacked the room's newest key; published as soon as it arrives. */
   private unsent = new Map<DocId, Uint8Array[]>();
@@ -299,6 +303,12 @@ export class RoomReplica {
     return { path, kind: entry.kind, ...(blob ? { blob } : {}), ...(isHash(entry.base) ? { base: entry.base } : {}), ...(entry.deleted === true ? { deleted: true as const } : {}) };
   }
 
+  /** Changes whenever a document may have (local or remote, deletions included, or rebuilt): a key for caches of it. */
+  docVersion(docId: DocId): number {
+    this.loadDoc(docId);
+    return this.changes.get(docId) ?? 0;
+  }
+
   /** Live index entries with a safe path. */
   files(): Map<string, FileEntry> {
     const out = new Map<string, FileEntry>();
@@ -399,14 +409,17 @@ export class RoomReplica {
     const store = this.node.store;
     const doc = new Y.Doc({ gc: true });
     // Marks: updates folded into a snapshot this device checked (and applied, below).
-    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0 };
+    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0 };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
     const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
     for (const env of [...snapshots, ...updates]) this.applyEnvelope(state, docId, env, checks);
+    for (const snapshot of snapshots) state.snapshotBytes = Math.max(state.snapshotBytes, snapshot.ct.length);
     doc.on("update", (update: Uint8Array, origin: unknown) => {
+      this.changes.set(docId, (this.changes.get(docId) ?? 0) + 1);
       if (origin !== REMOTE) this.localUpdate(docId, update);
     });
+    this.changes.set(docId, (this.changes.get(docId) ?? 0) + 1);
     if (updates.some((u) => snapshots.some((s) => u.clock <= (s.covers[u.author] ?? 0)))) this.compact(docId);
     // Clashes are looked for once the whole note is in (this computer's own saves too), and settled before it is read.
     for (const [env, bytes] of checks) quietly(() => this.clashes.check(docId, env, bytes));
@@ -478,7 +491,14 @@ export class RoomReplica {
       return;
     }
     if (this.applyEnvelope(state, env.doc, env)) this.changed(env.doc, state);
-    if (env.k === "s") this.compact(env.doc);
+    if (env.k === "s") {
+      // A writer's snapshot does the job of ours: one per note, not one per person typing in it.
+      if (this.writes(env.author)) {
+        state.sinceSnapshot = 0;
+        state.snapshotBytes = env.ct.length;
+      }
+      this.compact(env.doc);
+    }
   }
 
   private changed(docId: DocId, state: DocState): void {
@@ -536,9 +556,11 @@ export class RoomReplica {
         // A snapshot's "covers" is only its author's claim: it never counts as applied updates here.
         if (item.env.k === "u") this.markApplied(state, item.env.author, item.env.clock);
       }
-      state.sinceSnapshot += applied.length;
       const after = Y.encodeStateVector(state.doc);
-      return before.length !== after.length || before.some((byte, i) => byte !== after[i]);
+      const changed = before.length !== after.length || before.some((byte, i) => byte !== after[i]);
+      // Our own edits come back here once stored: already counted when made (see publishLocal).
+      if (changed) state.sinceSnapshot += applied.length;
+      return changed;
     } catch {
       return false; // not a valid Yjs update
     }
@@ -660,12 +682,19 @@ export class RoomReplica {
       seen.set(key, since);
       return lead || now - since >= PASS_ON_STEP_IN_MS;
     };
+    // Each author asked once while listing (the record can't change meanwhile): not once per document of 30,000.
+    const asked = new Map<string, boolean>();
+    const writer = (author: string) => {
+      let answer = asked.get(author);
+      if (answer === undefined) asked.set(author, (answer = writes(author)));
+      return answer;
+    };
     // Told by their authors alone, without going through their envelopes: most documents hold no such work.
-    const docs = store.docs(this.roomId).filter((docId) => !store.authorsOf(this.roomId, docId).every(writes) && !this.cantPassOn.has(docId) && due(`doc/${docId}`));
+    const docs = store.docs(this.roomId).filter((docId) => !store.authorsOf(this.roomId, docId).every(writer) && !this.cantPassOn.has(docId) && due(`doc/${docId}`));
     const files: Array<[string, BlobRef]> = [];
     for (const [fileId, entry] of this.files()) {
       const blob = entry.blob;
-      if (blob && !writes(blob.by) && !this.cantPassOn.has(`${fileId}/${blob.id}`) && due(`file/${fileId}/${blob.id}`)) files.push([fileId, blob]);
+      if (blob && !writer(blob.by) && !this.cantPassOn.has(`${fileId}/${blob.id}`) && due(`file/${fileId}/${blob.id}`)) files.push([fileId, blob]);
     }
     this.oldSince = seen;
     if (!this.passingOn && docs.length + files.length > 0) this.passingOn = this.passOn(docs, files, writes).finally(() => (this.passingOn = null));
@@ -806,7 +835,8 @@ export class RoomReplica {
     if (!this.node.publish(env)) fail("publish_refused");
     const state = this.docs.get(docId)!;
     this.markApplied(state, this.node.deviceId, clock);
-    if (++state.sinceSnapshot >= SNAPSHOT_EVERY) this.snapshot(docId);
+    // Every 200 edits, or for a large note one per 4 KB of its last snapshot (a 6 MB note: about 1,500 edits).
+    if (++state.sinceSnapshot >= Math.max(SNAPSHOT_EVERY, state.snapshotBytes / 4096)) this.snapshot(docId);
   }
 
   /** Change the index (create, rename, delete) as one local transaction. */
@@ -848,6 +878,7 @@ export class RoomReplica {
       return null; // too large to snapshot: the updates stay
     }
     state.sinceSnapshot = 0;
+    state.snapshotBytes = env.ct.length;
     if (!this.node.publish(env)) return null;
     this.compact(docId);
     return env;

@@ -106,6 +106,18 @@ export class EnvelopeStore {
   onMissingBlob?: () => void;
   private unreadable = new Set<string>();
   now: () => number = Date.now;
+  /** Per room, a count raised whenever what its digest or summary says may change (see roomVersion). */
+  private versions = new Map<string, number>();
+  private digests = new Map<string, { version: number; digest: string }>();
+
+  private touch(room: string): void {
+    this.versions.set(room, (this.versions.get(room) ?? 0) + 1);
+  }
+
+  /** Changes whenever the room's documents, version vectors, snapshots, blobs or dropped blobs may have: a cache key. */
+  roomVersion(room: string): number {
+    return this.versions.get(room) ?? 0;
+  }
 
   constructor(
     private readonly listener: StoreListener = {},
@@ -116,7 +128,10 @@ export class EnvelopeStore {
     let docs = this.docsByRoom.get(room);
     if (!docs) this.docsByRoom.set(room, (docs = new Map()));
     let entry = docs.get(doc);
-    if (!entry) docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {} }));
+    if (!entry) {
+      docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {} }));
+      this.touch(room);
+    }
     return entry;
   }
 
@@ -152,6 +167,7 @@ export class EnvelopeStore {
     }
     this.docBytes.set(env.room, bytes + env.ct.length);
     this.signatures.set(key, env.sig);
+    this.touch(env.room);
     this.listener.added?.(env);
     if (env.k === "s" && !member) this.compactOnClaim(env.room, env.doc, entry, env);
     return "added";
@@ -173,6 +189,7 @@ export class EnvelopeStore {
     }
     for (const kept of entry.snapshots.values()) if (kept !== snapshot && kept.author === author && vvDominates(snapshot.covers, kept.covers)) remove.push(kept);
     if (!raised && remove.length === 0) return;
+    this.touch(room);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
   }
@@ -188,6 +205,7 @@ export class EnvelopeStore {
     // Each snapshot dropped was checked to be in a kept one: never wanted again (a drop on a mere claim, in a room this
     // device only relays, is forgotten when it joins, like the claim).
     for (const env of remove) if (env.k === "s") entry.dropped[env.author] = Math.max(entry.dropped[env.author] ?? 0, env.seq);
+    this.touch(room);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
   }
@@ -213,6 +231,7 @@ export class EnvelopeStore {
     for (const [doc, entry] of this.docsByRoom.get(room) ?? []) {
       if (Object.keys(entry.claimed).length === 0) continue;
       entry.claimed = {};
+      this.touch(room);
       this.listener.docChanged?.(room, doc);
     }
   }
@@ -239,6 +258,7 @@ export class EnvelopeStore {
   /** Put saved marks back (loading from disk). */
   restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector, dropped: VersionVector = {}): void {
     const entry = this.entry(room, doc);
+    this.touch(room);
     for (const [author, clock] of Object.entries(marks)) entry.marks[author] = Math.max(entry.marks[author] ?? 0, clock);
     for (const [author, clock] of Object.entries(claimed)) entry.claimed[author] = Math.max(entry.claimed[author] ?? 0, clock);
     for (const [author, seq] of Object.entries(dropped)) entry.dropped[author] = Math.max(entry.dropped[author] ?? 0, seq);
@@ -340,6 +360,7 @@ export class EnvelopeStore {
     if (!blobs) this.blobsByRoom.set(meta.room, (blobs = new Map()));
     blobs.set(blobKeyOf(meta.author, meta.id), meta);
     this.blobBytes.set(meta.room, (this.blobBytes.get(meta.room) ?? 0) + meta.size);
+    this.touch(meta.room);
   }
 
   /** Put back a blob found on disk at startup (its ciphertext stays there). */
@@ -352,6 +373,7 @@ export class EnvelopeStore {
     let gone = this.goneByRoom.get(room);
     if (!gone) this.goneByRoom.set(room, (gone = new Map()));
     for (const [key, at] of entries) gone.set(key, at);
+    this.touch(room);
   }
 
   /** Make room for `bytes` more in a relayed room by dropping its oldest blobs. */
@@ -383,12 +405,15 @@ export class EnvelopeStore {
       gone.set(key, this.now());
       this.blobStorage.remove(meta);
     }
+    this.touch(room);
     this.listener.goneChanged?.(room);
   }
 
   /** A file needs a blob dropped earlier: forget that it is gone, so a peer can send it again. */
   undrop(room: string, key: string): void {
-    if (this.goneByRoom.get(room)?.delete(key)) this.listener.goneChanged?.(room);
+    if (!this.goneByRoom.get(room)?.delete(key)) return;
+    this.touch(room);
+    this.listener.goneChanged?.(room);
   }
 
   blob(room: string, author: string, id: string): BlobMeta | undefined {
@@ -427,12 +452,24 @@ export class EnvelopeStore {
     const gone = this.goneByRoom.get(room);
     if (!gone) return [];
     const cutoff = this.now() - STORE_LIMITS.goneMs;
-    for (const [key, at] of gone) if (at < cutoff) gone.delete(key);
+    for (const [key, at] of gone) if (at < cutoff && gone.delete(key)) this.touch(room);
     return [...gone].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   }
 
-  /** A short summary of a room's exact contents; two peers with equal digests hold the same envelopes. */
+  /**
+   * A short summary of a room's exact contents; two peers with equal digests hold the same envelopes. Cached until the
+   * room changes (see roomVersion): every peer's session asks for it.
+   */
   digest(room: string): string {
+    const version = this.roomVersion(room);
+    const cached = this.digests.get(room);
+    if (cached?.version === version) return cached.digest;
+    const digest = this.computeDigest(room);
+    this.digests.set(room, { version, digest });
+    return digest;
+  }
+
+  private computeDigest(room: string): string {
     const parts = this.docs(room).map((doc) => {
       const entry = this.docsByRoom.get(room)!.get(doc)!;
       const updates = [...entry.updates].map(([author, byClock]) => [author, [...byClock.keys()].sort((a, b) => a - b)]).sort();

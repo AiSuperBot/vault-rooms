@@ -193,6 +193,12 @@ export class RoomFolder {
   private knownPaths = new Map<string, string>();
   /** Tracked ids by pathKey (see idAt). */
   private knownKeys = new Map<string, string>();
+  /** The last desired() and the index version it was built from (see materializeNow). */
+  private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
+  /** Each note's shared text hash, and the document version it was taken at (see applyContent). */
+  private noteHashes = new Map<string, { version: number; hash: string }>();
+  /** `known` changed since it was last saved (see saveNow). */
+  private stateChanged = false;
   private expected = new Map<string, string>();
   /** Moves this folder makes (see move and movingMark), each until its rename event comes. */
   private moving = new Set<string>();
@@ -294,6 +300,8 @@ export class RoomFolder {
   }
 
   private setKnown(id: string, known: Known): void {
+    const old = this.known.get(id);
+    if (!old || JSON.stringify(old) !== JSON.stringify(known)) this.stateChanged = true;
     this.unindex(id);
     this.known.set(id, known);
     this.knownPaths.set(known.path, id);
@@ -319,7 +327,8 @@ export class RoomFolder {
   /** Stop tracking a file (gone, or no longer the room's), and whatever was held back of it. */
   private forget(id: string): void {
     this.unindex(id);
-    this.known.delete(id);
+    if (this.known.delete(id)) this.stateChanged = true;
+    this.noteHashes.delete(id);
     // An editor tied to it is tied again (to the copy shared under a new id, say), not left feeding a deleted note.
     const bound = this.o.isBound(id);
     if (this.heldBack.delete(id) || bound) this.o.heldBackChanged?.();
@@ -544,10 +553,20 @@ export class RoomFolder {
       const unstored = this.unstored(pending);
       if (!unstored) this.unstoredNow.delete(id);
       const known = this.known.get(id);
+      if (known && known.unstored !== unstored) this.stateChanged = true;
       if (known && unstored) known.unstored = unstored;
       else if (known) delete known.unstored;
     }
-    await this.o.saveState({ known: Object.fromEntries(this.known) });
+    // Written only when it changed: a room of 30,000 files is several MB of it.
+    if (this.stateChanged) {
+      this.stateChanged = false;
+      try {
+        await this.o.saveState({ known: Object.fromEntries(this.known) });
+      } catch (error) {
+        this.stateChanged = true;
+        throw error;
+      }
+    }
     await this.storeSaves();
   }
 
@@ -788,7 +807,10 @@ export class RoomFolder {
       else done = false;
     }
     const replica = this.o.replica;
-    const desired = this.desired();
+    // Built anew by a whole pass, and whenever the index changed: a pass for one note doesn't go over every file.
+    const version = replica.docVersion(INDEX_DOC);
+    if (everything || this.desiredCache?.version !== version) this.desiredCache = { version, desired: this.desired() };
+    const desired = this.desiredCache.desired;
     // Removals and renames only from a fully readable index: a gap there is never taken for a deletion.
     if (everything && replica.isComplete(INDEX_DOC)) {
       const entries = replica.entries();
@@ -810,9 +832,11 @@ export class RoomFolder {
     }
     // Whose each local name is, once the renames are done: a file still tracked as another's (whose rename or removal
     // is still to come, a file in the way being in use) is never taken for this one, nor written over.
-    const owners = new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const));
-    for (const [id, entry] of desired) {
-      if (!everything && !dirty.has(id) && !this.toKeep.has(id)) continue;
+    const owners = everything ? new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const)) : this.knownKeys;
+    // A pass for some notes goes over those only (desired is looked up, not walked).
+    const ids = everything ? desired.keys() : new Set([...dirty, ...this.toKeep.keys()].filter((id) => desired.has(id)));
+    for (const id of ids) {
+      const entry = desired.get(id)!;
       const owner = owners.get(pathKey(entry.path));
       // One that failed (a file in use, say), or must wait for another, is tried again by the next retry.
       if ((owner !== undefined && owner !== id) || !(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
@@ -938,9 +962,14 @@ export class RoomFolder {
     /** The file is as it was when last synced (by its size and time). */
     const unchanged = (stat: FileStat | null) => stat !== null && !doubtful && known?.path === entry.path && known.size === stat.size && known.mtime === stat.mtime;
     let remote: string | Uint8Array | null;
+    let noteVersion: number | undefined;
     if (entry.kind === "md") {
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
       if (!replica.isComplete(id) || replica.hasUnsent(id)) return;
+      // The shared note as it was when last synced, and the file untouched since: nothing to convert or hash.
+      noteVersion = replica.docVersion(id);
+      const hashed = this.noteHashes.get(id);
+      if (hashed?.version === noteVersion && hashed.hash === known?.hash && unchanged(this.o.vault.stat(path)) && !this.toKeep.has(id)) return;
       remote = normalizeNote(replica.noteText(id));
       // A clash copy to keep first (asked for as the note loaded, maybe): never written with both lines meanwhile.
       if (this.toKeep.has(id)) return;
@@ -951,6 +980,7 @@ export class RoomFolder {
     }
     if (remote === null) return; // the attachment hasn't arrived yet: its arrival brings a pass
     const remoteHash = sha(remote);
+    if (noteVersion !== undefined) this.noteHashes.set(id, { version: noteVersion, hash: remoteHash });
     const stat = this.o.vault.stat(path);
     if (stat && !this.fitsBeforeRead(entry.path, entry.kind === "md", id)) return;
     if (!stat) {

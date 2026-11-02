@@ -194,6 +194,8 @@ export class MeshNode {
   private answersSince = 0;
   private stopped = false;
   private resyncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** @internal Room summaries, shared by the sessions (see PeerSession.sendRoom). */
+  readonly summaries = new Map<string, { version: number; message: PeerMessage }>();
 
   constructor(
     chain: WorkspaceChain,
@@ -974,6 +976,10 @@ export class PeerSession {
 
   private sendRoom(room: string): void {
     const store = this.node.store;
+    store.gone(room); // lets go of expired entries (a change) before the cache is looked at
+    const version = store.roomVersion(room);
+    const cached = this.node.summaries.get(room);
+    if (cached?.version === version) return this.channel.send(cached.message);
     const docs: Record<string, DocSummary> = {};
     // As large as a member reads. These are hints: what is left out is sent again, never lost.
     let remaining = MAX_FRAME - (1 << 20);
@@ -994,7 +1000,13 @@ export class PeerSession {
       if (!fits({ [doc]: summary })) break;
       docs[doc] = summary;
     }
-    this.channel.send({ t: "room", room, docs, blobs });
+    const message: PeerMessage = { t: "room", room, docs, blobs };
+    // The same for every peer: built once per change of the room, for the few rooms compared last.
+    const summaries = this.node.summaries;
+    summaries.delete(room);
+    summaries.set(room, { version, message });
+    if (summaries.size > 8) summaries.delete(summaries.keys().next().value!);
+    this.channel.send(message);
   }
 
   /** Send history absent from the other side's bounded hints (omitted entries count as unknown). */

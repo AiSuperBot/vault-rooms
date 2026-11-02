@@ -107,6 +107,25 @@ describe("mesh", () => {
     }
   });
 
+  it("builds a room's summary once for every peer, and again once the room changed", () => {
+    const { chain, ana, ben, cy, roomId, seal } = setup();
+    const node = nodeFor(chain, ana);
+    node.publish(seal(ana, 1, "one"));
+    const summaries = (device: string) => {
+      const sent: PeerMessage[] = [];
+      const session = node.connect({ send: (message) => sent.push(message), close: () => {} }, device);
+      session.receive({ t: "digests", rooms: {} });
+      session.close("done");
+      return sent.find((message) => message.t === "room")!;
+    };
+    const first = summaries(cy.id);
+    expect(summaries(ben.id)).toBe(first);
+    node.publish(seal(ana, 2, "two"));
+    const next = summaries(cy.id);
+    expect(next).not.toBe(first);
+    expect(next.t === "room" && Object.values(next.docs)[0]!.vv[ana.id]).toBe(2);
+  });
+
   it("caps blob hints at the count accepted by the receiving parser", () => {
     const { chain, ana, cy, roomId } = setup();
     const source = nodeFor(chain, ana);
