@@ -82,6 +82,8 @@ export interface MeshDeps {
 
 export const DEFAULT_PORT = 47880;
 /** How many ports from WorkspaceSettings.port a device may listen on: the first free one is used. */
+/** Rooms are compared with every peer at least this often (up to twice it), see start. */
+const COMPARE_EVERY_MS = 5 * 60_000;
 export const PORT_SPAN = 10;
 /** Blobs no file uses any more are dropped after this long. */
 const BLOB_GRACE_MS = 7 * 86_400_000;
@@ -126,6 +128,8 @@ export class MeshService {
   private port = 0;
   private timers: Array<ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>> = [];
   private automateTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The next comparison of rooms with every peer (see start). */
+  private compareTimer: ReturnType<typeof setTimeout> | null = null;
   private saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private automating = false;
   private lastAutomate = 0;
@@ -338,6 +342,17 @@ export class MeshService {
     if (this.stopped) return this.abandonStart();
     const timer = setInterval(() => this.automateSoon(), 30_000);
     this.timers.push(timer);
+    // Rooms compared with every peer again now and then: a live edit a peer missed (refused for a moment, or not passed
+    // on to it because another peer said it had been sent it) comes then at the latest. Comparisons are cached, so
+    // this is cheap; the spread keeps computers from all asking at once.
+    const compare = () => {
+      this.compareTimer = setTimeout(() => {
+        if (this.stopped) return;
+        this.node.resync();
+        compare();
+      }, COMPARE_EVERY_MS * (1 + Math.random()));
+    };
+    compare();
     this.automateSoon();
     this.emit();
   }
@@ -377,6 +392,7 @@ export class MeshService {
     this.adoptFirstLink?.channel.close("stopped");
     this.adoptFirstLink = null;
     for (const timer of this.timers) clearInterval(timer as ReturnType<typeof setInterval>);
+    if (this.compareTimer) clearTimeout(this.compareTimer);
     if (this.automateTimer) clearTimeout(this.automateTimer);
     this.discovery?.stop();
     this.manager?.stop();

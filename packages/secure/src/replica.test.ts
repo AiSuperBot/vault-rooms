@@ -206,6 +206,52 @@ describe("room replica", () => {
     later.destroy();
   });
 
+  it("doesn't key a note while an edit of it couldn't be decrypted, and takes the edit in once the right key comes", () => {
+    const s = setup();
+    const a = s.member(s.ana), c = s.member(s.cy);
+    s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+    s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "first");
+    s.net.pump();
+    expect(c.replica.noteText(id)).toBe("first");
+    expect(c.replica.syncedKey(id)).toBeDefined();
+    // Cy holds a wrong key for the epoch (a rotation of hers that lost a race): Ana's next edit can't be read.
+    const right = c.replica.keyFor(1)!;
+    (c.replica as unknown as { keys: Map<number, Uint8Array> }).keys.set(1, newRoomKey());
+    a.replica.edit(id, (doc) => doc.getText("content").insert(5, " second"));
+    s.net.pump();
+    expect(c.replica.noteText(id)).toBe("first");
+    expect(c.replica.syncedKey(id)).toBeUndefined();
+    // The record backs the right key again (the wrong one is dropped, the right one wrapped for her).
+    (c.replica as unknown as { keys: Map<number, Uint8Array> }).keys.delete(1);
+    c.replica.addOwnKey(1, right);
+    expect(c.replica.noteText(id)).toBe("first second");
+    expect(c.replica.syncedKey(id)).toBe(c.replica.contentKey(id));
+     // A clash of it still being worked out (a take-out waiting for the key, say): not keyed either.
+    (c.replica as unknown as { clashes: { unsettled: Set<string> } }).clashes.unsettled.add(id);
+    expect(c.replica.syncedKey(id)).toBeUndefined();
+  });
+
+  it("fingerprints a note by its envelopes' signatures too", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    s.wrapFor(s.ana); a.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "first");
+    const store = a.node.store;
+    const [env] = store.envelopesOf(s.roomId, id).updates;
+    const key = store.fingerprint(s.roomId, id);
+    // Another envelope under the same key (an author equivocating) held instead: not the same fingerprint.
+    (store as unknown as { removeFrom(room: string, entry: unknown, envs: unknown[]): void; docsByRoom: Map<string, Map<string, unknown>> }).removeFrom(s.roomId, (store as unknown as { docsByRoom: Map<string, Map<string, unknown>> }).docsByRoom.get(s.roomId)!.get(id), [env]);
+    expect(store.add({ ...env!, sig: env!.sig.replace(/^./, (ch) => (ch === "A" ? "B" : "A")) })).toBe("added");
+    expect(store.fingerprint(s.roomId, id)).not.toBe(key);
+    // The same for a snapshot.
+    const snapshot = a.replica.snapshot(id, true)!;
+    const withSnapshot = store.fingerprint(s.roomId, id);
+    (store as unknown as { removeFrom(room: string, entry: unknown, envs: unknown[]): void }).removeFrom(s.roomId, (store as unknown as { docsByRoom: Map<string, Map<string, unknown>> }).docsByRoom.get(s.roomId)!.get(id), [snapshot]);
+    expect(store.add({ ...snapshot, sig: snapshot.sig.replace(/^./, (ch) => (ch === "A" ? "B" : "A")) })).toBe("added");
+    expect(store.fingerprint(s.roomId, id)).not.toBe(withSnapshot);
+  });
+
   it("applies an independent update while another waits for its dependency", () => {
     const s = setup();
     const a = s.member(s.ana), c = s.member(s.cy);

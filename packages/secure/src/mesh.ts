@@ -1051,7 +1051,8 @@ export class PeerSession {
     const summaries = this.node.summaries;
     summaries.delete(room);
     summaries.set(room, { version, message });
-    if (summaries.size > 8) summaries.delete(summaries.keys().next().value!);
+    // Few: each keeps its encoded frame too (see encodeFrame), up to tens of MB for a very large room.
+    if (summaries.size > 4) summaries.delete(summaries.keys().next().value!);
     this.channel.send(message);
   }
 

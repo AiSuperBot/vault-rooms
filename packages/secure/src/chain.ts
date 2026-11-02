@@ -1,4 +1,4 @@
-import { canonicalJson, freezeDeep, keepEncoding } from "./canonical.js";
+import { canonicalJson, freezeDeep, isDeeplyFrozen, keepEncoding } from "./canonical.js";
 import { fail, SecureError } from "./errors.js";
 import { activeDevice, MAX_CLOCK_SKEW_MS, roleAtLeast, roleIn, verifyGenesis, verifyNext, versionHash, type Role, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
@@ -17,7 +17,7 @@ const verifiedAgainst = new WeakMap<SignedVersion, string>();
  * encoded (see freezeDeep).
  */
 function settle(version: SignedVersion, before: SignedVersion | undefined): void {
-  if (Object.isFrozen(version)) return;
+  if (isDeeplyFrozen(version)) return;
   const state = version.body.state;
   const previous = before?.body.state;
   if (previous) {
@@ -25,7 +25,7 @@ function settle(version: SignedVersion, before: SignedVersion | undefined): void
       const records = state[kind] as Record<string, unknown>;
       const earlier = previous[kind] as Record<string, unknown>;
       for (const id of Object.keys(records)) {
-        const old = earlier[id];
+        const old = Object.hasOwn(earlier, id) ? earlier[id] : undefined;
         if (old !== undefined && old !== records[id] && canonicalJson(old) === canonicalJson(records[id])) records[id] = old;
       }
     }
