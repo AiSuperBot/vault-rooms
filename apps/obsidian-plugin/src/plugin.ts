@@ -290,10 +290,13 @@ export default class VaultRoomsPlugin extends Plugin {
   private restarting: Promise<void> | null = null;
 
   async createWorkspace(input: { workspaceName: string; userName: string; deviceName: string }): Promise<void> {
+    // Unreadable settings: a new workspace would be saved over the one they name.
+    if (this.settingsUnreadable) throw new Error(SETTINGS_UNREADABLE);
     return this.lifecycle(async () => this.startNow(await MeshService.create(this.deps(), input)));
   }
 
   async joinWorkspace(input: { link: string; userName: string; deviceName: string; peers?: string[] }): Promise<void> {
+    if (this.settingsUnreadable) throw new Error(SETTINGS_UNREADABLE);
     return this.lifecycle(async () => this.startNow(await MeshService.join(this.deps(), input)));
   }
 
