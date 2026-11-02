@@ -5,6 +5,7 @@
 // "os" is allowed: os.hostname() names this computer by default, os.networkInterfaces() lists its LAN addresses.
 //
 // Baselines are the counts of 0.3.9's bundle: lowered to what the code uses, so any new use is looked at.
+// - setTimeout( 26 -> 27: a swap's rename held a moment by another program is tried again after a pause (diskStore.ts, held).
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -13,7 +14,7 @@ import { fileURLToPath } from "node:url";
 export const TIER2_STRICT_ZERO = ["fastify", "Fastify", "ajv", "new Function", "eval(", "process.env", "node:fs", "console.log(", "console.info(", "console.trace("];
 
 export const TIER3_APPROVED_BASELINE = {
-  "setTimeout(": 26,
+  "setTimeout(": 27,
   "setInterval(": 5,
   "clearTimeout(": 25,
   "clearInterval(": 5,
