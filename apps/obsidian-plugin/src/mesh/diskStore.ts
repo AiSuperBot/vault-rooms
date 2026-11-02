@@ -209,7 +209,11 @@ export class DiskStore implements BlobStorage {
       const base = `${folder}/${segmentName(i)}`;
       let path: string | undefined;
       for (const candidate of [base, `${base}.tmp`, `${base}.old`]) if (!path && (await this.files.exists(candidate))) path = candidate;
-      if (!path) break;
+      // Missing while a later one is there (deleted from outside): written again from here, never appended after.
+      if (!path) {
+        this.chainDirtyFrom = Math.min(this.chainDirtyFrom, i);
+        break;
+      }
       if (path !== base) this.chainDirtyFrom = Math.min(this.chainDirtyFrom, i);
       let text: string;
       try {
@@ -238,7 +242,7 @@ export class DiskStore implements BlobStorage {
     }
     this.chainWritten = versions.slice();
     const before = await this.readWhole(`${this.root}/chain.json`, true);
-    if (before !== null && (before as unknown[]).length >= versions.length) {
+    if (before !== null && (before as unknown[]).length > versions.length) {
       this.chainWritten = [];
       this.chainDirtyFrom = 0;
       return (before as unknown[]).map(parseSignedVersion);

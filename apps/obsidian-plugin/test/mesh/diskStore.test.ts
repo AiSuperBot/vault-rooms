@@ -399,6 +399,14 @@ describe("disk store", () => {
     halfway.data.set("m/chain.json", JSON.stringify(all));
     halfway.data.set("m/chain/000000.jsonl", all.slice(0, 500).map((version) => `${JSON.stringify(version)}\n`).join(""));
     expect(await new DiskStore(halfway, "m").loadChain()).toHaveLength(1_052);
+    // A segment deleted from outside while a later one is there: written again from it, and read whole again.
+    const gap = new MemoryFiles();
+    await new DiskStore(gap, "m").saveChain(all);
+    gap.data.delete("m/chain/000001.jsonl");
+    const after = new DiskStore(gap, "m");
+    expect(await after.loadChain()).toHaveLength(500);
+    await after.saveChain(all);
+    expect(WorkspaceChain.load((await new DiskStore(gap, "m").loadChain())!).headHash).toBe(w.chain.headHash);
     // A segment's swap left a copy of another branch behind; a replaced branch removes it with the segment.
     files.data.set("m/chain/000002.jsonl.old", files.data.get("m/chain/000002.jsonl")!);
     const fork = new DiskStore(files, "m");
