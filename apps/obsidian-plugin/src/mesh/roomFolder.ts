@@ -1,5 +1,5 @@
 import { INDEX_DOC, isMarkdownPath, MAX_BYTES, MAX_NOTE_BYTES, pathKey, randomId, safeRoomPath, SecureError, type FileEntry, type RoomReplica } from "@vault-rooms/secure";
-import { isShareable, normalizeNote, sha, suffixed } from "./roomPaths.js";
+import { isScratch, isShareable, normalizeNote, sha, suffixed } from "./roomPaths.js";
 import { reconcileYTextByLines } from "../crdtReconcile.js";
 
 /**
@@ -39,6 +39,8 @@ export interface VaultLike {
   /** Vault paths of every file under `folder`, recursively. */
   listFiles(folder: string): string[];
   folderExists(path: string): boolean;
+  /** Remove a folder if nothing at all is in it (no file, no folder); never one that holds anything. */
+  removeEmptyFolder?(path: string): Promise<void>;
 }
 
 /**
@@ -143,6 +145,9 @@ function sameEntry(a: FileEntry | undefined, b: FileEntry): boolean {
   return a !== undefined && a.path === b.path && a.kind === b.kind && a.blob?.id === b.blob?.id && a.blob?.by === b.blob?.by;
 }
 
+/** Told when a reader adds a file. */
+const staysHere = (path: string) => `You can only read this room: "${path}" stays on this computer and isn't shared.`;
+
 function code(error: unknown): string {
   return error instanceof SecureError ? error.code : "error";
 }
@@ -161,8 +166,9 @@ export class RoomFolder {
   private blobFiles: { version: number; users: Map<string, string[]> } | null = null;
   /** The last desired() and the index version it was built from (see materializeNow). */
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
-  /** `known` changed since it was last saved (see saveNow). */
+  /** `known` changed since it was last saved (see saveNow), or only files' sizes and times did (saved at stop). */
   private stateChanged = false;
+  private statChanged = false;
   private expected = new Map<string, string>();
   /** Moves this folder makes (see move and movingMark), each until its rename event comes. */
   private moving = new Set<string>();
@@ -280,7 +286,8 @@ export class RoomFolder {
 
   private setKnown(id: string, known: Known): void {
     const old = this.known.get(id);
-    if (!old || JSON.stringify(old) !== JSON.stringify(known)) this.stateChanged = true;
+    if (!old || JSON.stringify({ ...old, size: 0, mtime: 0 }) !== JSON.stringify({ ...known, size: 0, mtime: 0 })) this.stateChanged = true;
+    else if (old.size !== known.size || old.mtime !== known.mtime) this.statChanged = true;
     this.unindex(id);
     this.known.set(id, known);
     this.knownPaths.set(known.path, id);
@@ -312,6 +319,14 @@ export class RoomFolder {
     // An editor tied to it is tied again (to the copy shared under a new id, say), not left feeding a deleted note.
     const bound = this.o.isBound(id);
     if (this.heldBack.delete(id) || bound) this.o.heldBackChanged?.();
+  }
+
+  /** A new note's entry waiting for the room key (see queuedEntries) no longer stands for a file here. */
+  private dropQueued(id: string): void {
+    const path = this.queuedEntries.get(id);
+    if (path === undefined) return;
+    this.queuedEntries.delete(id);
+    this.queuedPaths.delete(path);
   }
 
   /** Remembered in an earlier session before what was made here got stored: settled by the next pass, not by an editor. */
@@ -596,13 +611,16 @@ export class RoomFolder {
       if (known && unstored) known.unstored = unstored;
       else if (known) delete known.unstored;
     }
-    // Written only when it changed: a room of 30,000 files is several MB of it.
-    if (this.stateChanged) {
-      this.stateChanged = false;
+    // Written only when it changed: a room of 30,000 files is several MB of it. Sizes and times alone wait for stop: a
+    // stale one only makes the next start read that file again.
+    if (this.stateChanged || (this.statChanged && this.stopped)) {
+      const [state, stat] = [this.stateChanged, this.statChanged];
+      this.stateChanged = this.statChanged = false;
       try {
         await this.o.saveState({ known: Object.fromEntries(this.known) });
       } catch (error) {
-        this.stateChanged = true;
+        this.stateChanged = state;
+        this.statChanged = stat;
         throw error;
       }
     }
@@ -692,6 +710,7 @@ export class RoomFolder {
   }
 
   private notShared(relative: string, why: "type" | "size" | "name"): void {
+    if (isScratch(relative)) return;
     const reason = {
       type: "files of this type aren't shared in rooms",
       size: `it is too large to share (notes over ${MAX_NOTE_BYTES >> 20} MB, other files over ${(MAX_BYTES.b >> 20) - 1} MB)`,
@@ -718,6 +737,20 @@ export class RoomFolder {
   }
 
   // ---- writing to disk (ours, so the resulting vault events are ignored) ----
+
+  /** Folders a file was moved or trashed out of, with theirs: removed by the pass if that left them empty. */
+  private emptied = new Set<string>();
+
+  private leftFolder(relative: string): void {
+    for (let at = relative.lastIndexOf("/"); at > 0; at = relative.lastIndexOf("/", at - 1)) this.emptied.add(relative.slice(0, at));
+  }
+
+  private async removeEmptied(): Promise<void> {
+    // Deepest first, so a folder whose only content was an emptied folder goes too.
+    const folders = [...this.emptied].sort((a, b) => b.length - a.length);
+    this.emptied.clear();
+    for (const folder of folders) if (!this.stopped) await this.o.vault.removeEmptyFolder?.(this.vaultPath(folder));
+  }
 
   /** Do something to a file that its vault event will report: `mark` says what to expect, dropped if it doesn't happen. */
   private async expecting<T>(path: string, mark: string, act: () => Promise<T>, happened: (result: T) => boolean = () => true): Promise<T> {
@@ -752,6 +785,7 @@ export class RoomFolder {
   }
 
   private trash(relative: string): Promise<void> {
+    this.leftFolder(relative);
     const path = this.vaultPath(relative);
     return this.expecting(path, DELETED, () => this.o.vault.trash(path));
   }
@@ -761,6 +795,7 @@ export class RoomFolder {
    * the same pass must not make this move look like the user's (and the new file be renamed for everyone).
    */
   private async move(from: string, to: string): Promise<void> {
+    this.leftFolder(from);
     const [oldPath, newPath] = [this.vaultPath(from), this.vaultPath(to)];
     const mark = movingMark(oldPath, newPath);
     this.moving.add(mark);
@@ -854,7 +889,7 @@ export class RoomFolder {
     this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
     this.dirty = new Set();
-    this.localNames = null;
+    if (everything) this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     let done = await this.keepClashCopies();
     for (const path of [...this.retryWrites]) {
@@ -883,6 +918,7 @@ export class RoomFolder {
         }
       }
       whole = (await this.safely("renames", () => this.applyRenames(desired))) && whole;
+      await this.removeEmptied();
       // What failed (a file in use, say) is looked at again by the full pass of the next retry (see retrySoon).
       if (!whole) {
         this.retryAll = true;
@@ -903,6 +939,8 @@ export class RoomFolder {
     const now = performance.now();
     this.left = ids.length;
     for (const id of ids) {
+      // Stopped meanwhile (moved, deleted, the plugin updated): nothing more is written, least of all at the old path.
+      if (this.stopped) break;
       this.left--;
       this.reportProgress();
       const entry = desired.get(id)!;
@@ -961,7 +999,7 @@ export class RoomFolder {
       const known = this.known.get(id);
       if (known && known.path !== entry.path && this.o.vault.stat(this.vaultPath(known.path))) moves.set(id, { from: known.path, to: entry.path });
     }
-    while (moves.size > 0) {
+    while (moves.size > 0 && !this.stopped) {
       let progressed = false;
       for (const [id, { from, to }] of moves) {
         if (this.o.vault.stat(this.vaultPath(to)) && (pathKey(from) !== pathKey(to) || this.exactLocalPath(to))) continue;
@@ -1177,6 +1215,7 @@ export class RoomFolder {
     let done = true;
     this.left = paths.length;
     for (const path of paths) {
+      if (this.stopped) break;
       this.left--;
       this.reportProgress();
       if (this.o.inOtherRoom?.(path) || this.localOnly.has(path)) continue;
@@ -1329,7 +1368,7 @@ export class RoomFolder {
     // A new file here, nothing of ours: taken in, which checks its size before reading it (it may be huge). One that
     // can't be read yet (in use) is told of, and taken in by a retry.
     if (!id && !this.expected.has(vaultPath)) {
-      if (!this.o.replica.canWrite()) return this.readOnlyNotice(`You can only read this room: "${relative}" stays on this computer and isn't shared.`);
+      if (!this.o.replica.canWrite()) return this.readOnlyNotice(staysHere(relative));
       await this.createEntry(relative);
       return;
     }
@@ -1352,7 +1391,7 @@ export class RoomFolder {
     if (id && indexed?.deleted) return this.remoteChanged();
     if (!id || !entry) {
       if (this.o.replica.canWrite()) return this.createEntry(relative);
-      return this.readOnlyNotice(`You can only read this room: "${relative}" stays on this computer and isn't shared.`);
+      return this.readOnlyNotice(staysHere(relative));
     }
     // In doubt whether the others ever had what was made here last time: a pass settles it with the shared copy.
     if (this.doubtful(id)) return;
@@ -1412,9 +1451,10 @@ export class RoomFolder {
       return;
     }
     if (this.o.vault.stat(vaultPath)) return; // back already
-    const id = this.idAt(relative);
+    const id = this.idAt(relative) ?? this.queuedPaths.get(relative);
     if (!id) return;
     this.forget(id);
+    this.dropQueued(id);
     if (!this.o.replica.canWrite()) {
       this.readOnlyNotice(`You can only read this room, so "${relative}" was put back.`);
       this.dirty.add(id);
@@ -1434,7 +1474,7 @@ export class RoomFolder {
       const from = this.relative(oldVaultPath);
       const to = this.relative(newVaultPath);
       if (oldVaultPath.startsWith(this.prefix) && this.rejected.delete(oldVaultPath.slice(this.prefix.length))) this.o.healthChanged?.();
-      const id = from === null ? undefined : this.idAt(from);
+      const id = from === null ? undefined : (this.idAt(from) ?? this.queuedPaths.get(from));
       const unusable = (to === null && this.unsafeInside(newVaultPath)) || (to !== null && !isShareable(to));
       if (id && (to !== null || unusable)) {
         // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name.
@@ -1459,13 +1499,20 @@ export class RoomFolder {
         }
         const entry = this.o.replica.entry(id);
         if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, path: to! }));
-        this.setKnown(id, { ...this.known.get(id)!, path: to! });
+        if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to! });
+        else {
+          // Its entry still waits for the room key: it goes out under the new name.
+          this.queuedPaths.delete(from!);
+          this.queuedEntries.set(id, to!);
+          this.queuedPaths.set(to!, id);
+        }
         this.saveSoon();
         return;
       }
       // Moved out of the room: it leaves the room. Moved in: it joins it.
       if (id) {
         this.forget(id);
+        this.dropQueued(id);
         if (!this.o.replica.canWrite()) {
           this.dirty.add(id);
           return this.materializeNow();
@@ -1475,7 +1522,7 @@ export class RoomFolder {
         this.saveSoon();
       }
       if (to !== null && !this.idAt(to)) {
-        if (!this.o.replica.canWrite()) return this.readOnlyNotice(`You can only read this room: "${to}" stays on this computer and isn't shared.`);
+        if (!this.o.replica.canWrite()) return this.readOnlyNotice(staysHere(to));
         await this.tryLocalWrite(newVaultPath);
       }
     });

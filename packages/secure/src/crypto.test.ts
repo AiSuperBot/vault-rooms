@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { b64u, fromB64u, utf8 } from "./bytes.js";
+import { Budget } from "./mesh.js";
 import { canonicalJson, freezeDeep, keepEncoding, parseCanonical } from "./canonical.js";
 import {
   hashTagged,
@@ -69,6 +70,25 @@ describe("base64url", () => {
     expect(code(() => fromB64u("AQ", 2))).toBe("bad_length");
     // "AR" decodes to the same byte as "AQ" (unused low bits set): not canonical.
     expect(code(() => fromB64u("AR"))).toBe("bad_base64url");
+    // The same with one byte to spare, and a lone last character; every length that is canonical still reads.
+    expect(code(() => fromB64u("AAB"))).toBe("bad_base64url");
+    expect(code(() => fromB64u("AAAAA"))).toBe("bad_base64url");
+    expect(fromB64u("AAE")).toEqual(new Uint8Array([0, 1]));
+    for (let n = 0; n < 40; n++) {
+      const some = randomBytes(n);
+      expect(fromB64u(b64u(some))).toEqual(some);
+    }
+  });
+});
+
+describe("rate budgets", () => {
+  it("never go below what they held when the clock is set back", () => {
+    const budget = new Budget(2, 1000, 10_000_000);
+    expect(budget.take(10_000_000)).toBe(true);
+    // The clock goes back an hour: the one left is still there, and more come as time passes again.
+    expect(budget.take(10_000_000 - 3_600_000)).toBe(true);
+    expect(budget.take(10_000_000 - 3_600_000)).toBe(false);
+    expect(budget.take(10_000_000 - 3_599_000)).toBe(true);
   });
 });
 

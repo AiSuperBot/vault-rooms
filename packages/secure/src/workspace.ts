@@ -174,7 +174,7 @@ function parseMembers(value: unknown, field: string): Record<string, Role> {
 }
 
 /** Validates the shape of an untrusted state and returns a clean copy (no extra keys, no prototype tricks). */
-export function parseState(value: unknown): WorkspaceState {
+function parseState(value: unknown): WorkspaceState {
   const o = v.obj(value, "state", ["name", "roomCreation", "users", "devices", "invites", "rooms"]);
   const users: Record<string, UserRecord> = {};
   for (const [userId, raw] of Object.entries(v.idMap(o.users, "users", "u", LIMITS.users))) {
@@ -414,7 +414,7 @@ export function grantedRooms(state: WorkspaceState, invite: InviteRecord): Recor
  * - Users may rename themselves and revoke their own devices.
  * - Every version changes something, and per-user caps keep any one member from filling the record's tables.
  */
-export function authorize(prev: WorkspaceState, next: WorkspaceState, signer: Signer, at: number, workspaceId: string, joins: readonly JoinRecord[] = []): void {
+function authorize(prev: WorkspaceState, next: WorkspaceState, signer: Signer, at: number, workspaceId: string, joins: readonly JoinRecord[] = []): void {
   const signerUserId = signer.user;
   const admin = prev.users[signerUserId]!.admin;
   let changed = next.name !== prev.name || next.roomCreation !== prev.roomCreation;
@@ -595,10 +595,11 @@ export function nextVersion(
   const state = structuredClone(head.body.state);
   change(state);
   const at = Math.max(now, head.body.at);
-  const body: WorkspaceBody = { kind: "vr-ws-v1", ws: workspaceId, v: head.body.v + 1, prev: versionHash(head), by: deviceIdFor(deviceKey.publicKey), at, state: parseState(state) };
+  const prev = versionHash(head);
+  const body: WorkspaceBody = { kind: "vr-ws-v1", ws: workspaceId, v: head.body.v + 1, prev, by: deviceIdFor(deviceKey.publicKey), at, state: parseState(state) };
   if (joins.length > 0) body.joins = joins;
   const next = signVersion(body, deviceKey);
-  verifyNext(workspaceId, head, versionHash(head), next);
+  verifyNext(workspaceId, head, prev, next);
   return next;
 }
 

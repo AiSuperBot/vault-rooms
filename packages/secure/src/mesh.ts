@@ -128,7 +128,8 @@ function errorText(error: unknown): string {
 }
 
 /** A token bucket: `burst` at once, then one more every `everyMs`. */
-class Budget {
+/** @internal */
+export class Budget {
   private tokens: number;
   private last: number;
 
@@ -142,7 +143,7 @@ class Budget {
   }
 
   take(now: number): boolean {
-    this.tokens = Math.min(this.burst, this.tokens + (now - this.last) / this.everyMs);
+    this.tokens = Math.min(this.burst, this.tokens + Math.max(0, now - this.last) / this.everyMs);
     this.last = now;
     if (this.tokens < 1) return false;
     this.tokens--;
@@ -492,7 +493,8 @@ export class MeshNode {
     // Held already, this very envelope (same key and signature, checked when it came first): every peer of a mesh
     // passes each one on, so most copies end here, before the costly check.
     if (env.k === "p" ? this.presenceSeen(env) : this.store.holds(env)) return false;
-    if (!verifyEnvelope(this.effective(), this.workspaceId, env)) return false;
+    if (env.k === "p" && !this.isMemberOf(env.room) && !this.hasTargets(from, told)) return false;
+    if (!verifyEnvelope(this.effective(), this.workspaceId, env, !from && env.author === this.deviceId)) return false;
     if (env.k === "p") return this.presence(env, from, told);
     const result = this.store.add(env);
     if (result === "conflict") this.events.rejected?.("equivocation", env.author);
@@ -627,9 +629,17 @@ export class MeshNode {
    * Pass an envelope on to the peers that don't have it yet, saying who does (its author, who sent it, and everyone it
    * goes to now): each of them passes it on only to others. One message for all of them, encoded once.
    */
-  private push(env: Envelope, from: PeerSession | undefined, told: readonly string[] = []): void {
+  private pushTargets(from: PeerSession | undefined, told: readonly string[]): PeerSession[] {
     const known = new Set(told);
-    const targets = [...this.sessions].filter((session) => session !== from && session.ready && !known.has(session.remoteDevice));
+    return [...this.sessions].filter((session) => session !== from && session.ready && !known.has(session.remoteDevice));
+  }
+
+  private hasTargets(from: PeerSession | undefined, told: readonly string[]): boolean {
+    return this.pushTargets(from, told).length > 0;
+  }
+
+  private push(env: Envelope, from: PeerSession | undefined, told: readonly string[] = []): void {
+    const targets = this.pushTargets(from, told);
     if (targets.length === 0) return;
     const items = [...new Set([...told, env.author, ...(from ? [from.remoteDevice] : []), ...targets.map((session) => session.remoteDevice)])].slice(0, MAX_TOLD);
     const message: PeerMessage = { t: "push", env, items };
@@ -932,14 +942,14 @@ export class PeerSession {
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
       const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
-      this.send({ t: "versions", versions });
+      if (versions.length > 0) this.send({ t: "versions", versions });
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
     // Unless its hello shows it holds the same wraps already (thousands of them in a large workspace).
     if (!(Array.isArray(message.items) && message.items.includes(`wraps:${this.node.wrapsDigest()}`))) {
       const wraps = this.node.allWraps();
-      for (let i = 0; i < wraps.length; i += MAX_ITEMS) this.send({ t: "wraps", wraps: wraps.slice(i, i + MAX_ITEMS) });
+      for (const chunk of chunks(wraps, MAX_ITEMS)) this.send({ t: "wraps", wraps: chunk });
     }
     this.sendDigests();
   }
@@ -1132,8 +1142,7 @@ export class PeerSession {
 }
 
 function parseRoomSummary(raw: unknown): Map<string, DocSummary> {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw) || Object.getPrototypeOf(raw) !== Object.prototype) v.bad("room.docs");
-  const entries = Object.entries(raw as Record<string, unknown>);
+  const entries = Object.entries(v.plain(raw, "room.docs"));
   if (entries.length > 100_000) v.bad("room.docs");
   const out = new Map<string, DocSummary>();
   for (const [doc, value] of entries) {

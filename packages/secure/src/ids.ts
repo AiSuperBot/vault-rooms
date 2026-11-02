@@ -11,8 +11,17 @@ export function randomId(kind: IdKind): string {
 }
 
 /** A device id is derived from its signing key, so whoever claims an id must hold the matching key. */
+const deviceIds = new Map<string, string>();
+
 export function deviceIdFor(signingPublicKey: string): string {
-  return "d" + b64u(hashTagged("device-id", fromB64u(signingPublicKey, 32)).subarray(0, 16));
+  let id = deviceIds.get(signingPublicKey);
+  if (id === undefined) {
+    id = "d" + b64u(hashTagged("device-id", fromB64u(signingPublicKey, 32)).subarray(0, 16));
+    // shortcut: cleared whole when full; a workspace holds at most 2,000 devices.
+    if (deviceIds.size >= 10_000) deviceIds.clear();
+    deviceIds.set(signingPublicKey, id);
+  }
+  return id;
 }
 
 export function isId(value: unknown, kind: IdKind): value is string {

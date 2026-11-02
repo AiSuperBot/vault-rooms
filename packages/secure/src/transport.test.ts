@@ -260,7 +260,7 @@ describe("TLS transport", () => {
     const config: TransportConfig = { workspaceId: w.ws, deviceId: join.body.device.id, deviceKey: deeKey, tls: tlsD, membership: () => d.effective() };
     const manager = new PeerManager(d, config);
     cleanups.push(() => manager.stop());
-    manager.adopt(firstLink as PeerLink);
+    manager.accept(firstLink as PeerLink);
     await until(() => d.store.envelopesOf(w.roomId, INDEX_DOC).updates.length === 1);
     expect(a.node.effective().devices[join.body.device.id]).toBeDefined();
   });

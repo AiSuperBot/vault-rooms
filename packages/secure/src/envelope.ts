@@ -169,7 +169,8 @@ export function parseEnvelope(value: unknown): Envelope {
  * active device whose user currently has `write` in the room (any role for presence), the key epoch exists, and
  * the signature holds. A removed or downgraded writer's envelopes are refused from then on.
  */
-export function verifyEnvelope(state: WorkspaceState, workspaceId: string, env: Envelope): boolean {
+/** `sealedHere`: this device sealed it just now, so only its standing is checked, not its own signature again. */
+export function verifyEnvelope(state: WorkspaceState, workspaceId: string, env: Envelope, sealedHere = false): boolean {
   if (env.ws !== workspaceId) return false;
   const room = liveRoom(state, env.room);
   if (!room || env.n > room.epochs.length) return false;
@@ -177,6 +178,7 @@ export function verifyEnvelope(state: WorkspaceState, workspaceId: string, env: 
   if (!device) return false;
   const role = roleIn(state, env.room, device.user);
   if (!(env.k === "p" ? role !== undefined : roleAtLeast(role, "write"))) return false;
+  if (sealedHere) return true;
   const { sig, ...unsigned } = env;
   return verify(device.sign, SIG, signedBytes(unsigned as Omit<Envelope, "sig">), sig);
 }

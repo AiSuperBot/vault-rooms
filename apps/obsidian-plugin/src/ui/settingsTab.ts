@@ -6,7 +6,7 @@ import { confirmAction, CreateWorkspaceModal, JoinModal } from "./modals.js";
 import { pendingAction } from "./actions.js";
 
 /** What leaving means, with a warning when this is the only computer of the only admin. */
-export function leaveWarning(svc: MeshService | null): string {
+function leaveWarning(svc: MeshService | null): string {
   const base = "Leave on this computer? Others keep working; this computer stops syncing, and its workspace data and keys are deleted. Your files stay.";
   return svc?.isLastAdminDevice()
     ? `${base}\n\nYou are the workspace's only admin, and this is your only computer in it: after you leave, nobody can invite people, remove anyone or change the workspace's settings. Make someone else an admin first.`

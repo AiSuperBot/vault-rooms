@@ -21,10 +21,14 @@ export function b64u(bytes: Uint8Array): string {
 }
 
 /** Strict base64url: only the canonical, unpadded spelling of some byte string is accepted. */
+const B64U = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
 export function fromB64u(text: string, expectedLength?: number): Uint8Array {
   if (typeof text !== "string" || !/^[A-Za-z0-9_-]*$/.test(text)) fail("bad_base64url");
+  // Only one spelling per value: no lone last character, and no bits set past the last byte.
+  const rest = text.length % 4;
+  if (rest === 1 || (rest > 1 && B64U.indexOf(text[text.length - 1]!) & (rest === 2 ? 0xf : 0x3))) fail("bad_base64url");
   const bytes = Buffer.from(text, "base64url");
-  if (bytes.toString("base64url") !== text) fail("bad_base64url");
   if (expectedLength !== undefined && bytes.length !== expectedLength) fail("bad_length");
   return new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 }

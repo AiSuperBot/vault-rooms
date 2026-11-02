@@ -2833,3 +2833,69 @@ describe("room folder, progress told", () => {
     expect(told.at(-1)).toBe(60);
   });
 });
+
+describe("room folder, stopping and scratch files", () => {
+  it("writes nothing more once stopped, also in the middle of a pass", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    for (let i = 0; i < 40; i++) await a.vault.writeText(`Team/n${i}.md`, `note ${i}\n`);
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    let writes = 0;
+    let afterStop = 0;
+    let stopped: Promise<void> | null = null;
+    c.vault.failWrites = () => {
+      writes++;
+      if (stopped) afterStop++;
+      if (writes === 5) stopped = c.folder.stop();
+      return false;
+    };
+    await c.folder.start();
+    await stopped;
+    expect(writes).toBe(5);
+    expect(afterStop).toBe(0);
+  });
+
+  it("neither shares nor tells of Office's owner files and save temporaries", async () => {
+    const { s, a, c } = await pair({ "Report.docx": "doc" });
+    await a.vault.writeText("Team/~$port.docx", "Ana");
+    await a.vault.writeText("Team/~WRL0001.tmp", "x");
+    await s.settle();
+    expect([...c.vault.files.keys()].sort()).toEqual(["Team/Report.docx"]);
+    expect(a.notices).toEqual([]);
+    expect(a.folder.health().heldBack).toEqual([]);
+  });
+
+  it("saves a change of a file's size and time alone only with a real change, or at stop", async () => {
+    const { s, a } = await pair({ "Plan.md": "plan\n" });
+    const id = [...a.replica.files()].find(([, entry]) => entry.path === "Plan.md")![0];
+    a.bound.add(id);
+    let saves = 0;
+    const save = (a.folder as unknown as { o: { saveState: (state: RoomFolderState) => Promise<void> } }).o;
+    const original = save.saveState;
+    save.saveState = async (state) => {
+      saves++;
+      return original(state);
+    };
+    // An editor's autosaves of what is shared already: the same text, a new time. (The first drops what the note was
+    // remembered with, a real change; the next ones change times only.)
+    let first = -1;
+    for (let i = 0; i < 4; i++) {
+      if (i === 1) first = saves;
+      await a.vault.writeText("Team/Plan.md", "plan\n");
+      await a.folder.settled();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+    expect(first).toBeLessThanOrEqual(1);
+    expect(saves).toBe(first);
+    await a.folder.stop();
+    expect(saves).toBe(first + 1);
+    expect(a.saved.state!.known[id]!.mtime).toBe(a.vault.stat("Team/Plan.md")!.mtime);
+  });
+});

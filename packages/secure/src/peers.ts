@@ -65,7 +65,7 @@ export class PeerManager {
     private readonly config: TransportConfig,
     private readonly staticPeers: () => Address[] = () => [],
     private readonly events: PeerManagerEvents = {},
-    private readonly now: () => number = Date.now
+    private readonly now: () => number = () => performance.now()
   ) {
     node.addressBook = () => this.addressBook();
     node.onAddresses = (items) => this.heard(items);
@@ -103,13 +103,8 @@ export class PeerManager {
     this.maybeDial(device);
   }
 
-  /** From the server: an authenticated incoming connection. */
+  /** An authenticated connection: from the server, or made elsewhere (the one a joining device fetched the record over). */
   accept(link: PeerLink): void {
-    this.attach(link);
-  }
-
-  /** Adopt a connection made elsewhere (e.g. the one a joining device used to fetch the record). */
-  adopt(link: PeerLink): void {
     this.attach(link);
   }
 
@@ -242,7 +237,7 @@ export function parseAddress(text: string): Address | null {
 }
 
 /** An empty membership, for a device that has no workspace record yet. */
-export function noMembership(): WorkspaceState {
+function noMembership(): WorkspaceState {
   return { name: "joining", roomCreation: "admins", users: {}, devices: {}, invites: {}, rooms: {} };
 }
 

@@ -27,7 +27,17 @@ export function folderProblem(path: string, others: string[]): string | null {
   return clash === undefined ? null : `"${path}" overlaps the folder of another room ("${clash}").`;
 }
 
+/**
+ * Files only the program that has a document open keeps: Office's owner files ("~$Report.docx", naming who has it
+ * open) and save temporaries ("~WRL0001.tmp"). Shared, they would claim the document is open on every computer.
+ */
+export function isScratch(path: string): boolean {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  return name.startsWith("~$") || /^~WR[A-Z]\d+\.tmp$/i.test(name);
+}
+
 export function isShareable(path: string): boolean {
+  if (isScratch(path)) return false;
   const dot = path.lastIndexOf(".");
   return dot > path.lastIndexOf("/") + 1 && SHARED_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }

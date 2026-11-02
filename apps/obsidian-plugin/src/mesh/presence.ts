@@ -28,7 +28,7 @@ const MAX_NOTES = 1000;
 const MAX_CURSORS_PER_NOTE = 50;
 
 /** FNV-1a: stable across devices, so everyone sees the same colour for a person. */
-export function hueFor(userId: string): number {
+function hueFor(userId: string): number {
   let hash = 0x811c9dc5;
   for (let i = 0; i < userId.length; i++) {
     hash ^= userId.charCodeAt(i);

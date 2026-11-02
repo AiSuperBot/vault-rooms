@@ -105,4 +105,48 @@ describe("a room's folder on this computer", () => {
     expect(plugin.attachmentInRoom("Team/files/x.png", "x.png", "Team/Plan.md")).toBe("Team/files/x.png");
     expect(plugin.attachmentInRoom("x.png", "x.png", "Private/Plan.md")).toBe("x.png");
   });
+
+  it("gives an attachment a name no file of that folder has, whatever its case", () => {
+    const { plugin, items } = setup("Team", ["Team"]);
+    items.set("Team/Notes", Object.assign(folderAt("Team/Notes"), { children: [{ path: "Team/Notes/Scan.pdf" }] }));
+    expect(plugin.attachmentInRoom("scan.pdf", "scan.pdf", "Team/Notes/Plan.md")).toBe("Team/Notes/scan 2.pdf");
+  });
+
+  it("frees a deleted room's folder, to be shared again", async () => {
+    const { plugin } = setup("Team", ["Team"]);
+    plugin.service.replica = () => null;
+    plugin.service.state = { devices: {}, users: {}, rooms: { r1: { deleted: true, members: {} } } };
+    plugin.service.membershipEndedBy = () => undefined;
+    await plugin.onReplica("r1", null);
+    expect(plugin.settings.mesh.workspace.rooms.r1).toBeUndefined();
+  });
+});
+
+describe("the plugin's settings", () => {
+  it("are never saved over when data.json is there but can't be read, and nothing starts", async () => {
+    const app: any = { vault: { adapter: { exists: async () => true } } };
+    const plugin: any = new VaultRoomsPlugin(app, { dir: ".obsidian/plugins/vault-rooms" } as any);
+    plugin.loadData = async () => null;
+    plugin.saveData = vi.fn();
+    await plugin.loadSettings();
+    expect(plugin.settingsUnreadable).toBe(true);
+    await expect(plugin.saveSettings()).rejects.toThrow("can't be read");
+    await expect(plugin.leaveWorkspace()).rejects.toThrow("can't be read");
+    expect(plugin.saveData).not.toHaveBeenCalled();
+    // Readable again (the other program let go): read as usual on the next try.
+    plugin.loadData = async () => ({ mountRoot: "Shared", mesh: { scope: "testscope0000000", workspace: null } });
+    await plugin.loadSettings();
+    expect(plugin.settingsUnreadable).toBe(false);
+    expect(plugin.settings.mountRoot).toBe("Shared");
+  });
+
+  it("start fresh when there is no data.json yet", async () => {
+    const app: any = { vault: { adapter: { exists: async () => false } } };
+    const plugin: any = new VaultRoomsPlugin(app, { dir: ".obsidian/plugins/vault-rooms" } as any);
+    plugin.loadData = async () => null;
+    plugin.saveData = vi.fn();
+    await plugin.loadSettings();
+    expect(plugin.settingsUnreadable).toBe(false);
+    expect(plugin.saveData).toHaveBeenCalled();
+  });
 });

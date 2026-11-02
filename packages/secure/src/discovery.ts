@@ -13,8 +13,8 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
  * ever leads to a dial, which then has to pass the certificate pin and the signed exchange.
  */
 
-export const DISCOVERY_PORT = 47879;
-export const DISCOVERY_GROUP = "239.255.86.83";
+const DISCOVERY_PORT = 47879;
+const DISCOVERY_GROUP = "239.255.86.83";
 const ANNOUNCE_EVERY_MS = 15_000;
 const MAX_AGE_MS = 120_000;
 const MAX_PACKETS_PER_SECOND = 100;
@@ -62,8 +62,6 @@ export interface DiscoveryOptions {
   port(): number;
   membership(): WorkspaceState;
   onPeer(device: string, host: string, port: number): void;
-  discoveryPort?: number;
-  group?: string;
 }
 
 export class Discovery {
@@ -95,12 +93,12 @@ export class Discovery {
         resolve();
       });
       socket.on("message", (packet, rinfo) => this.onPacket(packet, rinfo.address));
-      socket.bind(this.options.discoveryPort ?? DISCOVERY_PORT, () => {
+      socket.bind(DISCOVERY_PORT, () => {
         bound = true;
         try {
           socket.setBroadcast(true);
           socket.setMulticastTTL(1);
-          socket.addMembership(this.options.group ?? DISCOVERY_GROUP);
+          socket.addMembership(DISCOVERY_GROUP);
         } catch {
           // Multicast unavailable on this network: broadcast still works.
         }
@@ -115,8 +113,7 @@ export class Discovery {
   announce(): void {
     if (!this.socket) return;
     const packet = Buffer.from(JSON.stringify(makeAnnouncement(this.options.workspaceId, this.options.deviceId, this.options.deviceKey, this.options.port())));
-    const port = this.options.discoveryPort ?? DISCOVERY_PORT;
-    for (const address of [this.options.group ?? DISCOVERY_GROUP, "255.255.255.255"]) this.socket.send(packet, port, address, () => {});
+    for (const address of [DISCOVERY_GROUP, "255.255.255.255"]) this.socket.send(packet, DISCOVERY_PORT, address, () => {});
   }
 
   private onPacket(packet: Buffer, address: string): void {
