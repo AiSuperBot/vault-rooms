@@ -112,12 +112,18 @@ const REFUSALS: Record<string, string> = {
   room_limit: "You have made as many rooms as one person may. An admin can make more.",
   invite_limit: "You have as many open invites as one person may: withdraw one first.",
   device_limit: "That person has as many computers in the workspace as one person may.",
-  invite_withdraw: "Only the person who made an invite, an admin, or a manager of all its rooms can withdraw it."
+  invite_withdraw: "Only the person who made an invite, an admin, or a manager of all its rooms can withdraw it.",
+  time_backwards: "This computer's clock is behind the workspace's last change: set the date and time right (automatically, if you can), then try again.",
+  future: "This computer's clock is ahead of the others': set the date and time right (automatically, if you can), then try again."
 };
+
+/** Rejections that mean the record moved on meanwhile (another change came first): trying again settles them. */
+const RACES = new Set(["fork", "loses", "unknown_parent", "gap", "duplicate"]);
 
 /** What a refused change means (`reason`: "forbidden:<what>:<id>", or how the record moved on meanwhile). */
 export function refusalText(reason: string): string {
-  if (!reason.startsWith("forbidden:")) return "Someone else changed the workspace at the same moment, or this computer is behind. Try again in a moment.";
+  if (RACES.has(reason)) return "Someone else changed the workspace at the same moment. Try again in a moment.";
+  if (!reason.startsWith("forbidden:")) return `The change wasn't applied (${reason}).`;
   return REFUSALS[reason.split(":")[1]!] ?? "That change isn't allowed.";
 }
 
@@ -244,8 +250,8 @@ export class MeshService {
     let invite: ReturnType<typeof parseInviteLink>;
     try {
       invite = parseInviteLink(input.link);
-    } catch (error) {
-      throw new MeshServiceError(joinText(error));
+    } catch {
+      throw new MeshServiceError(joinText({ code: "bad_invite_link" }));
     }
     let attempt = loadJoinAttempt(deps.secrets, deps.settings.scope);
     if (!attempt || attempt.join.body.ws !== invite.workspaceId || attempt.join.body.invite !== invite.inviteId) {
@@ -615,6 +621,19 @@ export class MeshService {
   }
 
   // ---- state for the UI ----
+
+  /**
+   * The device whose change of the record ended this user's membership of a room (leaving it, or a manager removing
+   * them), if one did: undefined when it ended otherwise (a deleted room keeps its members; this computer revoked).
+   */
+  membershipEndedBy(roomId: string): string | undefined {
+    const versions = this.node.chain.all();
+    for (let i = versions.length - 1; i > 0; i--) {
+      if (versions[i]!.body.state.rooms[roomId]?.members[this.settings.userId] !== undefined) return undefined;
+      if (versions[i - 1]!.body.state.rooms[roomId]?.members[this.settings.userId] !== undefined) return versions[i]!.body.by;
+    }
+    return undefined;
+  }
 
   get me(): { deviceId: string; userId: string } {
     return { deviceId: this.settings.deviceId, userId: this.settings.userId };

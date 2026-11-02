@@ -2817,3 +2817,19 @@ describe("room folder, progress", () => {
     expect(c.folder.health().syncing).toBe(0);
   });
 });
+
+describe("room folder, progress told", () => {
+  it("tells the panel the count a long pass ends with, however soon after the last time", async () => {
+    const { s, a, c, link } = await pair({ "Plan.md": "plan\n" });
+    link.cut();
+    for (let i = 0; i < 60; i++) await a.vault.writeBytes(`Team/pic ${i}.png`, new Uint8Array([i, 1, 2]));
+    await a.folder.settled();
+    const told: number[] = [];
+    (c.folder as unknown as { o: { healthChanged?: () => void } }).o.healthChanged = () => void told.push(c.folder.health().syncing);
+    // Only the index reaches Cy: the pass goes over 60 files, and ends with all 60 still to come.
+    for (const env of a.node.store.envelopesOf(s.roomId, INDEX_DOC).updates.sort((x, y) => x.clock - y.clock)) c.node.publish(env);
+    await c.folder.settled();
+    expect(c.folder.health().syncing).toBe(60);
+    expect(told.at(-1)).toBe(60);
+  });
+});

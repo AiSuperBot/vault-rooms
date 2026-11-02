@@ -436,9 +436,6 @@ export default class VaultRoomsPlugin extends Plugin {
     }
   }
 
-  /** Rooms this computer's user is leaving from here: no notice when access ends (see onReplica). */
-  readonly leaving = new Set<string>();
-
   /** Rooms whose new folder is being made (see onReplica). */
   private placing = new Set<string>();
 
@@ -455,9 +452,13 @@ export default class VaultRoomsPlugin extends Plugin {
       // Keep the folder assignment: if access comes back, the room returns to the same folder.
       const folder = ws.rooms[roomId]?.folder;
       // Nothing to tell of a room left from here; a deleted room is said to be deleted, not taken away.
-      const deleted = svc.state.rooms[roomId]?.deleted;
-      const left = this.leaving.delete(roomId);
-      if (folder && !ws.rooms[roomId]?.hidden && !left) new Notice(`${deleted ? `The room in "${folder}" was deleted.` : `You no longer have access to the room in "${folder}".`} Its files stay on this computer but no longer sync.`, 10000);
+      const by = svc.membershipEndedBy(roomId);
+      const why = svc.state.rooms[roomId]?.deleted
+        ? `The room in "${folder}" was deleted.`
+        : by !== undefined && svc.state.devices[by]?.user === svc.me.userId
+          ? `You left the room in "${folder}" from another computer of yours.`
+          : `You no longer have access to the room in "${folder}".`;
+      if (folder && !ws.rooms[roomId]?.hidden && by !== svc.me.deviceId) new Notice(`${why} Its files stay on this computer but no longer sync.`, 10000);
       this.changed();
       return;
     }

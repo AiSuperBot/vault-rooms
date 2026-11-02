@@ -300,7 +300,7 @@ export class MembersModal extends Modal {
           dropdown.selectEl.dataset.focusKey = `member:${userId}`;
           dropdown.setValue(role).onChange(async (value) => {
             // Giving up managing can't be undone by oneself: asked first (redrawn as it was if not).
-            if (userId === svc.me.userId && role === "manage" && !(await confirmAction(this.app, "Stop managing this room", "You'll no longer manage this room, and can't change that back yourself: another manager would have to.", "Change"))) return this.render();
+            if (userId === svc.me.userId && role === "manage" && !(await confirmAction(this.app, "Stop managing this room", "You'll no longer manage this room, and can't change that back yourself (being an admin doesn't let you either): another manager would have to.", "Change"))) return this.render();
             await this.run(() => svc.setMember(this.roomId, userId, value as Role));
           });
         });
@@ -360,17 +360,7 @@ export class MembersModal extends Modal {
       actions.addButton((button) => {
         button.buttonEl.dataset.focusKey = "leave";
         button.setButtonText("Leave this room").onClick(async () => {
-          if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) {
-            this.plugin.leaving.add(this.roomId);
-            await this.run(async () => {
-              try {
-                await svc.leaveRoom(this.roomId);
-              } catch (error) {
-                this.plugin.leaving.delete(this.roomId);
-                throw error;
-              }
-            });
-          }
+          if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) await this.run(() => svc.leaveRoom(this.roomId));
         });
       });
     if (iManage || svc.isAdmin()) actions.addButton((button) => {

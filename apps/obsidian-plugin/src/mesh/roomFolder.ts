@@ -228,6 +228,8 @@ export class RoomFolder {
   /** Notes whose writing waits for NOTE_WRITE_GAP_MS, and the pass that writes them. */
   private later = new Set<string>();
   private laterTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The next pass writes notes without waiting for the gap (see settled). */
+  private writeNow = false;
   /** The room index changed: the next pass looks at what changed in it, and at removals and renames. */
   private indexChanged = false;
   /** Files whose shared content isn't all here yet (part of a note can't be read, an attachment hasn't arrived). */
@@ -367,9 +369,9 @@ export class RoomFolder {
   }
 
   /** Tell the panel how many files are left (see RoomHealth.syncing): at once when that starts or ends, else once a second. */
-  private reportProgress(): void {
+  private reportProgress(final = false): void {
     const syncing = this.syncing();
-    if (syncing === this.reported || (this.reported !== 0 && syncing !== 0 && Date.now() - this.reportedAt < 1_000)) return;
+    if (syncing === this.reported || (!final && this.reported !== 0 && syncing !== 0 && Date.now() - this.reportedAt < 1_000)) return;
     this.reported = syncing;
     this.reportedAt = Date.now();
     this.o.healthChanged?.();
@@ -493,11 +495,12 @@ export class RoomFolder {
         this.materializeTimer = null;
         this.queuePass();
       }
+      // Notes waiting for the gap are written now, by a pass that doesn't make them wait again (when each was written
+      // is kept: the next change waits as it would).
       if (this.laterTimer) {
         clearTimeout(this.laterTimer);
         this.laterTimer = null;
-        this.noteWrites.clear();
-        this.writeLaterNow();
+        this.writeLaterNow(true);
       }
       if (this.deleteTimer) {
         clearTimeout(this.deleteTimer);
@@ -519,7 +522,8 @@ export class RoomFolder {
     }, wait);
   }
 
-  private writeLaterNow(): void {
+  private writeLaterNow(now = false): void {
+    this.writeNow ||= now;
     for (const id of this.later) this.dirty.add(id);
     this.later.clear();
     this.queuePass();
@@ -738,7 +742,7 @@ export class RoomFolder {
     const write = () =>
       typeof content === "string"
         ? this.o.vault.writeText(path, content, (current) => !unless?.() && (basedOn === undefined || sha(normalizeNote(current)) === basedOn))
-        : this.o.vault.writeBytes(path, content, basedOn === undefined ? undefined : (current) => sha(current) === basedOn);
+        : this.o.vault.writeBytes(path, content, (current) => !unless?.() && (basedOn === undefined || sha(current) === basedOn));
     return this.expecting(path, sha(content), write, (wrote) => wrote);
   }
 
@@ -846,9 +850,10 @@ export class RoomFolder {
     if (this.stopped || !this.started) return;
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
+    const writeNow = this.writeNow;
+    this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
     this.dirty = new Set();
-    if (everything) this.incomplete.clear();
     this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     let done = await this.keepClashCopies();
@@ -901,7 +906,7 @@ export class RoomFolder {
       this.reportProgress();
       const entry = desired.get(id)!;
       const wait = (this.noteWrites.get(id) ?? -Infinity) + NOTE_WRITE_GAP_MS - now;
-      if (wait > 0 && !everything && entry.kind === "md" && !this.toKeep.has(id)) {
+      if (wait > 0 && !writeNow && dirty.has(id) && !moved.includes(id) && entry.kind === "md" && !this.toKeep.has(id)) {
         this.writeLater(id, wait);
         continue;
       }
@@ -926,7 +931,7 @@ export class RoomFolder {
       this.o.healthChanged?.();
     }
     this.left = 0;
-    this.reportProgress();
+    this.reportProgress(true);
     if (this.noteWrites.size > 1_000) for (const [id, at] of this.noteWrites) if (now - at >= NOTE_WRITE_GAP_MS) this.noteWrites.delete(id);
     this.saveSoon();
     // Notes untouched for a while are let go (memory): loaded again when they change or are opened.
@@ -1044,7 +1049,8 @@ export class RoomFolder {
       if (known?.content === content && !replica.hasUnsent(id) && !this.toKeep.has(id) && unchanged(this.o.vault.stat(path))) return;
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
       if (!replica.isComplete(id)) {
-        this.incomplete.add(id);
+        // Waiting for a room key isn't counted as to go: the panel says the room waits for a key.
+        if (!replica.waitsForKey(id)) this.incomplete.add(id);
         return;
       }
       if (replica.hasUnsent(id)) return;
@@ -1190,7 +1196,7 @@ export class RoomFolder {
       if (this.known.size > before) track(relative);
     }
     this.left = 0;
-    this.reportProgress();
+    this.reportProgress(true);
     return done;
   }
 
