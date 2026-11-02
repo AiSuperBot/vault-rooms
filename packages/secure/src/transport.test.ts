@@ -314,7 +314,7 @@ describe("TLS transport", () => {
     await expect(joinWorkspace({ invite: { ...link, peers: [`127.0.0.1:${a.port}`] }, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_refused" });
     expect(parseAddress("[fe80::1]:47880")).toEqual({ host: "fe80::1", port: 47880 });
     expect(parseAddress(" 192.168.1.20:47880 ")).toEqual({ host: "192.168.1.20", port: 47880 });
-    for (const wrong of ["192.168.1.20", ":47880", "pc:0", "pc:65536", "pc:4.5"]) expect(parseAddress(wrong)).toBeNull();
+    for (const wrong of ["192.168.1.20", ":47880", "pc:0", "pc:65536", "pc:4.5", "fe80::1", "::1"]) expect(parseAddress(wrong)).toBeNull();
   });
 });
 

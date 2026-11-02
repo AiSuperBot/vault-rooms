@@ -234,8 +234,10 @@ export function parseAddress(text: string): Address | null {
   const trimmed = text.trim();
   const at = trimmed.lastIndexOf(":");
   if (at <= 0) return null;
-  const host = trimmed.slice(0, at).replace(/^\[|\]$/g, "");
+  const written = trimmed.slice(0, at);
+  const host = written.replace(/^\[|\]$/g, "");
   const port = Number(trimmed.slice(at + 1));
+  if (host.includes(":") && !/^\[.*\]$/.test(written)) return null;
   return host && Number.isInteger(port) && port >= 1 && port <= 65535 ? { host, port } : null;
 }
 
