@@ -276,19 +276,23 @@ export class DiskStore implements BlobStorage {
       const journals = (await this.files.list(roomFolder)).files
         .map((file) => ({ file, doc: idOfFileName(lastPart(file).replace(/\.jsonl(\.tmp|\.old)?$/, "")) }))
         .filter(({ doc }) => doc === "index" || isId(doc, "f"));
-      // Read several at once (tens of thousands of notes), then taken in one after another, in order.
-      const texts = await readAll(journals, ({ file }) => this.readJournal(file));
-      for (const [i, { file, doc }] of journals.entries()) {
-        const text = texts[i]!;
-        if (text !== null) {
-          this.addLines(store, room, doc, text);
-          continue;
+      // Read several at once (tens of thousands of notes), each batch taken in, in order, before the next is read (so
+      // only a batch, not the whole room, is in memory as text).
+      for (let at = 0; at < journals.length; at += READ_AT_ONCE) {
+        const batch = journals.slice(at, at + READ_AT_ONCE);
+        const texts = await Promise.all(batch.map(({ file }) => this.readJournal(file)));
+        for (const [i, { file, doc }] of batch.entries()) {
+          const text = texts[i]!;
+          if (text !== null) {
+            this.addLines(store, room, doc, text);
+            continue;
+          }
+          // Without it the document would look like it holds less than it does (empty, say), and a note would be written
+          // over with that: it stays incomplete until the journal is read (see RoomReplica.isComplete), tried again.
+          const key = `${room}\u0000${doc}`;
+          this.unread.set(key, [...(this.unread.get(key) ?? []), file]);
+          store.setUnreadable(room, doc, true);
         }
-        // Without it the document would look like it holds less than it does (empty, say), and a note would be written
-        // over with that: it stays incomplete until the journal is read (see RoomReplica.isComplete), tried again.
-        const key = `${room}\u0000${doc}`;
-        this.unread.set(key, [...(this.unread.get(key) ?? []), file]);
-        store.setUnreadable(room, doc, true);
       }
     }
     if (this.unread.size > 0) this.retryUnreadSoon();

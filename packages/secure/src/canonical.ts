@@ -34,6 +34,11 @@ export function freezeDeep<T>(value: T): T {
   return value;
 }
 
+/** Whether freezeDeep froze this value and all of it (Object.isFrozen tells only of the value itself). */
+export function isDeeplyFrozen(value: object): boolean {
+  return deeplyFrozen.has(value);
+}
+
 /** Keep the encoding of a deeply frozen value once it is made (a value shared widely, not each one: memory). */
 export function keepEncoding(value: object): void {
   if (deeplyFrozen.has(value)) keep.add(value);

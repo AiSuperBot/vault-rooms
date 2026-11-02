@@ -471,8 +471,9 @@ export class EnvelopeStore {
     const entry = this.docsByRoom.get(room)?.get(doc);
     if (!entry) return "";
     entry.fingerprint ??= b64u(hashTagged("doc-fingerprint", utf8(canonicalJson({
-      updates: [...entry.updates].map(([author, byClock]) => [author, [...byClock.keys()].sort((a, b) => a - b)]).sort(),
-      snapshots: [...entry.snapshots.keys()].sort()
+      // Signatures too: two different envelopes under one key (an author equivocating) never look alike.
+      updates: [...entry.updates].map(([author, byClock]) => [author, [...byClock].sort(([a], [b]) => a - b).map(([clock, env]) => [clock, env.sig])]).sort(),
+      snapshots: [...entry.snapshots].map(([key, env]) => [key, env.sig]).sort()
     })))).slice(0, 22);
     return entry.fingerprint;
   }

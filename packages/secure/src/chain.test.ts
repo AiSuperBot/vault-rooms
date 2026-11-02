@@ -36,6 +36,15 @@ describe("workspace chain", () => {
     expect(() => WorkspaceChain.load(forged)).toThrow();
   });
 
+  it("never takes an inherited property for a record, even in a version not checked yet", () => {
+    const { chain, admin } = founder();
+    const next = step(WorkspaceChain.load(chain.all()), admin, (state) => { state.name = "two"; });
+    // An own "__proto__" record, as JSON.parse makes one: offered without parsing (offer is public).
+    const raw = JSON.parse(JSON.stringify(next).replace('"users":{', '"users":{"__proto__":{},'));
+    chain.offer([raw]);
+    expect(Object.isFrozen(Object.prototype)).toBe(false);
+  });
+
   it("appends in order, ignores duplicates and refuses gaps", () => {
     const { chain, admin } = founder();
     const v1 = step(chain, admin, (state) => (state.name = "One"));

@@ -59,6 +59,11 @@ interface DocState {
   /** The store's count of envelopes added to it when it was loaded, and those taken in since (see syncedKey). */
   base: number;
   received: number;
+  /**
+   * Envelopes that couldn't be decrypted with the key held for their epoch (a key that lost a race to another, say):
+   * tried again whenever keys arrive. While any is here the text may lack what they hold (see syncedKey).
+   */
+  undecryptable: Map<string, UpdateEnvelope | SnapshotEnvelope>;
 }
 
 export interface ReplicaEvents {
@@ -145,11 +150,11 @@ export class RoomReplica {
   private changes = new Map<DocId, number>();
   private waiting = new Map<string, UpdateEnvelope | SnapshotEnvelope>();
   /** The documents with something in `waiting` (it is only ever emptied whole). */
+  private waitingDocs = new Set<DocId>();
   /** When each loaded document was last used (see releaseIdle). */
   private lastUsed = new Map<DocId, number>();
   /** See indexNow. */
   private indexCache: { version: number; entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } | null = null;
-  private waitingDocs = new Set<DocId>();
   /** Local edits made while this device lacked the room's newest key; published as soon as it arrives. */
   private unsent = new Map<DocId, Uint8Array[]>();
   /** Our own blobs sealed under a key the record no longer backs, to seal again once the right key is here. */
@@ -354,7 +359,7 @@ export class RoomReplica {
    */
   syncedKey(docId: DocId): string | undefined {
     const state = this.docs.get(docId);
-    if (!state || state.pending.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId)) return undefined;
+    if (!state || state.pending.size > 0 || state.undecryptable.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId) || this.clashes.busy(docId)) return undefined;
     if (state.base + state.received !== this.node.store.addsOf(this.roomId, docId)) return undefined;
     return this.contentKey(docId);
   }
@@ -481,7 +486,7 @@ export class RoomReplica {
     const store = this.node.store;
     const doc = new Y.Doc({ gc: true });
     // Marks: updates folded into a snapshot this device checked (and applied, below).
-    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0, base: store.addsOf(this.roomId, docId), received: 0 };
+    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0, base: store.addsOf(this.roomId, docId), received: 0, undecryptable: new Map() };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
     const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
@@ -594,7 +599,9 @@ export class RoomReplica {
     try {
       bytes = openEnvelope(env, key);
     } catch {
-      return false; // can't be decrypted with the committed key: ignore
+      // Not with the key held now: tried again when keys change (ours may have lost a race, see checkKeys).
+      state.undecryptable.set(envelopeKey(env), env);
+      return false;
     }
     try {
       // Held whole until what it builds on is in (Yjs would apply part of it). Only what depends on a missing update
@@ -670,6 +677,11 @@ export class RoomReplica {
       const state = this.docs.get(env.doc);
       if (!state) continue;
       if (this.applyEnvelope(state, env.doc, env)) touched.add(env.doc);
+    }
+    for (const [docId, state] of this.docs) {
+      const failed = [...state.undecryptable.values()];
+      state.undecryptable.clear();
+      for (const env of failed) if (this.applyEnvelope(state, docId, env)) touched.add(docId);
     }
     for (const docId of touched) this.changed(docId, this.docs.get(docId)!);
   }
