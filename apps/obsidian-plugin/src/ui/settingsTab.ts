@@ -92,17 +92,22 @@ export class RoomsSettingTab extends PluginSettingTab {
       .setName("Port")
       .setDesc(`The first port other computers connect to: the first free one of it and the next ${PORT_SPAN - 1} is used${svc?.listeningPort ? ` (now ${svc.listeningPort})` : ""}, never another. Every computer needs an inbound firewall rule for Obsidian on these ports (local network only). Takes effect after restarting Obsidian.`)
       .addText((text) => {
-        text.setValue(String(ws.port));
-        text.inputEl.addEventListener("change", async () => {
-          const port = Number(text.getValue().trim());
-          if (!Number.isInteger(port) || port < 1024 || port > 65535 - PORT_SPAN + 1) {
-            new Notice(`A port is a whole number from 1024 to ${65535 - PORT_SPAN + 1}. Kept ${ws.port}.`, 8000);
-            text.setValue(String(ws.port));
-            return;
-          }
+        const valid = (value: string) => {
+          const port = Number(value.trim());
+          return Number.isInteger(port) && port >= 1024 && port <= 65535 - PORT_SPAN + 1 ? port : null;
+        };
+        // Saved as typed (settings can close without the field losing focus); said only once the field is left.
+        text.setValue(String(ws.port)).onChange(async (value) => {
+          const port = valid(value);
+          if (port === null || port === ws.port) return;
           ws.port = port;
           delete ws.boundPort;
           await this.plugin.saveSettings();
+        });
+        text.inputEl.addEventListener("change", () => {
+          if (valid(text.getValue()) !== null) return;
+          new Notice(`A port is a whole number from 1024 to ${65535 - PORT_SPAN + 1}. Kept ${ws.port}.`, 8000);
+          text.setValue(String(ws.port));
         });
       });
 
@@ -110,13 +115,15 @@ export class RoomsSettingTab extends PluginSettingTab {
       .setName("Computers to connect to by address")
       .setDesc("Only needed where automatic discovery doesn't reach (multicast blocked): one host:port per line.")
       .addTextArea((text) => {
-        text.setValue(ws.peers.join("\n"));
-        text.inputEl.addEventListener("change", async () => {
-          const lines = text.getValue().split(/\s+/).filter(Boolean);
-          const wrong = lines.filter((line) => parseAddress(line) === null);
-          if (wrong.length > 0) new Notice(`Not an address (host:port), left out: ${wrong.join(", ")}`, 8000);
-          ws.peers = lines.filter((line) => !wrong.includes(line));
+        const lines = (value: string) => value.split(/\s+/).filter(Boolean);
+        // Saved as typed, addresses only; what isn't one is said once the field is left.
+        text.setValue(ws.peers.join("\n")).onChange(async (value) => {
+          ws.peers = lines(value).filter((line) => parseAddress(line) !== null);
           await this.plugin.saveSettings();
+        });
+        text.inputEl.addEventListener("change", () => {
+          const wrong = lines(text.getValue()).filter((line) => parseAddress(line) === null);
+          if (wrong.length > 0) new Notice(`Not an address (host:port), left out: ${wrong.join(", ")}`, 8000);
         });
       });
 

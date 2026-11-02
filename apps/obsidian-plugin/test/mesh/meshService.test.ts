@@ -83,6 +83,8 @@ describe("mesh service", () => {
     const join = vi.spyOn(secure, "joinWorkspace").mockRejectedValueOnce(new Error("unreachable"));
     try {
       await expect(MeshService.join(d, { link, userName: "Old", deviceName: "PC" })).rejects.toThrow("No computer of the workspace answered");
+      // A link cut short is said to be one, whatever part of it is missing.
+      await expect(MeshService.join(d, { link: link.slice(0, -5), userName: "Old", deviceName: "PC" })).rejects.toThrow("whole invite link");
       // Only the attempt is saved: no active keys until the record is stored.
       expect([...d.secretValues.keys()]).toEqual([`vault-rooms-${d.settings.scope}-join`]);
       expect(d.settings.workspace).toBeNull();
@@ -212,7 +214,16 @@ describe("mesh service", () => {
     expect(ana.state.rooms[roomId]!.epochs).toHaveLength(2);
     expect(ana.replica(roomId)!.sealEpoch()!.n).toBe(2);
     // Ben's device never received a wrap of the new key.
-    expect(ana.node.allWraps().some((w) => w.body.room === roomId && w.body.n === 2 && w.body.to === ben.me.deviceId)).toBe(false);
+    expect(ana.node.allWraps().some((w) => w.body.room === roomId && w.body.n === 2 && w.body.to === ben.me.deviceId)).toBe(false);    // Who ended it, from the record: Ana's computer. Then Ben, added again, leaves himself: his own.
+    expect(ben.membershipEndedBy(roomId)).toBe(ana.me.deviceId);
+    await ana.setMember(roomId, ben.me.userId, "write");
+    await until(() => ben.replica(roomId) !== null && ben.replica(roomId)!.keyFor(2) !== undefined);
+    expect(ben.membershipEndedBy(roomId)).toBeUndefined();
+    await ben.leaveRoom(roomId);
+    expect(ben.membershipEndedBy(roomId)).toBe(ben.me.deviceId);
+    await ana.deleteRoom(roomId);
+    await until(() => ben.state.rooms[roomId]?.deleted === true);
+    expect(ana.membershipEndedBy(roomId)).toBeUndefined();
   });
 
   it("stores a new room key before the others can hear of it, so Obsidian stopping right then doesn't lose it", async () => {

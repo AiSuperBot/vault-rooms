@@ -414,6 +414,11 @@ export class RoomReplica {
     return true;
   }
 
+  /** Whether part of a document waits for a room key this device doesn't have (yet). */
+  waitsForKey(docId: DocId): boolean {
+    return this.waitingDocs.has(docId) || (this.docs.get(docId)?.undecryptable.size ?? 0) > 0;
+  }
+
   /** Whether local edits of a document are waiting for the room's newest key. */
   hasUnsent(docId: DocId): boolean {
     return this.unsent.has(docId);
@@ -976,9 +981,14 @@ export class RoomReplica {
     state.snapshotBytes = env.ct.length;
     // What it holds is what the note holds now: its echo and compaction needn't decrypt it (a large note's is MBs).
     this.sealed = { env, contents: Y.snapshot(state.doc) };
-    if (!this.node.publish(env)) return null;
-    this.compact(docId);
-    return env;
+    try {
+      if (!this.node.publish(env)) return null;
+      this.compact(docId);
+      return env;
+    } finally {
+      // Only its echo and this compaction need it: not kept (a large note's is MBs).
+      this.sealed = null;
+    }
   }
 
   destroy(): void {

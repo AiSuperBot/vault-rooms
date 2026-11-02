@@ -278,13 +278,15 @@ export async function joinWorkspace(input: {
   config.deviceId = join.body.device.id;
   const addresses: Address[] = [...invite.peers.map(parseAddress).filter((address) => address !== null), ...(input.extraPeers ?? [])];
   const errors: string[] = [];
-  // A computer that answered and still let us go refused the invite (expired, used, withdrawn), rather than being away.
-  let reached = false;
+  // A computer of the workspace that answered and then let us go (the connection closed from its side) refused the
+  // invite: expired, used, withdrawn, or not known there yet. A check failing here, or no answer, isn't that.
+  let refused = false;
   for (const address of addresses) {
     let link: PeerLink | null = null;
+    let dialed = false;
     try {
       const open = (link = await dial(config, address.host, address.port));
-      reached = true;
+      dialed = true;
       const chain = await new Promise<WorkspaceChain>((resolve, reject) => {
         const handshake = new JoinHandshake(open.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
         open.onMessage((message) => handshake.receive(message));
@@ -297,11 +299,12 @@ export async function joinWorkspace(input: {
       link = null;
       return { chain, join, link: open };
     } catch (error) {
+      if (dialed && (error as Error).message === "socket_closed") refused = true;
       errors.push(`${address.host}:${address.port} ${(error as Error).message}`);
     } finally {
       // Only the connection that worked is kept (for the first session); every other is closed.
       link?.channel.close("join_failed");
     }
   }
-  fail(reached ? "join_refused" : "join_unreachable", `could not join: ${errors.join("; ") || "no peer addresses"}`);
+  fail(refused ? "join_refused" : "join_unreachable", `could not join: ${errors.join("; ") || "no peer addresses"}`);
 }

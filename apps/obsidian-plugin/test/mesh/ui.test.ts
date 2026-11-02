@@ -119,6 +119,8 @@ describe("reported UI and folder-lifecycle regressions", () => {
     expect(errorText(new SecureError("forbidden", "device_keys:d1234"))).toBe("That change isn't allowed.");
     expect(refusalText("forbidden:invite_limit:i1234")).toMatch(/open invites/);
     expect(refusalText("fork")).toMatch(/at the same moment/);
+    expect(refusalText("forbidden:time_backwards")).toMatch(/clock is behind/);
+    expect(refusalText("versions:incomplete")).toBe("The change wasn't applied (versions:incomplete).");
     let invited!: (link: string) => void;
     f.svc.createDeviceInvite.mockImplementation(() => new Promise((yes) => { invited = yes; }));
     const opened = vi.spyOn(LinkModal.prototype, "open");
