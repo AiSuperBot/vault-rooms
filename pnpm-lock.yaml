@@ -32,9 +32,6 @@ importers:
       '@vault-rooms/secure':
         specifier: workspace:*
         version: link:../../packages/secure
-      esbuild:
-        specifier: ^0.25.8
-        version: 0.25.12
       obsidian:
         specifier: 1.13.1
         version: 1.13.1(@codemirror/state@6.5.0)(@codemirror/view@6.38.6)
@@ -45,9 +42,9 @@ importers:
         specifier: 13.6.31
         version: 13.6.31
     devDependencies:
-      builtin-modules:
-        specifier: ^4.0.0
-        version: 4.0.0
+      esbuild:
+        specifier: ^0.25.8
+        version: 0.25.12
 
   packages/secure:
     dependencies:
@@ -683,10 +680,6 @@ packages:
 
   bidi-js@1.0.3:
     resolution: {integrity: sha512-RKshQI1R3YQ+n9YJz2QQ147P66ELpa1FQEg20Dk8oW9t2KgLbpDLLp9aGZ7y8WHSshDknG0bknqGw5/tyCs5tw==}
-
-  builtin-modules@4.0.0:
-    resolution: {integrity: sha512-p1n8zyCkt1BVrKNFymOHjcDSAl7oq/gUvfgULv2EblgpPVQlQr9yHnWjg9IJ2MhfwPqiYqMMrr01OY7yQoK2yA==}
-    engines: {node: '>=18.20'}
 
   cac@6.7.14:
     resolution: {integrity: sha512-b6Ilus+c3RrdDk+JhLKUAQfzzgLEPy6wcXqS7f/xe1EETvsDP6GORG7SFuOs6cID5YkqchW/LXZbX5bc8j7ZcQ==}
@@ -1549,8 +1542,6 @@ snapshots:
     dependencies:
       require-from-string: 2.0.2
     optional: true
-
-  builtin-modules@4.0.0: {}
 
   cac@6.7.14: {}
 

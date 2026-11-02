@@ -1,5 +1,5 @@
 import { App, Modal, Notice, Setting, TFolder } from "obsidian";
-import { cleanName, ROLES, roleIn, type Role } from "@vault-rooms/secure";
+import { cleanName, parseInviteLink, ROLES, roleIn, type Role } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
 import { personLabel } from "./labels.js";
 import { errorText, pendingAction } from "./actions.js";
@@ -41,12 +41,7 @@ export async function deleteRoom(plugin: VaultRoomsPlugin, roomId: string, done?
   if (!svc) return;
   const name = svc.rooms().find((room) => room.id === roomId)?.name;
   if (!(await confirmAction(plugin.app, "Delete room", `${name ? `"${name}"` : "This room"} is deleted for everyone: its files stay on every computer that has them, but stop syncing, and no one can open the room again. This can't be undone.`, "Delete"))) return;
-  try {
-    await svc.deleteRoom(roomId);
-    done?.();
-  } catch (error) {
-    new Notice(errorText(error), 8000);
-  }
+  await pendingAction(() => svc.deleteRoom(roomId), undefined, done);
 }
 
 export class CreateWorkspaceModal extends Modal {
@@ -95,7 +90,8 @@ export class JoinModal extends Modal {
       text.inputEl.rows = 3;
       text.inputEl.style.width = "100%";
     });
-    new Setting(this.contentEl).setName("Your name").setDesc("How others see you. For another computer of yours, use your usual name.").addText((text) => text.onChange((v) => (values.userName = cleanName(v))));
+    // A link for another computer of someone's own names them already.
+    new Setting(this.contentEl).setName("Your name").setDesc(this.params?.u ? "Not needed: this link adds another computer of yours." : "How others see you. Not needed for a link to add another computer of yours.").addText((text) => text.onChange((v) => (values.userName = cleanName(v))));
     new Setting(this.contentEl).setName("This computer").addText((text) => text.setValue(values.deviceName).onChange((v) => (values.deviceName = cleanName(v))));
     new Setting(this.contentEl)
       .setName("Computer address (optional)")
@@ -107,11 +103,20 @@ export class JoinModal extends Modal {
         .setButtonText("Join")
         .setCta()
         .onClick(async () => {
-          if (!values.link || !values.userName || !values.deviceName) return new Notice("Please fill in the link, your name and this computer's name.");
+          const forUser = (() => {
+            try {
+              return parseInviteLink(values.link).forUser;
+            } catch {
+              return undefined; // said by joining, below
+            }
+          })();
+          // The record keeps the name it has for that person: this one only fills the join record.
+          const userName = values.userName || (forUser ? values.deviceName : "");
+          if (!values.link || !userName || !values.deviceName) return new Notice("Please fill in the link, your name and this computer's name.");
           button.setDisabled(true);
           status.setText("Connecting…");
           try {
-            await this.plugin.joinWorkspace({ link: values.link, userName: values.userName, deviceName: values.deviceName, peers: values.address ? [values.address] : [] });
+            await this.plugin.joinWorkspace({ link: values.link, userName, deviceName: values.deviceName, peers: values.address ? [values.address] : [] });
             new Notice("Joined. Rooms shared with you appear as their keys arrive.", 8000);
             this.close();
           } catch (error) {
@@ -191,7 +196,7 @@ export class InviteModal extends Modal {
           await pendingAction(async () => {
             const link = await svc.createInvite(grants, days);
             this.close();
-            new LinkModal(this.app, "Invite link", link, `Send this link privately (not in a public channel): whoever has it can join until it is used or expires in ${days} day${days > 1 ? "s" : ""}.`).open();
+            new LinkModal(this.app, "Invite link", link, `Send this link privately (not in a public channel): whoever has it can join until it is used or expires in ${days} day${days > 1 ? "s" : ""}. Keep this computer on, with Obsidian open, until they have joined: it is the one they connect to.`).open();
           }, button);
         })
     );
@@ -212,6 +217,10 @@ export class NewRoomModal extends Modal {
       .map((folder) => folder.path)
       .filter((path) => this.plugin.folderProblem(path) === null)
       .sort();
+    if (folders.length === 0) {
+      this.contentEl.createEl("p", { text: "There is no folder to share yet. Make a folder in your vault (in the file explorer), put the notes to share in it, then come back here." });
+      return;
+    }
     const values = { folder: folders[0] ?? "", name: folders[0]?.split("/").pop() ?? "" };
     this.contentEl.createEl("p", { text: "Everything in the folder is shared, end-to-end encrypted, with the people you add. You manage the room; add people under Members afterwards." });
     let nameField: { setValue(value: string): unknown } | null = null;
@@ -290,6 +299,8 @@ export class MembersModal extends Modal {
           for (const option of ROLES) dropdown.addOption(option, ROLE_LABEL[option]);
           dropdown.selectEl.dataset.focusKey = `member:${userId}`;
           dropdown.setValue(role).onChange(async (value) => {
+            // Giving up managing can't be undone by oneself: asked first (redrawn as it was if not).
+            if (userId === svc.me.userId && role === "manage" && !(await confirmAction(this.app, "Stop managing this room", "You'll no longer manage this room, and can't change that back yourself: another manager would have to.", "Change"))) return this.render();
             await this.run(() => svc.setMember(this.roomId, userId, value as Role));
           });
         });
@@ -349,7 +360,17 @@ export class MembersModal extends Modal {
       actions.addButton((button) => {
         button.buttonEl.dataset.focusKey = "leave";
         button.setButtonText("Leave this room").onClick(async () => {
-          if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) await this.run(() => svc.leaveRoom(this.roomId));
+          if (await confirmAction(this.app, "Leave room", "You stop receiving this room. Its folder stays on this computer but no longer syncs.", "Leave")) {
+            this.plugin.leaving.add(this.roomId);
+            await this.run(async () => {
+              try {
+                await svc.leaveRoom(this.roomId);
+              } catch (error) {
+                this.plugin.leaving.delete(this.roomId);
+                throw error;
+              }
+            });
+          }
         });
       });
     if (iManage || svc.isAdmin()) actions.addButton((button) => {

@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { utf8 } from "./bytes.js";
+import { b64u, utf8 } from "./bytes.js";
+import { canonicalJson } from "./canonical.js";
+import { hashTagged } from "./crypto.js";
 import { newRoomKey } from "./keys.js";
 import { SecureError } from "./errors.js";
 import { blobId, INDEX_DOC, openEnvelope, parseEnvelope, sealBlob, sealPresence, sealSnapshot, sealUpdate, verifyEnvelope, type SealContext } from "./envelope.js";
@@ -195,10 +197,20 @@ describe("envelope store", () => {
         try { store.add(sealUpdate(ctx(writer), randomId("f"), 1, utf8("q"))); } finally { STORE_LIMITS.roomDocBytes = limit; }
       }
     ];
+    // As 0.3.8 made it, from scratch: peers on older versions compare against these very bytes.
+    const original = () => {
+      const docs = store.docs(roomId).map((d) => {
+        const byAuthor = new Map<string, number[]>();
+        for (const u of store.envelopesOf(roomId, d).updates) byAuthor.set(u.author, [...(byAuthor.get(u.author) ?? []), u.clock]);
+        return [d, [...byAuthor].map(([author, clocks]) => [author, clocks.sort((x, y) => x - y)]).sort(), store.snapshotKeys(roomId, d)];
+      });
+      return b64u(hashTagged("room-digest", utf8(canonicalJson({ docs, blobs: store.blobKeys(roomId) }))));
+    };
     for (const step of steps) {
       store.digest(roomId);
       step();
       expect(store.digest(roomId)).toBe(fresh());
+      expect(store.digest(roomId)).toBe(original());
     }
   });
 });

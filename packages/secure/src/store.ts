@@ -1,5 +1,5 @@
 import { b64u, utf8 } from "./bytes.js";
-import { canonicalJson } from "./canonical.js";
+import { canonicalJson, freezeDeep, keepEncoding } from "./canonical.js";
 import { hashTagged } from "./crypto.js";
 import { blobKeyOf, envelopeKey, type BlobEnvelope, type DocId, type SnapshotEnvelope, type StoredEnvelope, type UpdateEnvelope } from "./envelope.js";
 
@@ -25,6 +25,8 @@ interface DocEntry {
   dropped: VersionVector;
   /** See fingerprint: cleared whenever an envelope is added or removed. */
   fingerprint?: string;
+  /** Its part of the room's digest, its encoding kept (see computeDigest): cleared with the fingerprint. */
+  digestPart?: readonly unknown[];
   /** Envelopes added to it so far (see addsOf). */
   adds: number;
 }
@@ -171,7 +173,7 @@ export class EnvelopeStore {
     }
     this.docBytes.set(env.room, bytes + env.ct.length);
     this.signatures.set(key, env.sig);
-    entry.fingerprint = undefined;
+    entry.fingerprint = entry.digestPart = undefined;
     entry.adds++;
     this.touch(env.room);
     this.listener.added?.(env);
@@ -220,7 +222,7 @@ export class EnvelopeStore {
     for (const env of envs) {
       const key = envelopeKey(env);
       if (env.k === "b" || this.signatures.get(key) !== env.sig) continue;
-      entry.fingerprint = undefined;
+      entry.fingerprint = entry.digestPart = undefined;
       if (env.k === "u") {
         const byClock = entry.updates.get(env.author);
         byClock?.delete(env.clock);
@@ -505,11 +507,16 @@ export class EnvelopeStore {
     return digest;
   }
 
+  /** Each document's part is encoded once and kept until it changes: the digest of a large room is then mostly a join. */
   private computeDigest(room: string): string {
     const parts = this.docs(room).map((doc) => {
       const entry = this.docsByRoom.get(room)!.get(doc)!;
-      const updates = [...entry.updates].map(([author, byClock]) => [author, [...byClock.keys()].sort((a, b) => a - b)]).sort();
-      return [doc, updates, this.snapshotKeys(room, doc)];
+      if (!entry.digestPart) {
+        const updates = [...entry.updates].map(([author, byClock]) => [author, [...byClock.keys()].sort((a, b) => a - b)]).sort();
+        entry.digestPart = freezeDeep([doc, updates, this.snapshotKeys(room, doc)]);
+        keepEncoding(entry.digestPart);
+      }
+      return entry.digestPart;
     });
     return b64u(hashTagged("room-digest", utf8(canonicalJson({ docs: parts, blobs: this.blobKeys(room) }))));
   }

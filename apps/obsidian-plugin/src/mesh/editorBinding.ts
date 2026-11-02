@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
 import { Compartment, EditorState, Prec, Transaction, type Annotation, type Extension, type Text } from "@codemirror/state";
 import { EditorView, keymap, ViewPlugin } from "@codemirror/view";
 import * as Y from "yjs";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { reconcileYTextWithDiskText } from "../crdtReconcile.js";
 import type { AwarenessFacade, RoomPresence } from "./presence.js";
+import { sha } from "./roomPaths.js";
 
 /**
  * Live co-editing: every open editor showing a note of a room is bound to that note's shared text with
@@ -91,10 +91,6 @@ export const WHOLE_CHARACTERS: Extension = EditorState.transactionFilter.of((tr)
       ];
   return { changes, selection: tr.selection, effects: tr.effects, scrollIntoView: tr.scrollIntoView, annotations };
 });
-
-function sha(text: string): string {
-  return createHash("sha256").update(Buffer.from(text, "utf8")).digest("base64url");
-}
 
 /**
  * Whether binding an editor, which replaces what it shows with the shared text, can't lose anything: it shows the

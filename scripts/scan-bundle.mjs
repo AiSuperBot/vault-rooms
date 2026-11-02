@@ -1,20 +1,10 @@
-// Strict-zero tokens are always rejected. Dependency-owned runtime tokens use approved baselines.
-// Baselines include dependency, CRDT, storage, and LAN discovery timers.
-// Any increase requires source inspection before updating these numbers.
-// clearTimeout( 27 -> 28: CrdtDocManager.retireRoom cancels a room's pending materialize timers
-// through the injected SyncTimerHost (window timers when embedded), not a bare global.
-// globalThis 12 -> 10: CrdtDocStore now anchors its volatile cache ownership/failed-save
-// registry to the public vault adapter, preserving reload/window handoff without a global.
-// Only the previously inspected dependency-owned references remain allowed.
+// Scans the built main.js. Strict-zero tokens and modules must never appear (no file access of its own, no eval, no
+// environment). Timers, globals and fetch may appear only as often as reviewed: a changed count needs a look at the
+// source first, then the new count here with why. Required markers are security settings that must never silently
+// disappear: TLS 1.3 as the minimum version, and the channel-binding label that ties peer authentication to TLS.
+// "os" is allowed: os.hostname() names this computer by default, os.networkInterfaces() lists its LAN addresses.
 //
-// 0.3.0 (secure mesh fork; the relay, fastify and sql.js are gone):
-// - "os" is allowed: os.hostname() names this computer by default and os.networkInterfaces() lists its LAN
-//   addresses for invite links. Both are read locally and never sent anywhere else.
-// - setInterval/clearInterval 3 -> 5: per-connection heartbeats (transport.ts), discovery announcements
-//   (discovery.ts), the peer manager's redial tick (peers.ts), the service's housekeeping (meshService.ts) and
-//   presence expiry (presence.ts). Each is cleared on stop.
-// - Required markers are now security settings that must never silently disappear: TLS 1.3 as the minimum
-//   version, and the channel-binding exporter label that ties peer authentication to the TLS session.
+// Baselines are the counts of 0.3.9's bundle: lowered to what the code uses, so any new use is looked at.
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -23,13 +13,13 @@ import { fileURLToPath } from "node:url";
 export const TIER2_STRICT_ZERO = ["fastify", "Fastify", "ajv", "new Function", "eval(", "process.env", "node:fs", "console.log(", "console.info(", "console.trace("];
 
 export const TIER3_APPROVED_BASELINE = {
-  "setTimeout(": 27,
+  "setTimeout(": 26,
   "setInterval(": 5,
-  "clearTimeout(": 28,
+  "clearTimeout(": 25,
   "clearInterval(": 5,
-  "globalThis": 10,
-  "fetch(": 2,
-  "window.setTimeout": 15
+  "globalThis": 6,
+  "fetch(": 0,
+  "window.setTimeout": 5
 };
 
 export const REQUIRED_PRESENT = ["TLSv1.3", "EXPORTER-vault-rooms-peer-auth"];

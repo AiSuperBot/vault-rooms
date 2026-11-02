@@ -1,20 +1,9 @@
 import type * as Y from "yjs";
 
 /**
- * Text reconciliation (contract 1.12, blocker 2). Productionizes the Phase 0.3 spike
- * (crdtPersistenceReconcileSpike.test.ts), whose own comment flagged its diff as "sufficient to
- * prove the approach for the single-edit-region case" and recommended a real diff algorithm for
- * multi-region edits in production. This upgrades it: common-prefix/suffix trimming (unchanged from
- * the spike - it's the cheap, common case) followed by a proper LCS-based diff of the remaining
- * middle region, so two or more separately-edited regions in the same reconcile are each captured
- * as their own minimal insert/delete instead of being collapsed into one delete-everything-then-
- * insert-everything replacement of the whole middle span.
- *
- * Deliberately hand-rolled rather than adding a diff-match-patch-style dependency: this repo already
- * grew its bundle-scan surface once for yjs/y-codemirror.next (Phase 0.1), and a classic LCS diff
- * bounded by a cell-count cap (see MAX_DIFF_CELLS) is simple enough to verify correct by direct unit
- * test (including a fixed-seed fuzz test - see crdtReconcile.test.ts) without pulling in another
- * dependency to scan.
+ * Putting a note's text from disk into the shared text as small edits: the common prefix and suffix are trimmed, then
+ * the middle is diffed (LCS, by code points or by lines), capped by MAX_DIFF_CELLS (past it, the middle is replaced
+ * whole: still correct, only coarser). Hand-rolled, so the bundle carries no diff dependency; see crdtReconcile.test.ts.
  */
 
 export type DiffOp = { op: "equal" | "delete" | "insert"; text: string };

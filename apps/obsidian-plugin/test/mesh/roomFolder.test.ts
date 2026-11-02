@@ -1,9 +1,10 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
-import { keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
+import { INDEX_DOC, keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
-import { folderProblem, RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { folderProblem } from "../../src/mesh/roomPaths.js";
 import { MemoryVault } from "./memoryVault.js";
 
 interface Pc {
@@ -71,8 +72,12 @@ function setup(raeRole: "read" | "write" = "read") {
   const make = (device: TestDevice, folderPath: string, vault = new MemoryVault(), restart?: Pc): Pc => {
     restart?.replica.destroy();
     // As the plugin tells the folder (see MeshService.roomActivity): an envelope stored, for its note only (an index
-    // change or an attachment: for everything), and a key that came in.
-    const changed = (env: { k: string; doc?: string }) => pcs.get(device.id)?.folder.remoteChanged(env.k === "b" ? undefined : env.doc);
+    // change: what changed in the index; an attachment: the files using it), and a key that came in.
+    const changed = (env: { k: string; doc?: string; author?: string; id?: string }) => {
+      const folder = pcs.get(device.id)?.folder;
+      if (env.k === "b") folder?.blobArrived(`${env.author}/${env.id}`);
+      else folder?.remoteChanged(env.doc);
+    };
     const node = restart?.node ?? new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
       envelope: (env) => {
         pcs.get(device.id)?.replica.receive(env);
@@ -2384,11 +2389,11 @@ describe("room folder, rules and health", () => {
     a.vault.failWrites = (path) => path === "Team/New.md";
     await c.vault.writeText("Team/New.md", "from Cy\n");
     await s.settle();
-    expect(a.folder.health()).toEqual({ stopped: null, failing: ["New.md"], heldBack: [] });
+    expect(a.folder.health()).toEqual({ stopped: null, failing: ["New.md"], heldBack: [], syncing: 0 });
     a.vault.failWrites = undefined;
     a.folder.retryNow();
     await s.settle();
-    expect(a.folder.health()).toEqual({ stopped: null, failing: [], heldBack: [] });
+    expect(a.folder.health()).toEqual({ stopped: null, failing: [], heldBack: [], syncing: 0 });
     expect(text(a.vault, "Team/New.md")).toBe("from Cy\n");
   });
 
@@ -2706,5 +2711,109 @@ describe("room folder, renames waiting", () => {
     await s.settle();
     expect(text(a.vault, "Team/Notes.md")).toBe("base\ntyped\nfrom Cy\n");
     expect(copies(a.vault)).toEqual([]);
+  });
+});
+
+describe("room folder, everyday load", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("writes a note someone else is typing in at most every 1.5 s here, and the last text always", async () => {
+    const { s, a, c } = await pair({ "Live.md": "start\n" });
+    const id = [...a.replica.files()].find(([, entry]) => entry.path === "Live.md")![0];
+    a.bound.add(id);
+    a.replica.edit(id, (doc) => doc.getText("content").insert(0, "one\n"));
+    await s.settle();
+    expect(text(c.vault, "Team/Live.md")).toBe("one\nstart\n");
+    a.replica.edit(id, (doc) => doc.getText("content").insert(0, "two\n"));
+    s.net.pump();
+    await sleep(400);
+    // Written moments ago: the file waits, the shared note here doesn't.
+    expect(text(c.vault, "Team/Live.md")).toBe("one\nstart\n");
+    expect(c.replica.noteText(id)).toBe("two\none\nstart\n");
+    await sleep(1_400);
+    expect(text(c.vault, "Team/Live.md")).toBe("two\none\nstart\n");
+    // Settling writes what waits at once.
+    a.replica.edit(id, (doc) => doc.getText("content").insert(0, "three\n"));
+    await s.settle();
+    expect(text(c.vault, "Team/Live.md")).toBe("three\ntwo\none\nstart\n");
+  });
+
+  it("counts files whose shared content hasn't arrived yet, until it has", async () => {
+    const { s, a, c, link } = await pair({ "Plan.md": "plan\n" });
+    link.cut();
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
+    await a.folder.settled();
+    expect(c.folder.health().syncing).toBe(0);
+    // The index reaches Cy, the attachment not yet.
+    const index = a.node.store.envelopesOf(s.roomId, INDEX_DOC).updates.sort((x, y) => y.clock - x.clock)[0]!;
+    expect(c.node.publish(index)).toBe(true);
+    await c.folder.settled();
+    expect(c.folder.health().syncing).toBe(1);
+    expect(c.vault.files.has("Team/pic.png")).toBe(false);
+    s.net.link(a.node, c.node);
+    await s.settle();
+    expect(c.vault.files.has("Team/pic.png")).toBe(true);
+    expect(c.folder.health().syncing).toBe(0);
+  });
+
+  it("tells once per kind of file that stays on this computer, however many there are", async () => {
+    const { s, a } = await pair({ "Plan.md": "plan\n" });
+    for (let i = 0; i < 5; i++) await a.vault.writeText(`Team/macro ${i}.exe`, "x");
+    await s.settle();
+    expect(a.notices.filter((n) => n.includes("stays on this computer only"))).toHaveLength(1);
+    expect(a.folder.health().heldBack.filter((path) => path.endsWith(".exe"))).toHaveLength(5);
+  });
+
+  it("writes what an index change brings, and only that", async () => {
+    const { s, a, c } = await pair({ "One.md": "one\n", "Two.md": "two\n" });
+    const reads = vi.spyOn(c.vault, "stat");
+    await a.vault.writeText("Team/Three.md", "three\n");
+    await s.settle();
+    expect(text(c.vault, "Team/Three.md")).toBe("three\n");
+    // The other files aren't looked at for it (no stat of them).
+    expect(reads.mock.calls.some(([path]) => path === "Team/One.md" || path === "Team/Two.md")).toBe(false);
+    await a.vault.rename("Team/Two.md", "Team/Deux.md");
+    await s.settle();
+    expect(text(c.vault, "Team/Deux.md")).toBe("two\n");
+    expect(c.vault.files.has("Team/Two.md")).toBe(false);
+  });
+});
+
+describe("room folder, a rename heard late", () => {
+  it("writes a note renamed and changed elsewhere, when the rename is taken in after its new text", async () => {
+    const { s, a, c } = await pair({ "Old.md": "first\n" });
+    const id = [...a.replica.files()].find(([, entry]) => entry.path === "Old.md")![0];
+    // The index news doesn't reach Cy's folder at first (its history read late, say); the note's edit does.
+    const told = c.folder.remoteChanged.bind(c.folder);
+    c.folder.remoteChanged = (docId?: string) => (docId === INDEX_DOC ? undefined : told(docId));
+    await a.vault.rename("Team/Old.md", "Team/New.md");
+    await a.vault.writeText("Team/New.md", "second\n");
+    await s.settle();
+    expect(c.replica.entry(id)!.path).toBe("New.md");
+    expect(text(c.vault, "Team/Old.md")).toBe("first\n");
+    // Then it does (as a late read tells it): the file is moved, and written with its new text.
+    c.folder.remoteChanged = told;
+    c.folder.remoteChanged(INDEX_DOC);
+    await s.settle();
+    expect(c.vault.files.has("Team/Old.md")).toBe(false);
+    expect(text(c.vault, "Team/New.md")).toBe("second\n");
+  });
+});
+
+describe("room folder, progress", () => {
+  it("stops counting a file deleted before its content arrived", async () => {
+    const { s, a, c, link } = await pair({ "Plan.md": "plan\n" });
+    link.cut();
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
+    await a.folder.settled();
+    const newest = () => a.node.store.envelopesOf(s.roomId, INDEX_DOC).updates.sort((x, y) => y.clock - x.clock)[0]!;
+    c.node.publish(newest());
+    await c.folder.settled();
+    expect(c.folder.health().syncing).toBe(1);
+    await a.vault.trash("Team/pic.png");
+    await a.folder.settled();
+    c.node.publish(newest());
+    await c.folder.settled();
+    expect(c.folder.health().syncing).toBe(0);
   });
 });

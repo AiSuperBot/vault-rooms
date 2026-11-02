@@ -10,7 +10,7 @@ import { encodeFrame, FrameReader } from "./frames.js";
 import { randomId } from "./ids.js";
 import { formatInviteLink, newInvite, parseInviteLink } from "./invite.js";
 import { MeshNode } from "./mesh.js";
-import { joinWorkspace, PeerManager } from "./peers.js";
+import { joinWorkspace, parseAddress, PeerManager } from "./peers.js";
 import { createRoom, founder, invite, step } from "./testkit.js";
 import { createTlsIdentity, type TlsIdentity } from "./tlsIdentity.js";
 import { dial, PeerServer, Wire, workspaceTag, type PeerLink, type TransportConfig } from "./transport.js";
@@ -301,7 +301,20 @@ describe("TLS transport", () => {
     const b = await peer(other.chain, other.ana, other.tlsA);
     const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
     const link = { workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers: [`127.0.0.1:${b.port}`] };
-    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toThrow(/could not join/);
+    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_unreachable", message: expect.stringMatching(/could not join/) });
+  });
+
+  it("tells a link no computer answered for from one that was refused", async () => {
+    const w = await world();
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
+    const link = { workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers: ["127.0.0.1:1", "not an address", "127.0.0.1:99999"] };
+    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_unreachable" });
+    // A computer of the workspace answers, and turns away a link it doesn't know (expired, used, withdrawn).
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    await expect(joinWorkspace({ invite: { ...link, peers: [`127.0.0.1:${a.port}`] }, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_refused" });
+    expect(parseAddress("[fe80::1]:47880")).toEqual({ host: "fe80::1", port: 47880 });
+    expect(parseAddress(" 192.168.1.20:47880 ")).toEqual({ host: "192.168.1.20", port: 47880 });
+    for (const wrong of ["192.168.1.20", ":47880", "pc:0", "pc:65536", "pc:4.5"]) expect(parseAddress(wrong)).toBeNull();
   });
 });
 

@@ -1,7 +1,9 @@
 import { Notice } from "obsidian";
+import { refusalText } from "../mesh/meshService.js";
 
 export function errorText(error: unknown): string {
-  return (error instanceof Error ? error.message : String(error)).replace(/^forbidden:/, "Not allowed: ");
+  if ((error as { code?: string } | null)?.code === "forbidden") return refusalText(`forbidden:${(error as Error).message}`);
+  return error instanceof Error ? error.message : String(error);
 }
 
 type ActionButton = HTMLButtonElement | { setDisabled(disabled: boolean): unknown };

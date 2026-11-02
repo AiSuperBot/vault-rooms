@@ -18,6 +18,7 @@ import {
   newRoomKey,
   nextVersion,
   openRoomName,
+  parseAddress,
   parseInviteLink,
   PeerManager,
   PeerServer,
@@ -81,9 +82,9 @@ export interface MeshDeps {
 }
 
 export const DEFAULT_PORT = 47880;
-/** How many ports from WorkspaceSettings.port a device may listen on: the first free one is used. */
 /** Rooms are compared with every peer at least this often (up to twice it), see start. */
 const COMPARE_EVERY_MS = 5 * 60_000;
+/** How many ports from WorkspaceSettings.port a device may listen on: the first free one is used. */
 export const PORT_SPAN = 10;
 /** Blobs no file uses any more are dropped after this long. */
 const BLOB_GRACE_MS = 7 * 86_400_000;
@@ -102,6 +103,31 @@ export interface RoomInfo {
 }
 
 export class MeshServiceError extends Error {}
+
+/** Refusals of a change to the record that someone can run into, in words (the rest are bugs or tampering). */
+const REFUSALS: Record<string, string> = {
+  no_manager: "A room needs at least one manager: make someone else a manager first.",
+  settings: "Only admins can change the workspace's settings.",
+  room_create: "Only admins can share folders as rooms in this workspace.",
+  room_limit: "You have made as many rooms as one person may. An admin can make more.",
+  invite_limit: "You have as many open invites as one person may: withdraw one first.",
+  device_limit: "That person has as many computers in the workspace as one person may.",
+  invite_withdraw: "Only the person who made an invite, an admin, or a manager of all its rooms can withdraw it."
+};
+
+/** What a refused change means (`reason`: "forbidden:<what>:<id>", or how the record moved on meanwhile). */
+export function refusalText(reason: string): string {
+  if (!reason.startsWith("forbidden:")) return "Someone else changed the workspace at the same moment, or this computer is behind. Try again in a moment.";
+  return REFUSALS[reason.split(":")[1]!] ?? "That change isn't allowed.";
+}
+
+/** Why joining failed, in words (see joinWorkspace). */
+function joinText(error: unknown): string {
+  const code = (error as { code?: string }).code;
+  if (code === "bad_invite_link") return "That isn't a whole invite link. Copy the entire link again.";
+  if (code === "join_refused") return "A computer of the workspace answered but didn't accept this link: it may have expired, been used or been withdrawn, or that computer doesn't know of it yet. Try again while the person who invited you has Obsidian open, or ask them for a new link.";
+  return "No computer of the workspace answered. Make sure the person who invited you has Obsidian open on this network, or enter the address of a computer in the workspace below.";
+}
 
 /** Live rooms with a manager who has a computer that isn't revoked (`except`: as if that one were). */
 function managedRooms(state: WorkspaceState, except?: string): Set<string> {
@@ -215,7 +241,12 @@ export class MeshService {
 
   static async join(deps: MeshDeps, input: { link: string; userName: string; deviceName: string; peers?: string[] }): Promise<MeshService> {
     if (deps.settings.workspace) throw new MeshServiceError("This vault already belongs to a workspace.");
-    const invite = parseInviteLink(input.link);
+    let invite: ReturnType<typeof parseInviteLink>;
+    try {
+      invite = parseInviteLink(input.link);
+    } catch (error) {
+      throw new MeshServiceError(joinText(error));
+    }
     let attempt = loadJoinAttempt(deps.secrets, deps.settings.scope);
     if (!attempt || attempt.join.body.ws !== invite.workspaceId || attempt.join.body.invite !== invite.inviteId) {
       const { secrets } = await createDeviceSecrets();
@@ -225,12 +256,13 @@ export class MeshService {
     }
     const { secrets, join } = attempt;
     const certPem = secrets.tls.certPem;
-    const extraPeers = (input.peers ?? []).map(parseAddress).filter((a): a is { host: string; port: number } => a !== null);
+    const extraPeers = (input.peers ?? []).map(parseAddress).filter((a) => a !== null);
     let joined: Awaited<ReturnType<typeof joinWorkspace>>;
     try {
       joined = await joinWorkspace({ invite, extraPeers, join, userName: input.userName, deviceName: input.deviceName, deviceKey: secrets.sign, agreementKey: secrets.agree, tls: secrets.tls, newUserId: join.body.user.id });
     } catch (error) {
-      throw new MeshServiceError(`Couldn't reach the workspace: ${(error as Error).message}`);
+      deps.log(`join: ${String(error)}`);
+      throw new MeshServiceError(joinText(error));
     }
     try {
       const disk = MeshService.diskFor(deps, invite.workspaceId);
@@ -299,7 +331,7 @@ export class MeshService {
   async start(): Promise<void> {
     if (this.stopped) return;
     const config: TransportConfig = { workspaceId: this.settings.id, deviceId: this.settings.deviceId, deviceKey: this.secrets.sign, tls: this.secrets.tls, membership: () => this.node.effective() };
-    this.manager = new PeerManager(this.node, config, () => this.settings.peers.map(parseAddress).filter((a): a is { host: string; port: number } => a !== null), {
+    this.manager = new PeerManager(this.node, config, () => this.settings.peers.map(parseAddress).filter((a) => a !== null), {
       connected: () => this.emit(),
       disconnected: () => this.emit(),
       dialFailed: (target, reason) => this.deps.log(`dial ${target}: ${reason}`),
@@ -702,7 +734,7 @@ export class MeshService {
         }
         const version = nextVersion(this.settings.id, head, this.secrets.sign, change, Date.now(), joins);
         const result = this.node.offerVersions([version]);
-        if (result.status !== "appended") throw new MeshServiceError(`The change wasn't applied (${result.status === "rejected" ? result.reason : result.status}).`);
+        if (result.status !== "appended") throw new MeshServiceError(refusalText(result.status === "rejected" ? result.reason : result.status));
         for (const wrap of wraps) {
           if (version.body.state.rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit !== wrap.body.commit) continue;
           this.replicas.get(wrap.body.room)?.addOwnKey(wrap.body.n, keys.get(wrap.body.room)!);
@@ -1090,13 +1122,4 @@ export class MeshService {
     }
     if (refetch) this.node.resync();
   }
-}
-
-export function parseAddress(text: string): { host: string; port: number } | null {
-  const at = text.trim().lastIndexOf(":");
-  if (at <= 0) return null;
-  const host = text.trim().slice(0, at).replace(/^\[|\]$/g, "");
-  const port = Number(text.trim().slice(at + 1));
-  if (!host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
-  return { host, port };
 }

@@ -84,6 +84,8 @@ const MAX_PENDING = 2000;
 const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
+/** Every key a peer message may carry (each kind checks its own). */
+const MESSAGE_KEYS = ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"];
 const MAX_BRANCH_BYTES = 256 << 20;
 /** Devices a push may name as having it already (see MeshNode.push): more than a workspace holds. */
 const MAX_TOLD = 2000;
@@ -615,10 +617,6 @@ export class MeshNode {
     return [...this.sessions].filter((s) => s.ready).map((s) => s.remoteDevice);
   }
 
-  closeAll(reason: string): void {
-    for (const session of [...this.sessions]) session.close(reason);
-  }
-
   /** Tell every peer where the devices of the workspace can be reached (see addressBook). */
   shareAddresses(): void {
     const items = this.addressBook().slice(0, MAX_ADDRESSES);
@@ -803,7 +801,7 @@ export class PeerSession {
   }
 
   private handle(raw: unknown): void {
-    const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
+    const message = v.obj(raw, "message", MESSAGE_KEYS);
     // An answer to our hello always ends with digests: the records have been compared (see MeshNode.recordCompared).
     if (this.awaiting && message.t === "digests") {
       this.awaiting = false;
@@ -1174,7 +1172,7 @@ export class JoinHandshake {
   receive(raw: unknown): void {
     if (this.done) return;
     try {
-      const message = v.obj(raw, "message", ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"]);
+      const message = v.obj(raw, "message", MESSAGE_KEYS);
       if (message.t === "hello") {
         if (message.ws !== this.workspaceId) fail("other_workspace");
         this.targetHead = v.int(message.head, "hello.head", 0, MAX_JOIN_VERSIONS);

@@ -15,6 +15,8 @@ vi.mock("obsidian", async (original) => {
 import { LinkModal, MembersModal } from "../../src/ui/modals.js";
 import { RoomsView } from "../../src/ui/roomsView.js";
 import { errorText, pendingAction } from "../../src/ui/actions.js";
+import { refusalText } from "../../src/mesh/meshService.js";
+import { SecureError } from "@vault-rooms/secure";
 import { membershipLabels, personLabel } from "../../src/ui/labels.js";
 import VaultRoomsPlugin from "../../src/plugin.js";
 
@@ -112,7 +114,11 @@ describe("reported UI and folder-lifecycle regressions", () => {
     reject(new Error("forbidden:no access"));
     await Promise.all([first, second]);
     expect(button.disabled).toBe(false);
-    expect(errorText(new Error("forbidden:no access"))).toBe("Not allowed: no access");
+    // A refused change of the record says what was refused, in words, not its code.
+    expect(errorText(new SecureError("forbidden", "no_manager:r1234"))).toBe("A room needs at least one manager: make someone else a manager first.");
+    expect(errorText(new SecureError("forbidden", "device_keys:d1234"))).toBe("That change isn't allowed.");
+    expect(refusalText("forbidden:invite_limit:i1234")).toMatch(/open invites/);
+    expect(refusalText("fork")).toMatch(/at the same moment/);
     let invited!: (link: string) => void;
     f.svc.createDeviceInvite.mockImplementation(() => new Promise((yes) => { invited = yes; }));
     const opened = vi.spyOn(LinkModal.prototype, "open");

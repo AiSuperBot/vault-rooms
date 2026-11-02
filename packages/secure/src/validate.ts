@@ -34,14 +34,18 @@ export function str(value: unknown, field: string, maxLength: number): string {
 }
 
 /**
- * C0/C1 controls, the Unicode line/paragraph separators, and invisible characters that can make one name look like
- * another (zero-width characters, bidirectional marks, embeddings, overrides and isolates), compared by code point.
+ * C0/C1 controls and invisible characters that can make one name look like another (zero-width characters,
+ * bidirectional embeddings, overrides and isolates), compared by code point. Names of people, computers and rooms
+ * (`names`) also refuse the bidirectional marks (U+200E, U+200F, U+061C) and the line/paragraph separators. Paths
+ * don't: files have been shared under such names (marks pasted along with Hebrew or Arabic text), and refusing them
+ * now would leave those files silently unsynced on updated computers while older ones keep syncing them.
  */
-function hasControl(text: string): boolean {
+export function hasControl(text: string, names = true): boolean {
   for (const ch of text) {
     const c = ch.codePointAt(0)!;
-    if (c <= 0x1f || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029) return true;
-    if (c === 0x061c || (c >= 0x200b && c <= 0x200f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff) return true;
+    if (c <= 0x1f || (c >= 0x7f && c <= 0x9f)) return true;
+    if ((c >= 0x200b && c <= 0x200d) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2060 && c <= 0x2069) || c === 0xfeff) return true;
+    if (names && (c === 0x200e || c === 0x200f || c === 0x061c || c === 0x2028 || c === 0x2029)) return true;
   }
   return false;
 }

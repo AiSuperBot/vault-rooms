@@ -1,5 +1,5 @@
 import esbuild from "esbuild";
-import builtins from "builtin-modules";
+import { builtinModules } from "node:module";
 import { writeFile, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
@@ -25,7 +25,7 @@ const result = await esbuild.build({
   entryPoints: ["src/main.ts"],
   bundle: true,
   plugins: [lib0ShimPlugin],
-  external: ["obsidian", "electron", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr", ...builtins],
+  external: ["obsidian", "electron", "@codemirror/autocomplete", "@codemirror/collab", "@codemirror/commands", "@codemirror/language", "@codemirror/lint", "@codemirror/search", "@codemirror/state", "@codemirror/view", "@lezer/common", "@lezer/highlight", "@lezer/lr", ...builtinModules],
   format: "cjs",
   platform: "node",
   target: "es2018",
