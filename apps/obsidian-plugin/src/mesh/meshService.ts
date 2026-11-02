@@ -81,7 +81,7 @@ export interface MeshDeps {
   log(message: string): void;
 }
 
-export const DEFAULT_PORT = 47880;
+const DEFAULT_PORT = 47880;
 /** Rooms are compared with every peer at least this often (up to twice it), see start. */
 const COMPARE_EVERY_MS = 5 * 60_000;
 /** How many ports from WorkspaceSettings.port a device may listen on: the first free one is used. */
@@ -298,7 +298,7 @@ export class MeshService {
     }
   }
 
-  private adoptFirstLink: Parameters<PeerManager["adopt"]>[0] | null = null;
+  private adoptFirstLink: Parameters<PeerManager["accept"]>[0] | null = null;
 
   /** Reopen the workspace this vault belongs to (null if none). */
   static async open(deps: MeshDeps): Promise<MeshService | null> {
@@ -369,7 +369,7 @@ export class MeshService {
     this.manager.start();
     this.manager.heard(this.settings.addresses);
     if (this.adoptFirstLink) {
-      this.manager.adopt(this.adoptFirstLink);
+      this.manager.accept(this.adoptFirstLink);
       this.adoptFirstLink = null;
     }
     this.discovery = new Discovery({
@@ -443,12 +443,21 @@ export class MeshService {
       clearTimeout(timer);
       this.saveTimers.delete(key);
     }
-    await this.disk.saveChain(this.node.chain.all());
-    await this.disk.saveJoins(this.node.joinEntries());
-    await this.saveWraps();
-    await this.disk.flush();
+    let failed: unknown = null;
+    for (const step of [() => this.disk.saveChain(this.node.chain.all()), () => this.disk.saveJoins(this.node.joinEntries()), () => this.saveWraps(), () => this.disk.flush()]) {
+      try {
+        await step();
+      } catch (error) {
+        failed ??= error;
+      }
+    }
     for (const replica of this.replicas.values()) replica.destroy();
     this.replicas.clear();
+    if (failed !== null) {
+      // Nothing more is written later by this instance: the next one may be using the files already.
+      this.disk.discard();
+      throw failed;
+    }
   }
 
   /** Leave on this device: stop, and delete the workspace data and this device's keys. */
@@ -763,7 +772,12 @@ export class MeshService {
           this.replicas.get(wrap.body.room)?.addOwnKey(wrap.body.n, keys.get(wrap.body.room)!);
           this.node.addWrap(wrap);
         }
-        await this.disk.saveChain(this.node.chain.all());
+        try {
+          await this.disk.saveChain(this.node.chain.all());
+        } catch (error) {
+          this.deps.log(`record: ${String(error)}`);
+          this.saveSoon("chain", () => this.disk.saveChain(this.node.chain.all()));
+        }
         return version;
       }
     } finally {
@@ -865,23 +879,21 @@ export class MeshService {
 
   /** Revoke a device, and withdraw the open invites it made. */
   async revokeDevice(deviceId: string): Promise<void> {
-    const pending = await this.recordFirst((join) => join.body.device.id === deviceId);
-    await this.commit((state) => {
-      const device = state.devices[deviceId];
-      if (device) device.revoked = true;
-      for (const inviteId of pending) if (state.invites[inviteId]?.used === undefined) delete state.invites[inviteId];
-      for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.dev === deviceId && invite.used === undefined) delete state.invites[inviteId];
-    });
+    await this.shutOut((join) => join.body.device.id === deviceId, (state) => void (state.devices[deviceId] && (state.devices[deviceId]!.revoked = true)), (invite) => invite.dev === deviceId);
   }
 
   /** Remove a person, and withdraw the open invites they made. */
   async removeUser(userId: string): Promise<void> {
-    const pending = await this.recordFirst((join) => join.body.user.id === userId);
+    await this.shutOut((join) => join.body.user.id === userId, (state) => void (state.users[userId] && (state.users[userId]!.removed = true)), (invite) => invite.by === userId);
+  }
+
+  /** Shut a computer or person out (`mark`), with their joins recorded first, and the open invites `made` by them withdrawn. */
+  private async shutOut(joined: (join: JoinRecord) => boolean, mark: (state: WorkspaceState) => void, made: (invite: WorkspaceState["invites"][string]) => boolean): Promise<void> {
+    const pending = await this.recordFirst(joined);
     await this.commit((state) => {
-      const user = state.users[userId];
-      if (user) user.removed = true;
+      mark(state);
       for (const inviteId of pending) if (state.invites[inviteId]?.used === undefined) delete state.invites[inviteId];
-      for (const [inviteId, invite] of Object.entries(state.invites)) if (invite.by === userId && invite.used === undefined) delete state.invites[inviteId];
+      for (const [inviteId, invite] of Object.entries(state.invites)) if (made(invite) && invite.used === undefined) delete state.invites[inviteId];
     });
   }
 

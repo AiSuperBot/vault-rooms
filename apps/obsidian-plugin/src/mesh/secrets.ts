@@ -1,4 +1,4 @@
-import { agreementKeyPairFromSecret, createTlsIdentity, fingerprintOfPem, fromB64u, parseJoinRecord, signingKeyPairFromSeed, type JoinRecord, type KeyPair, type TlsIdentity } from "@vault-rooms/secure";
+import { agreementKeyPairFromSecret, createTlsIdentity, fingerprintOfPem, fromB64u, newAgreementKeyPair, newSigningKeyPair, parseJoinRecord, signingKeyPairFromSeed, type JoinRecord, type KeyPair, type TlsIdentity } from "@vault-rooms/secure";
 
 /**
  * Device secrets (signing key, key-agreement key, TLS private key) live in Obsidian's secret storage, which keeps
@@ -45,8 +45,8 @@ export function isScope(value: unknown): value is string {
 }
 
 export async function createDeviceSecrets(): Promise<{ secrets: DeviceSecrets; certPem: string }> {
-  const sign = signingKeyPairFromSeed(crypto.getRandomValues(new Uint8Array(32)));
-  const agree = agreementKeyPairFromSecret(Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url"));
+  const sign = newSigningKeyPair();
+  const agree = newAgreementKeyPair();
   const tls = await createTlsIdentity();
   return { secrets: { sign, agree, tls }, certPem: tls.certPem };
 }

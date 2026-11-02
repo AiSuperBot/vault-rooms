@@ -41,7 +41,7 @@ export interface FileEntry {
 /** What became of a local edit: shared, kept until the room key arrives, or refused (and undone). */
 export type EditResult = "published" | "queued" | "refused";
 
-export const REMOTE = Symbol("vault-rooms-remote");
+const REMOTE = Symbol("vault-rooms-remote");
 const SNAPSHOT_EVERY = 200;
 /** A writer that isn't the first to pass on a former writer's work steps in after this long (ms) if it is still there. */
 const PASS_ON_STEP_IN_MS = 10 * 60_000;
@@ -67,10 +67,6 @@ interface DocState {
 }
 
 export interface ReplicaEvents {
-  /** The index changed: these file ids were added, changed or removed. */
-  index?(fileIds: string[]): void;
-  /** A note's text changed because of a remote update. */
-  doc?(fileId: string): void;
   /** A local edit made outside `edit` (an editor) couldn't be shared ("read_only", "too_large", ...). */
   localRefused?(docId: string, code: string): void;
   /**
@@ -155,8 +151,13 @@ export class RoomReplica {
   private lastUsed = new Map<DocId, number>();
   /** This device's newest snapshot and what it holds (see snapshot): known without decrypting it. */
   private sealed: { env: SnapshotEnvelope; contents: Y.Snapshot } | null = null;
+  /** The update this device is publishing right now (see publishLocal): its echo isn't applied again. */
+  private publishing: UpdateEnvelope | null = null;
   /** See indexNow. */
-  private indexCache: { version: number; entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } | null = null;
+  private indexCache: { version: number; doc: Y.Doc; entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } | null = null;
+  /** The index document watched for changed entries (see indexNow), and the ids changed since the cache was built. */
+  private indexWatched: Y.Doc | null = null;
+  private indexChanged = new Set<string>();
   /** Local edits made while this device lacked the room's newest key; published as soon as it arrives. */
   private unsent = new Map<DocId, Uint8Array[]>();
   /** Our own blobs sealed under a key the record no longer backs, to seal again once the right key is here. */
@@ -323,9 +324,22 @@ export class RoomReplica {
   private indexNow(): { entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } {
     const version = this.docVersion(INDEX_DOC);
     if (this.indexCache?.version === version) return this.indexCache;
-    const entries = new Map<string, FileEntry>();
-    const files = new Map<string, FileEntry>();
-    for (const fileId of this.index.keys()) {
+    const doc = this.loadDoc(INDEX_DOC).doc;
+    // Only what changed since is checked again, on copies (callers may hold the maps given before): a change to one
+    // file of 30,000 doesn't re-check them all. A rebuilt index document is read whole.
+    const previous = this.indexCache?.doc === doc ? this.indexCache : null;
+    if (this.indexWatched !== doc) {
+      this.indexWatched = doc;
+      doc.getMap<FileEntry>("files").observe((event) => {
+        for (const key of event.keysChanged) this.indexChanged.add(key);
+      });
+    }
+    const entries = new Map<string, FileEntry>(previous?.entries);
+    const files = new Map<string, FileEntry>(previous?.files);
+    const ids = previous ? this.indexChanged : this.index.keys();
+    for (const fileId of ids) {
+      entries.delete(fileId);
+      files.delete(fileId);
       const entry = this.entry(fileId);
       if (!entry) continue;
       // Shared by every caller until the index changes: frozen, so none can change it for the others.
@@ -333,7 +347,8 @@ export class RoomReplica {
       entries.set(fileId, Object.freeze(entry));
       if (!entry.deleted) files.set(fileId, entry);
     }
-    this.indexCache = { version, entries, files };
+    this.indexChanged = new Set();
+    this.indexCache = { version, doc, entries, files };
     return this.indexCache;
   }
 
@@ -573,13 +588,10 @@ export class RoomReplica {
       this.lastUsed.set(env.doc, Date.now());
       state.received++;
     }
-    // Notes not loaded yet are decrypted when they are first opened; only tell the owner something changed.
-    if (!state) {
-      this.events.doc?.(env.doc);
-      return;
-    }
-    // Our own new snapshot coming back as it is stored: the note holds it already (it was made from it just now).
-    if (env !== this.sealed?.env && this.applyEnvelope(state, env.doc, env)) this.changed(env.doc, state);
+    // Notes not loaded yet are decrypted when they are first opened (the owner hears of the envelope from the node).
+    if (!state) return;
+    // Our own new snapshot or update coming back as it is stored: the note holds it already (made from it just now).
+    if (env !== this.sealed?.env && env !== this.publishing) this.applyEnvelope(state, env.doc, env);
     if (env.k === "s") {
       // A writer's snapshot does the job of ours: one per note, not one per person typing in it.
       if (this.writes(env.author)) {
@@ -588,11 +600,6 @@ export class RoomReplica {
       }
       this.compact(env.doc);
     }
-  }
-
-  private changed(docId: DocId, state: DocState): void {
-    if (docId === INDEX_DOC) this.events.index?.([...state.doc.getMap("files").keys()]);
-    else this.events.doc?.(docId);
   }
 
   /** Decrypt and merge one envelope. Returns true if it changed the document. `checks`: clashes are looked for later. */
@@ -680,18 +687,15 @@ export class RoomReplica {
     const waiting = [...this.waiting.values()];
     this.waiting.clear();
     this.waitingDocs.clear();
-    const touched = new Set<DocId>();
     for (const env of waiting) {
       const state = this.docs.get(env.doc);
-      if (!state) continue;
-      if (this.applyEnvelope(state, env.doc, env)) touched.add(env.doc);
+      if (state) this.applyEnvelope(state, env.doc, env);
     }
     for (const [docId, state] of this.docs) {
       const failed = [...state.undecryptable.values()];
       state.undecryptable.clear();
-      for (const env of failed) if (this.applyEnvelope(state, docId, env)) touched.add(docId);
+      for (const env of failed) this.applyEnvelope(state, docId, env);
     }
-    for (const docId of touched) this.changed(docId, this.docs.get(docId)!);
   }
 
   private queueUnsent(docId: DocId, update: Uint8Array): void {
@@ -932,7 +936,12 @@ export class RoomReplica {
     const ctx = this.sealContext();
     const clock = this.node.store.maxClock(this.roomId, docId, this.node.deviceId) + 1;
     const env = sealUpdate(ctx, docId, clock, update);
-    if (!this.node.publish(env)) fail("publish_refused");
+    this.publishing = env;
+    try {
+      if (!this.node.publish(env)) fail("publish_refused");
+    } finally {
+      this.publishing = null;
+    }
     const state = this.docs.get(docId)!;
     this.markApplied(state, this.node.deviceId, clock);
     // Every 200 edits, or for a large note one per 4 KB of its last snapshot (a 6 MB note: about 1,500 edits).

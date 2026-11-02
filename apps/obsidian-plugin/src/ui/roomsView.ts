@@ -92,6 +92,8 @@ export class RoomsView extends ItemView {
         retry.disabled = true;
         void this.act(() => this.plugin.restartService());
       };
+      // Unreadable settings: leaving would act on a guess, so only Try again.
+      if (!svc && this.plugin.settingsUnreadable) return;
       if (!svc) {
         buttons.createEl("button", { text: "Leave the workspace on this computer" }).onclick = async () => {
           if (await confirmAction(this.app, "Leave the workspace", "This deletes the workspace data and this computer's keys from this vault. Your files stay. You can join again with a new invite.\n\nIf this vault is also opened on another computer (a network share, or a synced folder), don't: the data is the other computer's, and Vault Rooms would stop working there. Use a vault of this computer's own instead.", "Leave")) await this.act(() => this.plugin.leaveWorkspace());

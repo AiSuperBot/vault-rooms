@@ -51,7 +51,7 @@ export interface BlobStorage {
   remove(meta: BlobMeta): void;
 }
 
-export class MemoryBlobs implements BlobStorage {
+class MemoryBlobs implements BlobStorage {
   private blobs = new Map<string, BlobEnvelope>();
 
   put(env: BlobEnvelope): void {

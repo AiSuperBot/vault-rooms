@@ -9,19 +9,23 @@ export function bad(field: string): never {
   return fail("bad_record", field);
 }
 
-export function obj(value: unknown, field: string, allowedKeys: readonly string[]): Json {
+/** A plain object (as JSON.parse makes them), or bad(field). */
+export function plain(value: unknown, field: string): Json {
   if (typeof value !== "object" || value === null || Array.isArray(value)) bad(field);
   const proto = Object.getPrototypeOf(value);
   if (proto !== Object.prototype && proto !== null) bad(field);
+  return value as Json;
+}
+
+export function obj(value: unknown, field: string, allowedKeys: readonly string[]): Json {
+  plain(value, field);
   for (const key of Object.keys(value as Json)) if (!allowedKeys.includes(key)) bad(`${field}.${key}`);
   return value as Json;
 }
 
 /** A map keyed by ids of one kind; at most `max` entries. */
 export function idMap(value: unknown, field: string, kind: IdKind, max: number): Json {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) bad(field);
-  const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) bad(field);
+  plain(value, field);
   const keys = Object.keys(value as Json);
   if (keys.length > max) bad(field);
   for (const key of keys) if (!isId(key, kind)) bad(`${field}.${key}`);

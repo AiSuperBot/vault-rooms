@@ -12,7 +12,7 @@ import { activeDevice, grantedRooms, inviteCreatorStands, overCapacity, parseAgr
  * So the secret itself never travels between peers, and nobody who merely sees a join record can reuse the invite.
  */
 
-export function inviteKeyFromSecret(secret: Uint8Array): KeyPair {
+function inviteKeyFromSecret(secret: Uint8Array): KeyPair {
   if (secret.length !== 32) fail("bad_secret");
   return signingKeyPairFromSeed(hkdf(secret, new Uint8Array(0), "invite-key"));
 }

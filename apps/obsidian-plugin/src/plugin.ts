@@ -4,7 +4,7 @@ import type { EditorView } from "@codemirror/view";
 import { cleanName, isWithin, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
 import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
-import { adapterFiles, ObsidianVault } from "./mesh/obsidianVault.js";
+import { ObsidianVault } from "./mesh/obsidianVault.js";
 import { RoomPresence } from "./mesh/presence.js";
 import { RoomFolder, type RoomFolderState, type RoomHealth } from "./mesh/roomFolder.js";
 import { folderProblem, normalizeNote } from "./mesh/roomPaths.js";
@@ -48,6 +48,8 @@ function folderName(name: string): string {
     .trim();
   return cleaned && safeRoomPath(cleaned) !== null ? cleaned : cleaned && safeRoomPath(`Room ${cleaned}`) !== null ? `Room ${cleaned}` : "Room";
 }
+
+const SETTINGS_UNREADABLE = "Vault Rooms' settings (data.json in its plugin folder) are there but can't be read: in use by another program (a sync or backup tool?), or damaged. Nothing was changed. Close that program and choose Try again, or restart Obsidian. If it stays so, put back data.json from a backup.";
 
 export default class VaultRoomsPlugin extends Plugin {
   declare settings: PluginSettings;
@@ -129,7 +131,15 @@ export default class VaultRoomsPlugin extends Plugin {
   // ---- settings ----
 
   async loadSettings(): Promise<void> {
-    const raw = ((await this.loadData()) ?? {}) as Partial<PluginSettings>;
+    const data = (await this.loadData()) as Partial<PluginSettings> | null;
+    // There but unreadable (in use, or torn by a crash): never saved over with defaults, which would drop this computer
+    // out of its workspace. Nothing starts until it can be read (Try again).
+    this.settingsUnreadable = data == null && (await this.app.vault.adapter.exists(normalizePath(`${this.manifest.dir}/data.json`)));
+    if (this.settingsUnreadable) {
+      this.settings = { mesh: { scope: randomScope(), workspace: null }, mountRoot: "Rooms" };
+      return;
+    }
+    const raw = data ?? {};
     // A damaged scope doesn't drop the workspace: opening it then fails visibly and Leave cleans up.
     const mesh: MeshSettings = { scope: isScope(raw.mesh?.scope) ? raw.mesh!.scope : randomScope(), workspace: raw.mesh?.workspace ?? null };
     this.settings = { mesh, mountRoot: typeof raw.mountRoot === "string" && raw.mountRoot ? raw.mountRoot : "Rooms" };
@@ -137,8 +147,12 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    if (this.settingsUnreadable) throw new Error(SETTINGS_UNREADABLE);
     await this.saveData(this.settings);
   }
+
+  /** data.json is there but couldn't be read (see loadSettings). */
+  settingsUnreadable = false;
 
   /** Why a folder can't be where rooms shared with you go, or null if it can. */
   mountRootProblem(path: string): string | null {
@@ -157,7 +171,8 @@ export default class VaultRoomsPlugin extends Plugin {
 
   private deps(): MeshDeps {
     return {
-      files: adapterFiles(this.app.vault.adapter),
+      // The plugin's own data (encrypted envelopes, the record), through the vault's data adapter.
+      files: this.app.vault.adapter,
       dataRoot: normalizePath(`${this.manifest.dir}/mesh`),
       secrets: obsidianSecrets(this.app.secretStorage as unknown as Parameters<typeof obsidianSecrets>[0]),
       settings: this.settings.mesh,
@@ -191,6 +206,11 @@ export default class VaultRoomsPlugin extends Plugin {
   private async startNow(service?: MeshService): Promise<void> {
     if (!service && this.service) return;
     this.serviceError = null;
+    if (this.settingsUnreadable) await this.loadSettings();
+    if (this.settingsUnreadable) {
+      this.serviceError = SETTINGS_UNREADABLE;
+      return this.changed();
+    }
     let svc: MeshService | null;
     try {
       svc = service ?? (await MeshService.open(this.deps()));
@@ -283,6 +303,7 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   private async leaveNow(): Promise<void> {
+    if (this.settingsUnreadable) throw new Error(SETTINGS_UNREADABLE);
     const service = this.service;
     await this.stopFolders();
     this.service = null;
@@ -339,9 +360,11 @@ export default class VaultRoomsPlugin extends Plugin {
     const dir = note.slice(0, note.lastIndexOf("/"));
     const dot = filename.lastIndexOf(".");
     const [stem, ext] = dot > 0 ? [filename.slice(0, dot), filename.slice(dot)] : [filename, ""];
+    const folder = this.app.vault.getAbstractFileByPath(dir);
+    const taken = new Set(folder instanceof TFolder ? folder.children.map((child) => pathKey(child.path)) : []);
     for (let i = 1; ; i++) {
       const candidate = `${dir}/${stem}${i > 1 ? ` ${i}` : ""}${ext}`;
-      if (!this.app.vault.getAbstractFileByPath(candidate)) return candidate;
+      if (!taken.has(pathKey(candidate)) && !this.app.vault.getAbstractFileByPath(candidate)) return candidate;
     }
   }
 
@@ -459,6 +482,11 @@ export default class VaultRoomsPlugin extends Plugin {
           ? `You left the room in "${folder}" from another computer of yours.`
           : `You no longer have access to the room in "${folder}".`;
       if (folder && !ws.rooms[roomId]?.hidden && by !== svc.me.deviceId) new Notice(`${why} Its files stay on this computer but no longer sync.`, 10000);
+      // A deleted room never comes back: its folder is free to be shared again.
+      if (svc.state.rooms[roomId]?.deleted && ws.rooms[roomId]) {
+        delete ws.rooms[roomId];
+        await this.saveSettings().catch((error: Error) => console.debug(`Vault Rooms: settings: ${error.message}`));
+      }
       this.changed();
       return;
     }

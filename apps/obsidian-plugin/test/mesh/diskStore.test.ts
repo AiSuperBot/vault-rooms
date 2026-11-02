@@ -252,7 +252,7 @@ describe("disk store", () => {
     expect((await new DiskStore(files, "m").open()).vv(w.roomId, doc)).toEqual({ [w.deviceId]: 2 });
     // A swap of the record interrupted the same way.
     await disk.saveChain(w.chain.all());
-    await files.rename("m/chain.json", "m/chain.json.old");
+    await files.rename("m/chain/000000.jsonl", "m/chain/000000.jsonl.old");
     expect(await new DiskStore(files, "m").loadChain()).toHaveLength(2);
   });
 
@@ -303,10 +303,77 @@ describe("disk store", () => {
     const files = new MemoryFiles();
     const disk = new DiskStore(files, "m");
     await disk.saveChain(w.chain.all());
-    files.failNextWriteTo = "chain.json.tmp";
+    files.failNextWriteTo = "000000.jsonl.tmp";
     await expect(disk.saveChain([w.chain.head])).rejects.toThrow("disk full");
     expect(await new DiskStore(files, "m").loadChain()).toHaveLength(2);
   });
+
+  it("never reads a locked record, joins or wraps as none, and swaps a file in when a rename is held a moment", async () => {
+    const w = world();
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    await disk.saveChain(w.chain.all());
+    await disk.saveJoins([]);
+    await disk.saveWraps([]);
+    for (const name of ["chain/", "joins.json", "wraps.json"]) {
+      files.failReads = (path) => path.startsWith(`m/${name}`);
+      const again = new DiskStore(files, "m");
+      const read = name === "chain/" ? again.loadChain() : name === "joins.json" ? again.loadJoins() : again.loadWraps();
+      await expect(read).rejects.toThrow("can't be read now");
+    }
+    files.failReads = undefined;
+    // An antivirus holding the file for a moment: the rename is tried again, not given up.
+    let held = 2;
+    const rename = files.rename.bind(files);
+    files.rename = async (from, to) => {
+      if (held-- > 0) throw Object.assign(new Error("EPERM: operation not permitted, rename"), { code: "EPERM" });
+      return rename(from, to);
+    };
+    await disk.saveJoins([]);
+    expect(await new DiskStore(files, "m").loadJoins()).toEqual([]);
+    // Both renames of the swap went through, the first after two refusals.
+    expect(held).toBe(-2);
+  });
+
+  it("stores the record in segments: a change appends its version, a replaced branch leaves nothing of the old one", async () => {
+    const w = world();
+    const userId = Object.keys(w.chain.head.body.state.users)[0]!;
+    for (let i = 0; i < 1_050; i++) w.chain.offer([nextVersion(w.workspaceId, w.chain.head, w.sign, (state) => (state.users[userId]!.name = `Ana ${i}`))]);
+    const files = new MemoryFiles();
+    // As 0.3.8 stored it: one file, read once and written as segments by the next save.
+    files.data.set("m/chain.json", JSON.stringify(w.chain.all()));
+    const disk = new DiskStore(files, "m");
+    expect(await disk.loadChain()).toHaveLength(1_052);
+    await disk.saveChain(w.chain.all());
+    expect([...files.data.keys()].filter((key) => key.startsWith("m/chain")).sort()).toEqual(["m/chain/000000.jsonl", "m/chain/000001.jsonl", "m/chain/000002.jsonl"]);
+    // One more version: only it is written.
+    const appended: string[] = [];
+    const append = files.append.bind(files);
+    files.append = async (path, data) => {
+      appended.push(data);
+      return append(path, data);
+    };
+    w.chain.offer([nextVersion(w.workspaceId, w.chain.head, w.sign, (state) => (state.users[userId]!.name = "Ana last"))]);
+    await disk.saveChain(w.chain.all());
+    expect(appended).toHaveLength(1);
+    expect(appended[0]!.split("\n").filter(Boolean)).toHaveLength(1);
+    const again = new DiskStore(files, "m");
+    const read = await again.loadChain();
+    expect(read).toHaveLength(1_053);
+    expect(WorkspaceChain.load(read!).headHash).toBe(w.chain.headHash);
+    // A torn last line (Obsidian stopped mid-append): read up to it, and written whole from its segment next time.
+    await append("m/chain/000002.jsonl", '{"body":{"kind":"vr-ws');
+    const torn = new DiskStore(files, "m");
+    expect(await torn.loadChain()).toHaveLength(1_053);
+    await torn.saveChain(w.chain.all());
+    expect(files.data.get("m/chain/000002.jsonl")!.endsWith("}\n")).toBe(true);
+    expect(await new DiskStore(files, "m").loadChain()).toHaveLength(1_053);
+    // A branch that replaces versions from 700 on, shorter: segment 1 rewritten, segment 2 gone.
+    const branch = w.chain.all().slice(0, 700);
+    await torn.saveChain(branch);
+    expect(files.data.has("m/chain/000002.jsonl")).toBe(false);
+    expect(await new DiskStore(files, "m").loadChain()).toHaveLength(700);
+  }, 60_000);
 
   it("wipes everything on leaving", async () => {
     const w = world();

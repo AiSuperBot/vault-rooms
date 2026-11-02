@@ -1,5 +1,4 @@
-import { normalizePath, TFile, TFolder, type App, type DataAdapter } from "obsidian";
-import type { Files } from "./diskStore.js";
+import { normalizePath, TFile, TFolder, type App } from "obsidian";
 import type { FileStat, VaultLike } from "./roomFolder.js";
 
 /** The room folders' view of the vault, through Obsidian's vault API (so its caches and editors stay in step). */
@@ -102,23 +101,9 @@ export class ObsidianVault implements VaultLike {
   folderExists(path: string): boolean {
     return this.app.vault.getAbstractFileByPath(normalizePath(path)) instanceof TFolder;
   }
-}
 
-/** The plugin's own data (encrypted envelopes, the record), through the vault's data adapter. */
-export function adapterFiles(adapter: DataAdapter): Files {
-  return {
-    exists: (path) => adapter.exists(path),
-    read: (path) => adapter.read(path),
-    write: (path, data) => adapter.write(path, data),
-    append: (path, data) => adapter.append(path, data),
-    remove: (path) => adapter.remove(path),
-    rename: (from, to) => adapter.rename(from, to),
-    mkdir: (path) => adapter.mkdir(path),
-    list: (path) => adapter.list(path),
-    rmdir: (path, recursive) => adapter.rmdir(path, recursive),
-    stat: async (path) => {
-      const stat = await adapter.stat(path);
-      return stat ? { size: stat.size, mtime: stat.mtime } : null;
-    }
-  };
+  async removeEmptyFolder(path: string): Promise<void> {
+    const folder = this.app.vault.getAbstractFileByPath(normalizePath(path));
+    if (folder instanceof TFolder && folder.children.length === 0) await this.app.vault.delete(folder);
+  }
 }

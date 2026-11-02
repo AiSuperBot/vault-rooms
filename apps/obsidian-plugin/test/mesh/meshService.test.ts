@@ -114,7 +114,7 @@ describe("mesh service", () => {
     const host = await started(await MeshService.create(deps("ResumeHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
     const link = (await host.createInvite({})).replace(/p=[^&]*/, `p=127.0.0.1%3A${host.listeningPort}`);
     const d = deps("ResumeJoin");
-    if (failure === "record") (d.files as MemoryFiles).failNextWriteTo = "chain.json.tmp";
+    if (failure === "record") (d.files as MemoryFiles).failNextWriteTo = "000000.jsonl.tmp";
     else d.save = async () => { throw new Error("disk full"); };
     await expect(MeshService.join(d, { link, userName: "Guest", deviceName: "PC" })).rejects.toThrow("disk full");
     expect(d.settings.workspace).toBeNull();
@@ -202,6 +202,21 @@ describe("mesh service", () => {
       for (const server of taken) server.close();
     }
   }, 60_000);
+
+  it("finishes stopping when storing the record fails, and writes nothing later", async () => {
+    const ana = await MeshService.create(deps("AnaStop"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" });
+    const roomId = await ana.createRoom("Plans");
+    const disk = (ana as unknown as { disk: { saveChain: () => Promise<void>; saveWraps: () => Promise<void>; discard: () => void } }).disk;
+    disk.saveChain = async () => {
+      throw new Error("EPERM: rename chain.json");
+    };
+    const wraps = vi.spyOn(disk, "saveWraps");
+    const discard = vi.spyOn(disk, "discard");
+    await expect(ana.stop()).rejects.toThrow("EPERM");
+    expect(wraps).toHaveBeenCalled();
+    expect(discard).toHaveBeenCalled();
+    expect(ana.replica(roomId)).toBeNull();
+  });
 
   it("rotates the room key when a member is removed, so new content is out of their reach", async () => {
     const ana = await started(await MeshService.create(deps("Ana2"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" }));

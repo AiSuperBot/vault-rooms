@@ -16,6 +16,15 @@ const verifiedAgainst = new WeakMap<SignedVersion, string>();
  * hash and signature are untouched; tens of thousands of versions then share what didn't change, in memory and when
  * encoded (see freezeDeep).
  */
+/** Equal parsed JSON values (what canonicalJson would encode alike: keys in any order). */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null || Array.isArray(a) !== Array.isArray(b)) return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every((key) => Object.hasOwn(b, key) && sameValue((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key]));
+}
+
 function settle(version: SignedVersion, before: SignedVersion | undefined): void {
   if (isDeeplyFrozen(version)) return;
   const state = version.body.state;
@@ -26,7 +35,7 @@ function settle(version: SignedVersion, before: SignedVersion | undefined): void
       const earlier = previous[kind] as Record<string, unknown>;
       for (const id of Object.keys(records)) {
         const old = Object.hasOwn(earlier, id) ? earlier[id] : undefined;
-        if (old !== undefined && old !== records[id] && canonicalJson(old) === canonicalJson(records[id])) records[id] = old;
+        if (old !== undefined && old !== records[id] && sameValue(old, records[id])) records[id] = old;
       }
     }
   }
@@ -236,7 +245,7 @@ function rank(forkState: WorkspaceState, seniority: Map<string, number>, first: 
  * What the losing branch took away is made again on top of the winner (see `concurrentReductions`), so concurrent
  * revocations add up whichever branch wins.
  */
-export function preferBranch(
+function preferBranch(
   forkState: WorkspaceState,
   seniority: Map<string, number>,
   a: SignedVersion[],

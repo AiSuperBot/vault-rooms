@@ -4,7 +4,7 @@ import * as Y from "yjs";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { reconcileYTextWithDiskText } from "../crdtReconcile.js";
 import type { AwarenessFacade, RoomPresence } from "./presence.js";
-import { sha } from "./roomPaths.js";
+import { normalizeNote, sha } from "./roomPaths.js";
 
 /**
  * Live co-editing: every open editor showing a note of a room is bound to that note's shared text with
@@ -183,7 +183,7 @@ export class EditorBinding {
     let shared = target.ytext.toString();
     if (shared.includes("\r")) {
       if (target.readOnly) return true; // left unbound: a reader can't fix the shared text
-      reconcileYTextWithDiskText(target.ytext, shared.replace(/\r\n?/g, "\n"), "editor");
+      reconcileYTextWithDiskText(target.ytext, normalizeNote(shared), "editor");
       shared = target.ytext.toString();
     }
     const now = view.state.doc.toString();
