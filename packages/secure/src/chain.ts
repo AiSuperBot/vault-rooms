@@ -1,5 +1,38 @@
+import { canonicalJson, freezeDeep, keepEncoding } from "./canonical.js";
 import { fail, SecureError } from "./errors.js";
 import { activeDevice, MAX_CLOCK_SKEW_MS, roleAtLeast, roleIn, verifyGenesis, verifyNext, versionHash, type Role, type SignedVersion, type WorkspaceState } from "./workspace.js";
+
+/**
+ * Versions verified so far, with the hash of the predecessor each was verified against. A version is frozen before it
+ * is verified (see settle), and the predecessor's hash pins its whole state, so verifying it again against the same
+ * one gives the same answer: the record versions of a catch-up, checked once as they come in parts (see the mesh's
+ * staged branch), aren't checked all over again when the branch is taken. The clock is still checked every time.
+ */
+const verifiedAgainst = new WeakMap<SignedVersion, string>();
+
+/**
+ * Before a version is hashed and verified: each record (user, device, invite, room) unchanged since the version before
+ * it becomes that version's very object, and the whole version is frozen for good. Equal records encode alike, so its
+ * hash and signature are untouched; tens of thousands of versions then share what didn't change, in memory and when
+ * encoded (see freezeDeep).
+ */
+function settle(version: SignedVersion, before: SignedVersion | undefined): void {
+  if (Object.isFrozen(version)) return;
+  const state = version.body.state;
+  const previous = before?.body.state;
+  if (previous) {
+    for (const kind of ["users", "devices", "invites", "rooms"] as const) {
+      const records = state[kind] as Record<string, unknown>;
+      const earlier = previous[kind] as Record<string, unknown>;
+      for (const id of Object.keys(records)) {
+        const old = earlier[id];
+        if (old !== undefined && old !== records[id] && canonicalJson(old) === canonicalJson(records[id])) records[id] = old;
+      }
+    }
+  }
+  freezeDeep(version);
+  for (const kind of ["users", "devices", "invites", "rooms"] as const) for (const record of Object.values(state[kind])) keepEncoding(record);
+}
 
 export type OfferResult =
   | { status: "appended"; count: number }
@@ -21,6 +54,7 @@ export class WorkspaceChain {
 
   constructor(genesis: SignedVersion) {
     this.workspaceId = verifyGenesis(genesis);
+    freezeDeep(genesis);
     this.versions = [genesis];
     this.hashes = [this.workspaceId];
   }
@@ -90,6 +124,11 @@ export class WorkspaceChain {
     if (branch[0]!.body.prev !== this.hashes[start - 1]) return { status: "rejected", reason: "unknown_parent" };
 
     // Skip the prefix we already have (by hash, before any costly check), then verify only the rest.
+    let before: SignedVersion | undefined = this.versions[start - 1];
+    for (const version of branch) {
+      settle(version, before);
+      before = version;
+    }
     const hashes = branch.map(versionHash);
     let same = 0;
     while (same < branch.length && this.hashes[start + same] === hashes[same]) same++;
@@ -104,7 +143,10 @@ export class WorkspaceChain {
       for (let i = 0; i < theirs.length; i++) {
         const version = theirs[i]!;
         if (now !== undefined && version.body.at > now + MAX_CLOCK_SKEW_MS) fail("forbidden", "future");
-        verifyNext(this.workspaceId, parent, parentHash, version);
+        if (verifiedAgainst.get(version) !== parentHash) {
+          verifyNext(this.workspaceId, parent, parentHash, version);
+          verifiedAgainst.set(version, parentHash);
+        }
         parent = version;
         parentHash = theirHashes[i]!;
       }

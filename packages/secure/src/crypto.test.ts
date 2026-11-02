@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { b64u, fromB64u, utf8 } from "./bytes.js";
-import { canonicalJson, parseCanonical } from "./canonical.js";
+import { canonicalJson, freezeDeep, keepEncoding, parseCanonical } from "./canonical.js";
 import {
   hashTagged,
   isSmallOrderSigningKey,
@@ -38,6 +38,18 @@ describe("canonical JSON", () => {
     }
     // eslint-disable-next-line no-sparse-arrays
     expect(code(() => canonicalJson([1, , 3]))).toBe("canonical_sparse_array");
+  });
+  it("encodes a deeply frozen value once, the same, and still within the depth limit wherever it is met", () => {
+    const deep = (n: number): unknown => (n === 0 ? { x: 1 } : { d: deep(n - 1) });
+    const record = freezeDeep({ b: [1, 2], a: deep(20) });
+    keepEncoding(record);
+    const fresh = JSON.parse(JSON.stringify(record));
+    expect(canonicalJson(record)).toBe(canonicalJson(fresh));
+    expect(canonicalJson({ k: record })).toBe(canonicalJson({ k: fresh }));
+    // Met again deep down: over the limit, as the same value not frozen would be.
+    expect(code(() => canonicalJson({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: { k: { l: record } } } } } } } } } } } }))).toBe("canonical_too_deep");
+    expect(code(() => canonicalJson({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: { k: { l: fresh } } } } } } } } } } } }))).toBe("canonical_too_deep");
+    expect(Object.isFrozen((record as { a: { d: object } }).a.d)).toBe(true);
   });
   it("parses only canonical text", () => {
     expect(parseCanonical('{"a":1}')).toEqual({ a: 1 });

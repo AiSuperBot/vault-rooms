@@ -66,6 +66,11 @@ interface Known extends FileStat {
    * "unchanged here" until the shared version matches it, and a new entry that never got stored is made again.
    */
   unstored?: true | "entry" | "received";
+  /**
+   * For notes: what the shared note held when `hash` was taken from it (see RoomReplica.contentKey). While it is the
+   * same and the file untouched, the note isn't loaded at all: after a restart too.
+   */
+  content?: string;
 }
 
 export interface RoomFolderState {
@@ -148,6 +153,8 @@ const DELETED = "\u0000deleted";
 /** Work on files that failed (a file in use, a full disk) is tried again after this, doubling up to the maximum. */
 const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 300_000;
+/** A note not used for this long is unloaded (see RoomReplica.releaseIdle). */
+const IDLE_NOTE_MS = 5 * 60_000;
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
 const RECENT_EDIT_MS = 10 * 60_000;
 
@@ -194,9 +201,9 @@ export class RoomFolder {
   /** Tracked ids by pathKey (see idAt). */
   private knownKeys = new Map<string, string>();
   /** The last desired() and the index version it was built from (see materializeNow). */
+  /** Which files use each attachment version, for the index version it was built from (see blobArrived). */
+  private blobFiles: { version: number; users: Map<string, string[]> } | null = null;
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
-  /** Each note's shared text hash, and the document version it was taken at (see applyContent). */
-  private noteHashes = new Map<string, { version: number; hash: string }>();
   /** `known` changed since it was last saved (see saveNow). */
   private stateChanged = false;
   private expected = new Map<string, string>();
@@ -328,7 +335,6 @@ export class RoomFolder {
   private forget(id: string): void {
     this.unindex(id);
     if (this.known.delete(id)) this.stateChanged = true;
-    this.noteHashes.delete(id);
     // An editor tied to it is tied again (to the copy shared under a new id, say), not left feeding a deleted note.
     const bound = this.o.isBound(id);
     if (this.heldBack.delete(id) || bound) this.o.heldBackChanged?.();
@@ -448,6 +454,20 @@ export class RoomFolder {
   /** The folder was moved (it is stopped next, and started at its new place): deletions made just before still count. */
   folderMoved(): void {
     this.movedAway = true;
+  }
+
+  /**
+   * An attachment version arrived (or was stored): the files that use it are written. Should none use it yet (it came
+   * before the index entry naming it), the entry's arrival brings a whole pass.
+   */
+  blobArrived(blob: string): void {
+    const version = this.o.replica.docVersion(INDEX_DOC);
+    if (this.blobFiles?.version !== version) {
+      const users = new Map<string, string[]>();
+      for (const [id, entry] of this.o.replica.files()) if (entry.blob) users.set(`${entry.blob.by}/${entry.blob.id}`, [...(users.get(`${entry.blob.by}/${entry.blob.id}`) ?? []), id]);
+      this.blobFiles = { version, users };
+    }
+    for (const id of this.blobFiles.users.get(blob) ?? []) this.remoteChanged(id);
   }
 
   /** Call when the room index or a note (`docId`: only that one) changed remotely, or a key arrived. */
@@ -595,7 +615,8 @@ export class RoomFolder {
    * the envelopes (by key) it just made for the file's entry (`created`: a new entry); and so does what it received for
    * its note. Until then the file is marked (see Known.unstored), and the mark is checked again whenever state is saved.
    */
-  private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false): void {
+  /** `content`: for a note whose `hash` is of the shared text, what the shared note held then (see Known.content). */
+  private remember(id: string, path: string, hash: string, blob?: { id: string; by: string }, made: Array<string | null> = [], created = false, content?: string): void {
     const replica = this.o.replica;
     this.keptAside.delete(pathKey(path));
     const stat = this.o.vault.stat(this.vaultPath(path));
@@ -617,7 +638,8 @@ export class RoomFolder {
       size: stat?.size ?? -1,
       mtime: stat?.mtime ?? -1,
       ...(blob ? { blob: blob.id, ...(blob.by === replica.deviceId ? { mine: true as const } : {}) } : {}),
-      ...(unstored ? { unstored } : {})
+      ...(unstored ? { unstored } : {}),
+      ...(content ? { content } : {})
     });
     if (this.rejected.delete(path)) this.o.healthChanged?.();
     // Shared again: told again should it be held back later (once per time, not per save while it is).
@@ -858,6 +880,8 @@ export class RoomFolder {
       this.o.healthChanged?.();
     }
     this.saveSoon();
+    // Notes untouched for a while are let go (memory): loaded again when they change or are opened.
+    this.o.replica.releaseIdle(IDLE_NOTE_MS, (id) => this.o.isBound(id) || this.toKeep.has(id));
     if (this.ready) this.o.passed?.();
   }
 
@@ -962,15 +986,17 @@ export class RoomFolder {
     /** The file is as it was when last synced (by its size and time). */
     const unchanged = (stat: FileStat | null) => stat !== null && !doubtful && known?.path === entry.path && known.size === stat.size && known.mtime === stat.mtime;
     let remote: string | Uint8Array | null;
-    let noteVersion: number | undefined;
+    let content: string | undefined;
     if (entry.kind === "md") {
+      // The shared note holds what it held when last synced, and the file is untouched since: nothing to do, without
+      // even loading it (tens of thousands of notes after a restart).
+      content = replica.contentKey(id);
+      if (known?.content === content && !replica.hasUnsent(id) && !this.toKeep.has(id) && unchanged(this.o.vault.stat(path))) return;
       // Part of the note can't be read yet, or our own edit is waiting for the room key: nothing to decide on yet.
       if (!replica.isComplete(id) || replica.hasUnsent(id)) return;
-      // The shared note as it was when last synced, and the file untouched since: nothing to convert or hash.
-      noteVersion = replica.docVersion(id);
-      const hashed = this.noteHashes.get(id);
-      if (hashed?.version === noteVersion && hashed.hash === known?.hash && unchanged(this.o.vault.stat(path)) && !this.toKeep.has(id)) return;
       remote = normalizeNote(replica.noteText(id));
+      // Remembered with the text only when the text is all of what the store holds (it may lag a moment behind).
+      content = replica.syncedKey(id);
       // A clash copy to keep first (asked for as the note loaded, maybe): never written with both lines meanwhile.
       if (this.toKeep.has(id)) return;
     } else {
@@ -980,7 +1006,6 @@ export class RoomFolder {
     }
     if (remote === null) return; // the attachment hasn't arrived yet: its arrival brings a pass
     const remoteHash = sha(remote);
-    if (noteVersion !== undefined) this.noteHashes.set(id, { version: noteVersion, hash: remoteHash });
     const stat = this.o.vault.stat(path);
     if (stat && !this.fitsBeforeRead(entry.path, entry.kind === "md", id)) return;
     if (!stat) {
@@ -989,28 +1014,30 @@ export class RoomFolder {
         await this.keepAside(variant, await this.o.vault.readBytes(this.vaultPath(variant)));
         await this.trash(variant);
       }
-      return this.write(id, entry, remote, remoteHash);
+      return this.write(id, entry, remote, remoteHash, undefined, content);
     }
     const unchangedHere = known !== undefined && unchanged(stat);
     if (unchangedHere) {
       if (remoteHash === known.hash) {
         // The same bytes in another blob (a writer passing on someone else's file, say): remembered, so it isn't read again.
         if (entry.blob && entry.blob.id !== known.blob) this.remember(id, entry.path, remoteHash, { id: entry.blob.id, by: known.mine ? replica.deviceId : "" });
+        // The same text as remembered: from now on known without loading it (see Known.content).
+        else if (content !== undefined && known.content !== content) this.setKnown(id, { ...known, content });
         return;
       }
       // Another version of an attachment made from an older one than the version this computer made (two people
       // changed it at once): keep ours. A version of someone else's that we merely had is just older.
       if (entry.kind === "bin" && known.mine && entry.blob && entry.blob.id !== known.blob && entry.base !== known.blob) await this.keepAside(entry.path, await this.o.vault.readBytes(path));
-      return this.write(id, entry, remote, remoteHash, known.hash);
+      return this.write(id, entry, remote, remoteHash, known.hash, content);
     }
     const local = entry.kind === "md" ? await this.readNote(path) : await this.o.vault.readBytes(path);
     const localHash = sha(local);
-    if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob);
+    if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     if (!known || (localHash === known.hash && !doubtful)) {
       // Nothing changed here since the last sync (or a file we never tracked sits at this path): the shared copy wins,
       // but an untracked file with content is kept aside first.
       if (!known && local.length > 0) await this.keepAside(entry.path, local);
-      return this.write(id, entry, remote, remoteHash, localHash);
+      return this.write(id, entry, remote, remoteHash, localHash, content);
     }
     if (remoteHash === known.hash && !doubtful) {
       // Only changed here (e.g. while Obsidian was closed): share the local version, unless it is already held back.
@@ -1019,18 +1046,19 @@ export class RoomFolder {
     }
     // Changed on both sides since the last sync.
     await this.keepAside(entry.path, local);
-    await this.write(id, entry, remote, remoteHash, localHash);
+    await this.write(id, entry, remote, remoteHash, localHash, content);
   }
 
   /** Write the shared version, only if the file is still what the decision was based on (checked as it is written). */
-  private async write(id: string, entry: FileEntry, remote: string | Uint8Array, remoteHash: string, basedOn?: string): Promise<void> {
+  /** `content`: the note's content key, when `remote` is all of what its store holds (see RoomReplica.syncedKey). */
+  private async write(id: string, entry: FileEntry, remote: string | Uint8Array, remoteHash: string, basedOn?: string, content?: string): Promise<void> {
     // Changed meanwhile (saved again while its copy was being kept, say), or an editor bound meanwhile (which owns the
     // note now): left as it is and looked at again next time.
     const wrote =
       typeof remote === "string"
         ? await this.writeText(entry.path, remote, (current) => !this.o.isBound(id) && (basedOn === undefined || sha(normalizeNote(current)) === basedOn))
         : await this.writeBytes(entry.path, remote, basedOn === undefined ? undefined : (current) => sha(current) === basedOn);
-    if (wrote) this.remember(id, entry.path, remoteHash, entry.blob);
+    if (wrote) this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     else if (!this.o.isBound(id)) {
       const known = this.known.get(id);
       if (known) this.setKnown(id, { ...known, mtime: -1 });

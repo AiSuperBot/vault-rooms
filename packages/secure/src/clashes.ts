@@ -577,6 +577,11 @@ export class Clashes {
     return this.fileSaves.has(docId);
   }
 
+  /** Whether a clash of a document is being worked out (in memory only): it must stay loaded until it is. */
+  busy(docId: DocId): boolean {
+    return this.typed.has(docId) || this.takeOuts.has(docId) || this.waitingTakeOuts.has(docId) || this.rivals.has(docId) || this.unsettled.has(docId);
+  }
+
   /** Changes whenever the saves remembered here change (see recentSaves). */
   get savesChanged(): number {
     return this.savesVersion;

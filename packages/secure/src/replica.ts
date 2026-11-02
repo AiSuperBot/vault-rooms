@@ -48,7 +48,7 @@ const PASS_ON_STEP_IN_MS = 10 * 60_000;
 
 interface DocState {
   doc: Y.Doc;
-  pending: Map<string, { env: UpdateEnvelope | SnapshotEnvelope; bytes: Uint8Array }>;
+  pending: Map<string, { env: UpdateEnvelope | SnapshotEnvelope; bytes: Uint8Array; needs: Map<number, number> }>;
   /** Updates contained in `doc`, per author (contiguous), so a snapshot never claims more than it holds. */
   applied: VersionVector;
   /** Applied updates beyond a gap, per author. */
@@ -56,6 +56,9 @@ interface DocState {
   sinceSnapshot: number;
   /** The size of the newest snapshot seen of it: a large note is snapshotted less often (see publishLocal). */
   snapshotBytes: number;
+  /** The store's count of envelopes added to it when it was loaded, and those taken in since (see syncedKey). */
+  base: number;
+  received: number;
 }
 
 export interface ReplicaEvents {
@@ -80,23 +83,38 @@ function waitsForDependencies(doc: Y.Doc): boolean {
   return doc.store.pendingStructs !== null || doc.store.pendingDs !== null;
 }
 
-/** Check the update's references before Yjs can notify an editor of a partially applied deletion. */
-function dependenciesReady(doc: Y.Doc, bytes: Uint8Array): boolean {
+/**
+ * What an update needs the document to hold before it goes in whole (Yjs would apply part of it, and an editor could
+ * show a deletion without its insertion): per client, the clock the document's state must reach. Worked out once per
+ * update; whether it is met is then a lookup per client (see ready).
+ */
+function dependencyNeeds(bytes: Uint8Array): Map<number, number> {
   const { structs, ds } = Y.decodeUpdate(bytes);
+  const needs = new Map<number, number>();
+  const need = (client: number, clock: number) => {
+    if (clock > (needs.get(client) ?? 0)) needs.set(client, clock);
+  };
+  // Its own structs, per client: a run starting past what came before it in the update needs the document to reach it.
   const ends = new Map<number, number>();
-  const end = (client: number) => ends.get(client) ?? Y.getState(doc.store, client);
   for (const struct of structs) {
     if (struct instanceof Y.Skip) continue;
-    if (struct.id.clock > end(struct.id.client)) return false;
-    ends.set(struct.id.client, Math.max(end(struct.id.client), struct.id.clock + struct.length));
+    const { client, clock } = struct.id;
+    const end = ends.get(client);
+    if (end === undefined || clock > end) need(client, clock);
+    ends.set(client, Math.max(end ?? 0, clock + struct.length));
   }
+  const own = (client: number) => ends.get(client) ?? 0;
+  // What its items are tied to, and what it deletes, unless the update holds that itself.
   for (const struct of structs) {
-    if (!(struct instanceof Y.Item) || struct.id.clock + struct.length <= Y.getState(doc.store, struct.id.client)) continue;
-    for (const ref of [struct.origin, struct.rightOrigin, struct.parent]) {
-      if (ref instanceof Y.ID && ref.clock >= end(ref.client)) return false;
-    }
+    if (!(struct instanceof Y.Item)) continue;
+    for (const ref of [struct.origin, struct.rightOrigin, struct.parent]) if (ref instanceof Y.ID && ref.clock >= own(ref.client)) need(ref.client, ref.clock + 1);
   }
-  for (const [client, ranges] of ds.clients) if (ranges.some(({ clock, len }) => clock + len > end(client))) return false;
+  for (const [client, ranges] of ds.clients) for (const { clock, len } of ranges) if (clock + len > own(client)) need(client, clock + len);
+  return needs;
+}
+
+function ready(doc: Y.Doc, needs: Map<number, number>): boolean {
+  for (const [client, clock] of needs) if (Y.getState(doc.store, client) < clock) return false;
   return true;
 }
 
@@ -126,6 +144,12 @@ export class RoomReplica {
   /** See docVersion. */
   private changes = new Map<DocId, number>();
   private waiting = new Map<string, UpdateEnvelope | SnapshotEnvelope>();
+  /** The documents with something in `waiting` (it is only ever emptied whole). */
+  /** When each loaded document was last used (see releaseIdle). */
+  private lastUsed = new Map<DocId, number>();
+  /** See indexNow. */
+  private indexCache: { version: number; entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } | null = null;
+  private waitingDocs = new Set<DocId>();
   /** Local edits made while this device lacked the room's newest key; published as soon as it arrives. */
   private unsent = new Map<DocId, Uint8Array[]>();
   /** Our own blobs sealed under a key the record no longer backs, to seal again once the right key is here. */
@@ -284,13 +308,26 @@ export class RoomReplica {
   }
 
   /** Index entries with a safe path, deleted ones included (marked). Entries whose path fails the check are left out. */
-  entries(): Map<string, FileEntry> {
-    const out = new Map<string, FileEntry>();
+  entries(): ReadonlyMap<string, FileEntry> {
+    return this.indexNow().entries;
+  }
+
+  /** The index checked once per change of it (callers only read; a room can hold tens of thousands of files). */
+  private indexNow(): { entries: ReadonlyMap<string, FileEntry>; files: ReadonlyMap<string, FileEntry> } {
+    const version = this.docVersion(INDEX_DOC);
+    if (this.indexCache?.version === version) return this.indexCache;
+    const entries = new Map<string, FileEntry>();
+    const files = new Map<string, FileEntry>();
     for (const fileId of this.index.keys()) {
       const entry = this.entry(fileId);
-      if (entry) out.set(fileId, entry);
+      if (!entry) continue;
+      // Shared by every caller until the index changes: frozen, so none can change it for the others.
+      if (entry.blob) Object.freeze(entry.blob);
+      entries.set(fileId, Object.freeze(entry));
+      if (!entry.deleted) files.set(fileId, entry);
     }
-    return out;
+    this.indexCache = { version, entries, files };
+    return this.indexCache;
   }
 
   /** One validated index entry, without rebuilding the whole index. Deleted entries are included. */
@@ -303,6 +340,42 @@ export class RoomReplica {
     return { path, kind: entry.kind, ...(blob ? { blob } : {}), ...(isHash(entry.base) ? { base: entry.base } : {}), ...(entry.deleted === true ? { deleted: true as const } : {}) };
   }
 
+  /**
+   * What is held of a note, as a short fingerprint (see EnvelopeStore.fingerprint), without loading it: the same, and
+   * nothing of ours waiting to be sent, means the same text as when it was taken.
+   */
+  contentKey(docId: DocId): string {
+    return this.node.store.fingerprint(this.roomId, docId);
+  }
+
+  /**
+   * The content key of a note whose text now is exactly what its held envelopes make: loaded, every envelope the store
+   * added since taken in, none waiting for a key or for what it builds on. Otherwise undefined (its text may lag).
+   */
+  syncedKey(docId: DocId): string | undefined {
+    const state = this.docs.get(docId);
+    if (!state || state.pending.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId)) return undefined;
+    if (state.base + state.received !== this.node.store.addsOf(this.roomId, docId)) return undefined;
+    return this.contentKey(docId);
+  }
+
+  /**
+   * Let go of notes not used for `idleMs` (memory: a room can hold tens of thousands): each is loaded again from the
+   * store when next needed. Not a note `keep` says is in use (open in an editor), nor one with anything held only in
+   * memory: updates waiting for what they build on or for a key, edits waiting to be sent, a clash being worked out.
+   */
+  releaseIdle(idleMs: number, keep: (docId: DocId) => boolean): void {
+    if (this.passingOn) return;
+    const now = Date.now();
+    for (const [docId, state] of [...this.docs]) {
+      if (docId === INDEX_DOC || now - (this.lastUsed.get(docId) ?? 0) < idleMs) continue;
+      if (state.pending.size > 0 || this.unsent.has(docId) || this.waitingDocs.has(docId) || this.clashes.busy(docId) || keep(docId)) continue;
+      state.doc.destroy();
+      this.docs.delete(docId);
+      this.lastUsed.delete(docId);
+    }
+  }
+
   /** Changes whenever a document may have (local or remote, deletions included, or rebuilt): a key for caches of it. */
   docVersion(docId: DocId): number {
     this.loadDoc(docId);
@@ -310,10 +383,8 @@ export class RoomReplica {
   }
 
   /** Live index entries with a safe path. */
-  files(): Map<string, FileEntry> {
-    const out = new Map<string, FileEntry>();
-    for (const [fileId, entry] of this.entries()) if (!entry.deleted) out.set(fileId, entry);
-    return out;
+  files(): ReadonlyMap<string, FileEntry> {
+    return this.indexNow().files;
   }
 
   /** The note document for a file (loaded and decrypted on first use). */
@@ -332,7 +403,7 @@ export class RoomReplica {
   isComplete(docId: DocId): boolean {
     if (this.node.store.isUnreadable(this.roomId, docId)) return false;
     if (waitsForDependencies(this.loadDoc(docId).doc)) return false;
-    for (const env of this.waiting.values()) if (env.doc === docId) return false;
+    if (this.waitingDocs.has(docId)) return false;
     return true;
   }
 
@@ -404,12 +475,13 @@ export class RoomReplica {
   // ---- incoming ----
 
   private loadDoc(docId: DocId): DocState {
+    this.lastUsed.set(docId, Date.now());
     let state = this.docs.get(docId);
     if (state) return state;
     const store = this.node.store;
     const doc = new Y.Doc({ gc: true });
     // Marks: updates folded into a snapshot this device checked (and applied, below).
-    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0 };
+    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0, base: store.addsOf(this.roomId, docId), received: 0 };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
     const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
@@ -485,6 +557,10 @@ export class RoomReplica {
   receive(env: StoredEnvelope): void {
     if (this.destroyed || env.room !== this.roomId || env.k === "b") return;
     const state = this.docs.get(env.doc);
+    if (state) {
+      this.lastUsed.set(env.doc, Date.now());
+      state.received++;
+    }
     // Notes not loaded yet are decrypted when they are first opened; only tell the owner something changed.
     if (!state) {
       this.events.doc?.(env.doc);
@@ -511,6 +587,7 @@ export class RoomReplica {
     const key = this.keys.get(env.n);
     if (!key) {
       this.waiting.set(`${env.k}/${docId}/${env.author}/${env.k === "u" ? env.clock : env.seq}`, env);
+      this.waitingDocs.add(docId);
       return false;
     }
     let bytes: Uint8Array;
@@ -523,8 +600,9 @@ export class RoomReplica {
       // Held whole until what it builds on is in (Yjs would apply part of it). Only what depends on a missing update
       // waits: anything else goes in at once.
       // shortcut: held updates stay in memory only (their envelopes are stored), bound them if a room ever piles them up.
-      if (!dependenciesReady(state.doc, bytes)) {
-        state.pending.set(envelopeKey(env), { env, bytes });
+      const needs = dependencyNeeds(bytes);
+      if (!ready(state.doc, needs)) {
+        state.pending.set(envelopeKey(env), { env, bytes, needs });
         return false;
       }
       const before = Y.encodeStateVector(state.doc);
@@ -539,7 +617,7 @@ export class RoomReplica {
           Y.applyUpdate(state.doc, item.bytes, REMOTE);
           next = undefined;
           for (const [key, held] of state.pending) {
-            if (!dependenciesReady(state.doc, held.bytes)) continue;
+            if (!ready(state.doc, held.needs)) continue;
             state.pending.delete(key);
             next = held;
             break;
@@ -586,6 +664,7 @@ export class RoomReplica {
   private retryWaiting(): void {
     const waiting = [...this.waiting.values()];
     this.waiting.clear();
+    this.waitingDocs.clear();
     const touched = new Set<DocId>();
     for (const env of waiting) {
       const state = this.docs.get(env.doc);

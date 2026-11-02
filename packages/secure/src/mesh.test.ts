@@ -7,6 +7,7 @@ import { INDEX_DOC, openEnvelope, sealBlob, sealPresence, sealSnapshot, sealUpda
 import { randomId } from "./ids.js";
 import { createJoinRecord, foldJoinInto, joinHash } from "./invite.js";
 import { keyCommitment, newRoomKey, sealRoomName, unwrapRoomKey, wrapRoomKey } from "./keys.js";
+import { encodeFrame } from "./frames.js";
 import { JoinHandshake, MeshNode, versionBatches, type Channel, type PeerMessage, type PeerSession } from "./mesh.js";
 import { RoomReplica } from "./replica.js";
 import { createRoom, fold, founder, invite, Network, step, type TestDevice } from "./testkit.js";
@@ -124,6 +125,42 @@ describe("mesh", () => {
     const next = summaries(cy.id);
     expect(next).not.toBe(first);
     expect(next.t === "room" && Object.values(next.docs)[0]!.vv[ana.id]).toBe(2);
+  });
+
+  it("passes a push on only to peers that don't have it yet, and encodes it once for all of them", () => {
+    const { chain, ana, ben, cy, seal } = setup();
+    const node = nodeFor(chain, ben);
+    const sent = new Map<string, PeerMessage[]>([[ana.id, []], [cy.id, []]]);
+    const sessions = new Map([...sent.keys()].map((device) => [device, node.connect({ send: (message) => sent.get(device)!.push(message), close: () => {} }, device)]));
+    // Ana sent it to Ben and Cy at once: Ben doesn't send it to Cy again.
+    sessions.get(ana.id)!.receive({ t: "push", env: seal(ana, 1, "one"), items: [ana.id, ben.id, cy.id] });
+    expect(sent.get(cy.id)!.filter((message) => message.t === "push")).toHaveLength(0);
+    // Without that (0.3.6 sends none): passed on, saying who has it now.
+    sessions.get(ana.id)!.receive({ t: "push", env: seal(ana, 2, "two") });
+    const pushed = sent.get(cy.id)!.filter((message) => message.t === "push");
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]!.t === "push" && pushed[0]!.items).toEqual(expect.arrayContaining([ana.id, cy.id]));
+    expect(encodeFrame(pushed[0])).toBe(encodeFrame(pushed[0]));
+    for (const session of sessions.values()) session.close("done");
+  });
+
+  it("sends its wraps only to a peer whose hello shows it doesn't hold the same ones", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const node = nodeFor(chain, ana);
+    const wrap = wrapRoomKey(ws, roomId, 1, key, { id: cy.id, agree: cy.agree.publicKey }, ana.sign);
+    const none = node.wrapsDigest();
+    expect(node.addWrap(wrap)).toBe(true);
+    expect(node.wrapsDigest()).not.toBe(none);
+    const wrapsSent = (items?: string[]) => {
+      const sent: PeerMessage[] = [];
+      const session = node.connect({ send: (message) => sent.push(message), close: () => {} }, cy.id);
+      session.receive({ t: "hello", ws, head: chain.head.body.v, recent: [[chain.head.body.v, chain.headHash]], ...(items ? { items } : {}) });
+      session.close("done");
+      return sent.filter((message) => message.t === "wraps").length;
+    };
+    expect(wrapsSent()).toBe(1);
+    expect(wrapsSent(["fragments", `wraps:${node.wrapsDigest()}`])).toBe(0);
+    expect(wrapsSent(["fragments", "wraps:something else"])).toBe(1);
   });
 
   it("caps blob hints at the count accepted by the receiving parser", () => {

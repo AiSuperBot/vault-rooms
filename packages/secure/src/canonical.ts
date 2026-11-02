@@ -14,8 +14,52 @@ export function canonicalJson(value: unknown): string {
 
 const MAX_DEPTH = 32;
 
+/** Objects frozen whole by freezeDeep: they can't change. */
+const deeplyFrozen = new WeakSet<object>();
+/**
+ * Of those, the ones whose encoding is kept (see keepEncoding), with the depth below them, so the depth limit still holds
+ * wherever one is met again: records shared by many versions of the workspace are encoded once.
+ */
+const keep = new WeakSet<object>();
+const encoded = new WeakMap<object, { json: string; height: number }>();
+/** The deepest level reached so far by the encoding under way (see encode). */
+let reached = 0;
+
+/** Freeze a value and everything in it, for good: what is frozen so is encoded once (see canonicalJson). */
+export function freezeDeep<T>(value: T): T {
+  if (typeof value !== "object" || value === null || deeplyFrozen.has(value)) return value;
+  Object.freeze(value);
+  for (const child of Object.values(value)) freezeDeep(child);
+  deeplyFrozen.add(value);
+  return value;
+}
+
+/** Keep the encoding of a deeply frozen value once it is made (a value shared widely, not each one: memory). */
+export function keepEncoding(value: object): void {
+  if (deeplyFrozen.has(value)) keep.add(value);
+}
+
 function encode(value: unknown, depth: number): string {
   if (depth > MAX_DEPTH) fail("canonical_too_deep");
+  reached = Math.max(reached, depth);
+  if (typeof value === "object" && value !== null && keep.has(value)) {
+    const known = encoded.get(value);
+    if (known) {
+      if (depth + known.height > MAX_DEPTH) fail("canonical_too_deep");
+      reached = Math.max(reached, depth + known.height);
+      return known.json;
+    }
+    const outer = reached;
+    reached = depth;
+    const json = encodeNow(value, depth);
+    encoded.set(value, { json, height: reached - depth });
+    reached = Math.max(outer, reached);
+    return json;
+  }
+  return encodeNow(value, depth);
+}
+
+function encodeNow(value: unknown, depth: number): string {
   if (value === null) return "null";
   switch (typeof value) {
     case "boolean":

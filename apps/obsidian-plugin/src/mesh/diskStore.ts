@@ -273,10 +273,13 @@ export class DiskStore implements BlobStorage {
       if (!isId(room, "r")) continue;
       // Every copy, a swap's .tmp and .old included: lines are independent and duplicates fold together, so an
       // interrupted rewrite loses nothing.
-      for (const file of (await this.files.list(roomFolder)).files) {
-        const doc = idOfFileName(lastPart(file).replace(/\.jsonl(\.tmp|\.old)?$/, ""));
-        if (doc !== "index" && !isId(doc, "f")) continue;
-        const text = await this.readJournal(file);
+      const journals = (await this.files.list(roomFolder)).files
+        .map((file) => ({ file, doc: idOfFileName(lastPart(file).replace(/\.jsonl(\.tmp|\.old)?$/, "")) }))
+        .filter(({ doc }) => doc === "index" || isId(doc, "f"));
+      // Read several at once (tens of thousands of notes), then taken in one after another, in order.
+      const texts = await readAll(journals, ({ file }) => this.readJournal(file));
+      for (const [i, { file, doc }] of journals.entries()) {
+        const text = texts[i]!;
         if (text !== null) {
           this.addLines(store, room, doc, text);
           continue;
@@ -367,6 +370,7 @@ export class DiskStore implements BlobStorage {
     for (const roomFolder of (await this.files.list(base)).folders) {
       const room = idOfFileName(lastPart(roomFolder));
       if (!isId(room, "r")) continue;
+      const blobs: Array<{ file: string; author: string; id: string; n: number }> = [];
       for (const file of (await this.files.list(roomFolder)).files) {
         const name = lastPart(file);
         if (name === "gone.json") {
@@ -381,8 +385,12 @@ export class DiskStore implements BlobStorage {
         const author = match ? idOfFileName(match[1]!) : "";
         const id = match ? idOfFileName(match[2]!) : "";
         if (!match || !isId(author, "d") || !isHash(id)) continue;
-        const stat = await this.files.stat(file);
-        if (stat) store.restoreBlob({ room, author, id, n: Number(match[3]), size: stat.size, at: stat.mtime });
+        blobs.push({ file, author, id, n: Number(match[3]) });
+      }
+      const stats = await readAll(blobs, ({ file }) => this.files.stat(file));
+      for (const [i, { author, id, n }] of blobs.entries()) {
+        const stat = stats[i];
+        if (stat) store.restoreBlob({ room, author, id, n, size: stat.size, at: stat.mtime });
       }
     }
   }
@@ -533,6 +541,16 @@ export class DiskStore implements BlobStorage {
     this.folders.clear();
     if (await this.files.exists(this.root)) await this.files.rmdir(this.root, true);
   }
+}
+
+/** How many files are read at once when the store opens: a disk serves several in parallel. */
+const READ_AT_ONCE = 32;
+
+/** `read` for every item, READ_AT_ONCE at a time; the results in the items' order. */
+async function readAll<T, R>(items: T[], read: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  for (let i = 0; i < items.length; i += READ_AT_ONCE) for (const result of await Promise.all(items.slice(i, i + READ_AT_ONCE).map(read))) out.push(result);
+  return out;
 }
 
 function numbers(value: unknown): Record<string, number> {
