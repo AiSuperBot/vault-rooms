@@ -223,7 +223,7 @@ export class RoomFolder {
   private stopped = false;
   /** Clash copies to keep, by file id (see noteClashed): written by the next pass, before the note itself. */
   private toKeep = new Map<string, string[]>();
-  /** Notes written from the shared state, by file id: when (see NOTE_WRITE_GAP_MS). */
+  /** Notes written from the shared state, by file id: when, by performance.now() (see NOTE_WRITE_GAP_MS). */
   private noteWrites = new Map<string, number>();
   /** Notes whose writing waits for NOTE_WRITE_GAP_MS, and the pass that writes them. */
   private later = new Set<string>();
@@ -899,7 +899,8 @@ export class RoomFolder {
     for (const id of this.incomplete) if (!desired.has(id)) this.incomplete.delete(id);
     if (!everything && previous && previous.desired !== desired) for (const [id, entry] of desired) if (!sameEntry(previous.desired.get(id), entry)) some.add(id);
     const ids = everything || !previous ? [...desired.keys()] : [...some].filter((id) => desired.has(id));
-    const now = Date.now();
+    // A steady clock: setting the computer's clock back mustn't make a note wait for hours.
+    const now = performance.now();
     this.left = ids.length;
     for (const id of ids) {
       this.left--;
@@ -1121,7 +1122,7 @@ export class RoomFolder {
     // Changed meanwhile (saved again while its copy was being kept, say), or an editor bound meanwhile (which owns the
     // note now): left as it is and looked at again next time.
     const wrote = await this.writeShared(entry.path, remote, basedOn, () => this.o.isBound(id));
-    if (wrote && entry.kind === "md") this.noteWrites.set(id, Date.now());
+    if (wrote && entry.kind === "md") this.noteWrites.set(id, performance.now());
     if (wrote) this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     else if (!this.o.isBound(id)) {
       const known = this.known.get(id);

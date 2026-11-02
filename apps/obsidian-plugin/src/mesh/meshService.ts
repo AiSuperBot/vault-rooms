@@ -104,6 +104,8 @@ export interface RoomInfo {
 
 export class MeshServiceError extends Error {}
 
+const CLOCK_BEHIND = "This computer's clock is behind the workspace's last change. Check the date and time here (set automatically, if you can), and on the computer that made the last change, then try again.";
+
 /** Refusals of a change to the record that someone can run into, in words (the rest are bugs or tampering). */
 const REFUSALS: Record<string, string> = {
   no_manager: "A room needs at least one manager: make someone else a manager first.",
@@ -113,8 +115,10 @@ const REFUSALS: Record<string, string> = {
   invite_limit: "You have as many open invites as one person may: withdraw one first.",
   device_limit: "That person has as many computers in the workspace as one person may.",
   invite_withdraw: "Only the person who made an invite, an admin, or a manager of all its rooms can withdraw it.",
-  time_backwards: "This computer's clock is behind the workspace's last change: set the date and time right (automatically, if you can), then try again.",
-  future: "This computer's clock is ahead of the others': set the date and time right (automatically, if you can), then try again."
+  // On a change made here both mean the same: this computer's clock is behind the record's last change (or the
+  // computer that made it was ahead).
+  time_backwards: CLOCK_BEHIND,
+  future: CLOCK_BEHIND
 };
 
 /** Rejections that mean the record moved on meanwhile (another change came first): trying again settles them. */
