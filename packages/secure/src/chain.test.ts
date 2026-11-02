@@ -21,6 +21,21 @@ describe("workspace chain", () => {
     expect(() => chain.prefix(chain.length + 1)).toThrow();
   });
 
+  it("shares records unchanged between versions, freezes what it holds, and still refuses a changed record", () => {
+    const { chain, admin } = founder();
+    step(chain, admin, (state) => { state.name = "one"; });
+    const reloaded = WorkspaceChain.load(structuredClone(chain.all()));
+    const [first, second] = reloaded.all().slice(-2);
+    const userId = Object.keys(second!.body.state.users)[0]!;
+    expect(second!.body.state.users[userId]).toBe(first!.body.state.users[userId]);
+    expect(Object.isFrozen(second!.body.state.users[userId])).toBe(true);
+    expect(() => { (reloaded.head.body.state as { name: string }).name = "changed"; }).toThrow();
+    // A record changed after signing (made equal to nothing before it) is still caught.
+    const forged = structuredClone(chain.all());
+    forged.at(-1)!.body.state.users[userId]!.name = "forged";
+    expect(() => WorkspaceChain.load(forged)).toThrow();
+  });
+
   it("appends in order, ignores duplicates and refuses gaps", () => {
     const { chain, admin } = founder();
     const v1 = step(chain, admin, (state) => (state.name = "One"));

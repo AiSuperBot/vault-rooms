@@ -23,6 +23,10 @@ interface DocEntry {
    * a dropped snapshot that is still going around the mesh from being taken in and passed on again, forever.
    */
   dropped: VersionVector;
+  /** See fingerprint: cleared whenever an envelope is added or removed. */
+  fingerprint?: string;
+  /** Envelopes added to it so far (see addsOf). */
+  adds: number;
 }
 
 /** What is kept in memory of a blob; the ciphertext itself stays in a BlobStorage. */
@@ -129,7 +133,7 @@ export class EnvelopeStore {
     if (!docs) this.docsByRoom.set(room, (docs = new Map()));
     let entry = docs.get(doc);
     if (!entry) {
-      docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {} }));
+      docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {}, adds: 0 }));
       this.touch(room);
     }
     return entry;
@@ -167,6 +171,8 @@ export class EnvelopeStore {
     }
     this.docBytes.set(env.room, bytes + env.ct.length);
     this.signatures.set(key, env.sig);
+    entry.fingerprint = undefined;
+    entry.adds++;
     this.touch(env.room);
     this.listener.added?.(env);
     if (env.k === "s" && !member) this.compactOnClaim(env.room, env.doc, entry, env);
@@ -214,6 +220,7 @@ export class EnvelopeStore {
     for (const env of envs) {
       const key = envelopeKey(env);
       if (env.k === "b" || this.signatures.get(key) !== env.sig) continue;
+      entry.fingerprint = undefined;
       if (env.k === "u") {
         const byClock = entry.updates.get(env.author);
         byClock?.delete(env.clock);
@@ -454,6 +461,34 @@ export class EnvelopeStore {
     const cutoff = this.now() - STORE_LIMITS.goneMs;
     for (const [key, at] of gone) if (at < cutoff && gone.delete(key)) this.touch(room);
     return [...gone].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  }
+
+  /**
+   * One short hash of the envelopes held for a document. The same fingerprint, the same envelopes, so (with the keys
+   * there were) the same text: a note need not be decrypted to know it hasn't changed (see RoomFolder.applyContent).
+   */
+  fingerprint(room: string, doc: DocId): string {
+    const entry = this.docsByRoom.get(room)?.get(doc);
+    if (!entry) return "";
+    entry.fingerprint ??= b64u(hashTagged("doc-fingerprint", utf8(canonicalJson({
+      updates: [...entry.updates].map(([author, byClock]) => [author, [...byClock.keys()].sort((a, b) => a - b)]).sort(),
+      snapshots: [...entry.snapshots.keys()].sort()
+    })))).slice(0, 22);
+    return entry.fingerprint;
+  }
+
+  /** How many envelopes were added to a document so far: a replica that took in that many is caught up with it. */
+  addsOf(room: string, doc: DocId): number {
+    return this.docsByRoom.get(room)?.get(doc)?.adds ?? 0;
+  }
+
+  /** Whether this very envelope is held (same key and signature; a blob by its id, or dropped on purpose). */
+  holds(env: StoredEnvelope): boolean {
+    if (env.k === "b") {
+      const key = blobKeyOf(env.author, env.id);
+      return this.blobsByRoom.get(env.room)?.has(key) === true || this.goneByRoom.get(env.room)?.has(key) === true;
+    }
+    return this.signatures.get(envelopeKey(env)) === env.sig;
   }
 
   /**

@@ -211,9 +211,11 @@ export default class VaultRoomsPlugin extends Plugin {
         this.changed();
       }),
       svc.onReplica((roomId, replica) => void this.onReplica(roomId, replica)),
-      svc.onRoomActivity((roomId, docId) => {
+      svc.onRoomActivity((roomId, docId, blob) => {
         if (this.pendingMounts.has(roomId)) this.retryPendingMounts();
-        this.folders.get(roomId)?.remoteChanged(docId);
+        const folder = this.folders.get(roomId);
+        if (blob) folder?.blobArrived(blob);
+        else folder?.remoteChanged(docId);
       }),
       svc.onPresence((env) => this.presences.get(env.room)?.receive(env)),
       svc.onLocalRefused((roomId, docId, code) => this.onLocalRefused(roomId, docId, code)),

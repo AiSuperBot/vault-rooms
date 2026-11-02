@@ -46,8 +46,8 @@ export type PeerMessage =
   /** Exactly what I hold of one room (blobs as "author/id", those dropped here included), so the other side can send what I lack. */
   | { t: "room"; room: string; docs: Record<string, DocSummary>; blobs: string[] }
   | { t: "envelopes"; items: unknown[] }
-  /** One new envelope, live. */
-  | { t: "push"; env: unknown }
+  /** One new envelope, live. `items`: devices it has been sent to already, not to be sent it again (0.3.6 ignores it). */
+  | { t: "push"; env: unknown; items?: string[] }
   /** A joining device's first message: its join record. */
   | { t: "join"; join: unknown }
   /** Where devices of the workspace can be reached: [device id, "host:port"] (see MeshNode.addressBook). */
@@ -85,6 +85,8 @@ const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
 const MAX_BRANCH_BYTES = 256 << 20;
+/** Devices a push may name as having it already (see MeshNode.push): more than a workspace holds. */
+const MAX_TOLD = 2000;
 
 function hashOf(purpose: string, value: unknown): string {
   return b64u(hashTagged(purpose, utf8(canonicalJson(value))));
@@ -194,6 +196,7 @@ export class MeshNode {
   private answersSince = 0;
   private stopped = false;
   private resyncTimer: ReturnType<typeof setTimeout> | null = null;
+  private wrapsDigestCache: string | null = null;
   /** @internal Room summaries, shared by the sessions (see PeerSession.sendRoom). */
   readonly summaries = new Map<string, { version: number; message: PeerMessage }>();
 
@@ -306,7 +309,7 @@ export class MeshNode {
     let wrapsChanged = false;
     for (const [slot, wrap] of this.wraps) {
       if (this.effective().rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit === wrap.body.commit) continue;
-      this.wraps.delete(slot);
+      this.dropWrap(slot);
       this.keepAside(wrap);
       wrapsChanged = true;
     }
@@ -315,7 +318,7 @@ export class MeshNode {
         if (verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
           waiting.delete(hash);
           const slot = wrapSlot(wrap);
-          if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
+          if (!this.wraps.has(slot)) this.setWrap(slot, wrap);
           wrapsChanged = true;
         } else if (waiting === this.staleWraps && !this.worthKeeping(wrap)) {
           waiting.delete(hash);
@@ -363,7 +366,7 @@ export class MeshNode {
     for (const wrap of wraps) {
       if (verifyKeyWrap(this.effective(), this.workspaceId, wrap)) {
         const slot = wrapSlot(wrap);
-        if (!this.wraps.has(slot)) this.wraps.set(slot, wrap);
+        if (!this.wraps.has(slot)) this.setWrap(slot, wrap);
       } else if (this.worthKeeping(wrap)) this.keepAside(wrap);
     }
     this.events.wraps?.();
@@ -390,6 +393,22 @@ export class MeshNode {
   /** The wraps that count: of a key the record has, from a device that may give it. */
   allWraps(): KeyWrap[] {
     return [...this.wraps.values()];
+  }
+
+  // The wraps are only changed through these, so their digest (see wrapsDigest) is never stale.
+  private setWrap(slot: string, wrap: KeyWrap): void {
+    this.wraps.set(slot, wrap);
+    this.wrapsDigestCache = null;
+  }
+
+  private dropWrap(slot: string): void {
+    if (this.wraps.delete(slot)) this.wrapsDigestCache = null;
+  }
+
+  /** One hash of the wraps that count here: a peer holding the same set isn't sent them again (see PeerSession.hello). */
+  wrapsDigest(): string {
+    this.wrapsDigestCache ??= hashOf("wraps", [...this.wraps.values()].map((wrap) => wrap.sig).sort());
+    return this.wrapsDigestCache;
   }
 
   /** Wraps to keep on disk: those that count, and those set aside because the record may name their key again. */
@@ -459,23 +478,27 @@ export class MeshNode {
       waiting.set(hash, wrap);
       return false;
     }
-    this.wraps.set(slot, wrap);
+    this.setWrap(slot, wrap);
     this.events.wraps?.();
     this.broadcast({ t: "wraps", wraps: [wrap] }, from);
     return true;
   }
 
   /** Store and pass on a room envelope (presence is only passed on). False if invalid, already known or refused. */
-  publish(env: Envelope, from?: PeerSession): boolean {
+  /** `told`: devices that have it already (see push), not sent it again. */
+  publish(env: Envelope, from?: PeerSession, told: readonly string[] = []): boolean {
+    // Held already, this very envelope (same key and signature, checked when it came first): every peer of a mesh
+    // passes each one on, so most copies end here, before the costly check.
+    if (env.k === "p" ? this.presenceSeen(env) : this.store.holds(env)) return false;
     if (!verifyEnvelope(this.effective(), this.workspaceId, env)) return false;
-    if (env.k === "p") return this.presence(env, from);
+    if (env.k === "p") return this.presence(env, from, told);
     const result = this.store.add(env);
     if (result === "conflict") this.events.rejected?.("equivocation", env.author);
     if (result === "quota") this.events.rejected?.(`quota:${env.room}`, env.author);
     if (result !== "added") return false;
     this.events.envelope?.(env);
     const mine = !from && env.author === this.deviceId;
-    if (!mine || !this.persist) this.broadcast({ t: "push", env }, from);
+    if (!mine || !this.persist) this.push(env, from, told);
     // An attachment received isn't held in memory to be stored again (it can be large): should storing it fail, it is
     // missing here until Obsidian starts again, and then a peer sends it again.
     if (!this.persist || (!mine && env.k === "b")) return true;
@@ -498,7 +521,7 @@ export class MeshNode {
           }
           this.unpersisted.delete(key);
           if (this.stopped) return;
-          this.broadcast({ t: "push", env });
+          this.push(env, undefined);
           this.events.stored?.(env);
         },
         (error: unknown) => {
@@ -546,11 +569,15 @@ export class MeshNode {
   }
 
   /** Presence: only fresh messages, at a bounded rate per author, each passed on once. */
-  private presence(env: PresenceEnvelope, from?: PeerSession): boolean {
+  private presenceSeen(env: PresenceEnvelope): boolean {
+    const key = `${env.room}/${env.author}/${env.at}/${env.sig}`;
+    return this.seenPresence.has(key) || this.olderPresence.has(key);
+  }
+
+  private presence(env: PresenceEnvelope, from?: PeerSession, told: readonly string[] = []): boolean {
     const now = this.now();
     if (Math.abs(now - env.at) > PRESENCE_WINDOW_MS) return false;
     const key = `${env.room}/${env.author}/${env.at}/${env.sig}`;
-    if (this.seenPresence.has(key) || this.olderPresence.has(key)) return false;
     let budget = this.presenceBudgets.get(env.author);
     if (!budget) {
       if (this.presenceBudgets.size >= PRESENCE_MEMORY) this.presenceBudgets.clear();
@@ -564,7 +591,7 @@ export class MeshNode {
     }
     this.seenPresence.add(key);
     this.events.presence?.(env);
-    this.broadcast({ t: "push", env }, from);
+    this.push(env, from, told);
     return true;
   }
 
@@ -596,6 +623,19 @@ export class MeshNode {
   shareAddresses(): void {
     const items = this.addressBook().slice(0, MAX_ADDRESSES);
     if (items.length > 0) this.broadcast({ t: "addresses", items });
+  }
+
+  /**
+   * Pass an envelope on to the peers that don't have it yet, saying who does (its author, who sent it, and everyone it
+   * goes to now): each of them passes it on only to others. One message for all of them, encoded once.
+   */
+  private push(env: Envelope, from: PeerSession | undefined, told: readonly string[] = []): void {
+    const known = new Set(told);
+    const targets = [...this.sessions].filter((session) => session !== from && session.ready && !known.has(session.remoteDevice));
+    if (targets.length === 0) return;
+    const items = [...new Set([...told, env.author, ...(from ? [from.remoteDevice] : []), ...targets.map((session) => session.remoteDevice)])].slice(0, MAX_TOLD);
+    const message: PeerMessage = { t: "push", env, items };
+    for (const session of targets) session.send(message);
   }
 
   private broadcast(message: PeerMessage, except?: PeerSession): void {
@@ -672,11 +712,12 @@ export class PeerSession {
   }
 
   /**
-   * `items` says what this side reads beyond 0.3.6: "fragments", versions sent in parts with `end` and `hash`. 0.3.6
-   * takes a hello with `items` (a key its messages may have) and drops a versions message with keys it doesn't know.
+   * `items` says what this side reads beyond 0.3.6: "fragments", versions sent in parts with `end` and `hash`; and
+   * "wraps:<digest>", the wraps it holds (see MeshNode.wrapsDigest), not sent to it again. 0.3.6 takes a hello with
+   * `items` (a key its messages may have) and drops a versions message with keys it doesn't know.
    */
   private hello(): PeerMessage {
-    return { t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent(), items: ["fragments"] };
+    return { t: "hello", ws: this.node.workspaceId, head: this.node.chain.head.body.v, recent: this.node.recent(), items: ["fragments", `wraps:${this.node.wrapsDigest()}`] };
   }
 
   send(message: PeerMessage): void {
@@ -787,8 +828,10 @@ export class PeerSession {
         return this.onRoom(message);
       case "envelopes":
         return this.each(message.items, (item) => this.node.publish(parseEnvelope(item), this));
-      case "push":
-        return this.each([message.env], (item) => this.node.publish(parseEnvelope(item), this));
+      case "push": {
+        const told = Array.isArray(message.items) ? message.items.slice(0, MAX_TOLD).filter((id): id is string => isId(id, "d")) : [];
+        return this.each([message.env], (item) => this.node.publish(parseEnvelope(item), this, told));
+      }
       case "join":
         return this.each([message.join], (join) => this.node.addJoin(parseJoinRecord(join), this));
       case "addresses":
@@ -895,8 +938,11 @@ export class PeerSession {
     }
     const joins = this.node.pendingJoinRecords();
     if (joins.length > 0) this.send({ t: "joins", joins });
-    const wraps = this.node.allWraps();
-    for (let i = 0; i < wraps.length; i += MAX_ITEMS) this.send({ t: "wraps", wraps: wraps.slice(i, i + MAX_ITEMS) });
+    // Unless its hello shows it holds the same wraps already (thousands of them in a large workspace).
+    if (!(Array.isArray(message.items) && message.items.includes(`wraps:${this.node.wrapsDigest()}`))) {
+      const wraps = this.node.allWraps();
+      for (let i = 0; i < wraps.length; i += MAX_ITEMS) this.send({ t: "wraps", wraps: wraps.slice(i, i + MAX_ITEMS) });
+    }
     this.sendDigests();
   }
 

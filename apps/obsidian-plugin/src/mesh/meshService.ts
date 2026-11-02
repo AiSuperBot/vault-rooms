@@ -116,7 +116,7 @@ export class MeshService {
   private presenceListeners = new Set<(env: PresenceEnvelope) => void>();
   private replicas = new Map<string, RoomReplica>();
   private replicaListeners = new Set<(roomId: string, replica: RoomReplica | null) => void>();
-  private activityListeners = new Set<(roomId: string, docId?: string) => void>();
+  private activityListeners = new Set<(roomId: string, docId?: string, blob?: string) => void>();
   private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
   private lostRoomListeners = new Set<(roomId: string) => void>();
   private clashListeners = new Set<(roomId: string, docId: string, version: string) => boolean>();
@@ -163,7 +163,7 @@ export class MeshService {
       const replica = this.replicas.get(env.room);
       if (!replica) return;
       replica.receive(env);
-      this.roomActivity(env.room, env.k === "b" ? undefined : env.doc);
+      this.envelopeActivity(env);
     };
     events.envelope = take;
     // History read from disk late (in use by another program when the workspace opened): taken in like news, and the
@@ -175,7 +175,7 @@ export class MeshService {
     events.presence = (env) => {
       for (const listener of this.presenceListeners) listener(env);
     };
-    events.stored = (env) => this.roomActivity(env.room, env.k === "b" ? undefined : env.doc);
+    events.stored = (env) => this.envelopeActivity(env);
     events.sessions = () => this.emit();
     events.compared = () => this.automateSoon();
     events.rejected = (reason, from) => {
@@ -419,8 +419,11 @@ export class MeshService {
     return () => this.replicaListeners.delete(listener);
   }
 
-  /** Something arrived for a room (content or a key): its folder should look again (at `docId` only, if given). */
-  onRoomActivity(listener: (roomId: string, docId?: string) => void): () => void {
+  /**
+   * Something arrived for a room (content or a key): its folder should look again, at `docId` only if given, or at the
+   * files using attachment version `blob` ("author/id").
+   */
+  onRoomActivity(listener: (roomId: string, docId?: string, blob?: string) => void): () => void {
     this.activityListeners.add(listener);
     return () => this.activityListeners.delete(listener);
   }
@@ -443,8 +446,13 @@ export class MeshService {
     return () => this.lostRoomListeners.delete(listener);
   }
 
-  private roomActivity(roomId: string, docId?: string): void {
-    for (const listener of this.activityListeners) listener(roomId, docId);
+  private roomActivity(roomId: string, docId?: string, blob?: string): void {
+    for (const listener of this.activityListeners) listener(roomId, docId, blob);
+  }
+
+  private envelopeActivity(env: StoredEnvelope): void {
+    if (env.k === "b") this.roomActivity(env.room, undefined, `${env.author}/${env.id}`);
+    else this.roomActivity(env.room, env.doc);
   }
 
   private emit(): void {

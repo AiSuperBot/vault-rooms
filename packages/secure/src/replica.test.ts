@@ -133,6 +133,79 @@ describe("room replica", () => {
     expect(c.node.store.maxSnapshotSeq(s.roomId, id, s.cy.id)).toBe(before);
   });
 
+  it("ends with the same text whatever order the edits of three people arrive in", () => {
+    for (let seed = 1; seed <= 20; seed++) {
+      let random = seed;
+      const next = (n: number) => (random = (random * 1103515245 + 12345) % 2 ** 31) % n;
+      const s = setup();
+      const a = s.member(s.ana), c = s.member(s.cy);
+      s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+      s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+      const id = addNote(a.replica, "Plan.md", "start");
+      s.net.pump();
+      // Three writers editing one text, each update depending on what its writer had seen.
+      const base = Y.encodeStateAsUpdate(c.replica.noteDoc(id));
+      const writers = [1, 2, 3].map(() => { const doc = new Y.Doc(); Y.applyUpdate(doc, base); return doc; });
+      const updates: Uint8Array[] = [];
+      for (let i = 0; i < 40; i++) {
+        const writer = writers[next(3)]!;
+        const other = writers[next(3)]!;
+        if (other !== writer) Y.applyUpdate(writer, Y.encodeStateAsUpdate(other));
+        const before = Y.encodeStateVector(writer);
+        const text = writer.getText("content");
+        if (text.length > 2 && next(3) === 0) text.delete(next(text.length - 1), 1 + next(2));
+        else text.insert(next(text.length + 1), String.fromCharCode(97 + next(26)));
+        updates.push(Y.encodeStateAsUpdate(writer, before));
+      }
+      const all = new Y.Doc();
+      Y.applyUpdate(all, base);
+      for (const update of updates) Y.applyUpdate(all, update);
+      const clock = a.node.store.maxClock(s.roomId, id, s.ana.id);
+      const order = updates.map((_, i) => i).sort(() => next(3) - 1);
+      const store = () => (c.replica.noteDoc(id) as unknown as { store: { pendingStructs: unknown; pendingDs: unknown } }).store;
+      for (const i of order) {
+        a.node.publish(sealUpdate({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.ana.sign }, id, clock + 1 + i, updates[i]!));
+        s.net.pump();
+        // Never half applied: Yjs is never left holding part of an update.
+        expect([store().pendingStructs, store().pendingDs]).toEqual([null, null]);
+      }
+      expect(c.replica.noteText(id)).toBe(all.getText("content").toString());
+      expect(c.replica.isComplete(id)).toBe(true);
+      for (const doc of [...writers, all]) doc.destroy();
+    }
+  });
+
+  it("lets idle notes go and loads them again intact, and keys a note's text only once it has all its store holds", () => {
+    const s = setup();
+    const a = s.member(s.ana), c = s.member(s.cy);
+    s.wrapFor(s.ana); s.wrapFor(s.cy); a.replica.refreshKeys();
+    s.net.link(a.node, c.node); s.net.pump(); c.replica.refreshKeys();
+    const id = addNote(a.replica, "Plan.md", "first");
+    s.net.pump();
+    expect(c.replica.noteText(id)).toBe("first");
+    const docs = () => (c.replica as unknown as { docs: Map<string, unknown> }).docs;
+    // Open in an editor (kept), then not.
+    c.replica.releaseIdle(0, (doc) => doc === id);
+    expect(docs().has(id)).toBe(true);
+    c.replica.releaseIdle(0, () => false);
+    expect(docs().has(id)).toBe(false);
+    expect(c.replica.noteText(id)).toBe("first");
+    expect(c.replica.syncedKey(id)).toBe(c.replica.contentKey(id));
+    // The store holds an edit the loaded note hasn't taken in yet: its text isn't keyed until it has.
+    const clock = c.node.store.maxClock(s.roomId, id, s.ana.id);
+    const later = new Y.Doc();
+    Y.applyUpdate(later, Y.encodeStateAsUpdate(c.replica.noteDoc(id)));
+    const before = Y.encodeStateVector(later);
+    later.getText("content").insert(5, " and second");
+    const env = sealUpdate({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.ana.sign }, id, clock + 1, Y.encodeStateAsUpdate(later, before));
+    expect(c.node.store.add(env)).toBe("added");
+    expect(c.replica.syncedKey(id)).toBeUndefined();
+    c.replica.receive(env);
+    expect(c.replica.noteText(id)).toBe("first and second");
+    expect(c.replica.syncedKey(id)).toBe(c.replica.contentKey(id));
+    later.destroy();
+  });
+
   it("applies an independent update while another waits for its dependency", () => {
     const s = setup();
     const a = s.member(s.ana), c = s.member(s.cy);
@@ -215,9 +288,11 @@ describe("room replica", () => {
     s.net.pump();
     expect(c.replica.files().size).toBe(0);
     expect(c.replica.epochsMissing()).toEqual([1]);
+    expect(c.replica.isComplete(fileId)).toBe(false);
     s.wrapFor(s.cy);
     s.net.pump();
     expect(c.replica.noteText(fileId)).toBe("Secret plan");
+    expect(c.replica.isComplete(fileId)).toBe(true);
   });
 
   it("keeps edits made before any key arrived, and sends them once one does", () => {

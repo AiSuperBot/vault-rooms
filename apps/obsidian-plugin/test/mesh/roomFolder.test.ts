@@ -403,6 +403,23 @@ describe("reported file regressions", () => {
     expect(save).toHaveBeenCalled();
   });
 
+  it("writes an attachment when its content arrives, looking at the files using it only", async () => {
+    const { s, c } = await pair({ "Image.png": "image bytes", "Plan.md": "plan" });
+    const [id, entry] = [...c.replica.files()].find(([, e]) => e.kind === "bin")!;
+    // It hadn't arrived when the pass came: nothing written then.
+    c.vault.files.delete("Team/Image.png");
+    const read = vi.spyOn(c.replica, "readBlob").mockResolvedValueOnce(null);
+    c.folder.remoteChanged(id);
+    await s.settle();
+    expect(c.vault.files.has("Team/Image.png")).toBe(false);
+    read.mockRestore();
+    const text = vi.spyOn(c.replica, "noteText");
+    c.folder.blobArrived(`${entry!.blob!.by}/${entry!.blob!.id}`);
+    await s.settle();
+    expect(c.vault.text("Team/Image.png")).toBe("image bytes");
+    expect(text).not.toHaveBeenCalled();
+  });
+
   it("handles repeated save events with direct lookups and no full index or known-path scans", async () => {
     const files = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [`n${i}.md`, `note ${i}`]));
     const { a } = await pair(files);
@@ -2404,7 +2421,7 @@ describe("room folder, retries", () => {
     await s.settle();
     await a.vault.writeText("Team/Plan.md", "base\nkept\n");
     await s.settle();
-    const live = (pc: { replica: { files(): Map<string, { path: string }> } }) => [...pc.replica.files().values()].filter((entry) => entry.path.startsWith("Plan"));
+    const live = (pc: { replica: { files(): ReadonlyMap<string, { path: string }> } }) => [...pc.replica.files().values()].filter((entry) => entry.path.startsWith("Plan"));
     expect(live(a)).toHaveLength(1);
     expect(live(c)).toHaveLength(1);
     expect(text(c.vault, `Team/${live(c)[0]!.path}`)).toBe("base\nkept\n");
@@ -2594,6 +2611,22 @@ describe("room folder, blocked renames", () => {
     await c.vault.writeText("Team/New.md", "from Cy\n");
     await s.settle();
     expect(a.folder.health().failing).toContain("scan.pdf");
+  });
+
+  it("doesn't load notes unchanged since the last sync when Obsidian starts again, and still writes a changed one", async () => {
+    const files = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`n${i}.md`, `note ${i}`]));
+    const { s, a, c } = await pair(files);
+    await c.folder.stop();
+    const again = s.make(s.cy, "Team", c.vault, c);
+    s.net.link(again.node, a.node);
+    await again.folder.start();
+    await s.settle();
+    const loaded = () => [...(again.replica as unknown as { docs: Map<string, unknown> }).docs.keys()].filter((doc) => doc !== "index");
+    expect(loaded()).toEqual([]);
+    await a.vault.writeText("Team/n7.md", "note 7, changed");
+    await s.settle();
+    expect(c.vault.text("Team/n7.md")).toBe("note 7, changed");
+    expect(loaded()).toHaveLength(1);
   });
 
   it("keeps telling of a file that couldn't be taken in at start, whatever else syncs, and takes it in later", async () => {

@@ -6,12 +6,20 @@ export const MAX_FRAME = 64 << 20;
 /** Frames from a device that isn't a member here yet, once it has shown it holds this device's record (see PeerSession). */
 export const PROVEN_MAX_FRAME = 16 << 20;
 
+/** Frames by message: one message sent to many peers (a pushed attachment, a room summary) is encoded once. */
+const encoded = new WeakMap<object, Buffer>();
+
+/** A message is never changed once sent: its frame is kept with it (and goes when it does). */
 export function encodeFrame(message: unknown): Buffer {
+  const cached = typeof message === "object" && message !== null ? encoded.get(message) : undefined;
+  if (cached) return cached;
   const body = Buffer.from(JSON.stringify(message), "utf8");
   if (body.length > MAX_FRAME) fail("frame_too_large");
   const head = Buffer.alloc(4);
   head.writeUInt32BE(body.length);
-  return Buffer.concat([head, body]);
+  const frame = Buffer.concat([head, body]);
+  if (typeof message === "object" && message !== null) encoded.set(message, frame);
+  return frame;
 }
 
 /**
