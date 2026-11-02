@@ -194,33 +194,23 @@ export class DiskStore implements BlobStorage {
    * The record, as files of CHAIN_SEGMENT versions each, one version per line: a new version is appended, so a change
    * writes that version only, not the whole record (tens of MB once it holds thousands of versions; a single file of
    * it would in the end be too large to read back at all). Read strictly: a locked one is an error, never "none".
-   * Reading stops at the first thing that doesn't read whole (a torn line, a segment cut short): the record read is
-   * always a prefix of what was saved, never one with a gap (peers send the rest), and the next save writes on from it.
+   * Reading stops at the first thing that doesn't read whole (a torn line, a segment cut short or missing): the record
+   * read is always a prefix of what was saved, never one with a gap (peers send the rest), and the next save writes
+   * again from the first segment not read cleanly. chain.json (before 0.3.9) is read too while it is there, and wins
+   * if it holds more (a move to segments that stopped half-way).
    */
   async loadChain(): Promise<SignedVersion[] | null> {
     const folder = `${this.root}/chain`;
-    const names = (await this.files.exists(folder)) ? (await this.files.list(folder)).files.map(lastPart).filter((name) => SEGMENT.test(name)).map((name) => name.slice(0, 12)) : [];
-    this.chainFiles = names.reduce((most, name) => Math.max(most, Number(name.slice(0, 6)) + 1), 0);
-    if (names.length === 0) {
-      // As stored before 0.3.9, whole: the first save writes it as segments (and drops this file).
-      const saved = await this.readWhole(`${this.root}/chain.json`, true);
-      if (saved === null) return null;
-      this.chainWritten = [];
-      this.chainClean = false;
-      return (saved as unknown[]).map(parseSignedVersion);
-    }
+    await this.listChain();
     const versions: SignedVersion[] = [];
-    let clean = true;
     for (let i = 0; i < this.chainFiles; i++) {
-      // A swap stopped half-way leaves the segment as .tmp (new, written whole) or .old (before): read as it was swapped.
+      // A swap stopped half-way leaves the segment as .tmp (new, written whole) or .old (before): read as it was
+      // swapped, and written again from there.
       const base = `${folder}/${segmentName(i)}`;
       let path: string | undefined;
       for (const candidate of [base, `${base}.tmp`, `${base}.old`]) if (!path && (await this.files.exists(candidate))) path = candidate;
-      if (!path) {
-        clean = false;
-        break;
-      }
-      if (path !== base) clean = false;
+      if (!path) break;
+      if (path !== base) this.chainDirtyFrom = Math.min(this.chainDirtyFrom, i);
       let text: string;
       try {
         text = await this.files.read(path);
@@ -228,46 +218,70 @@ export class DiskStore implements BlobStorage {
         throw new Error(`${segmentName(i)} of the record can't be read now (in use by another program?): close that program, then try again`);
       }
       let count = 0;
+      let whole = text.length === 0 || text.endsWith("\n");
       for (const line of text.split("\n")) {
         if (line.length === 0) continue;
         try {
           versions.push(parseSignedVersion(JSON.parse(line)));
           count++;
         } catch {
-          clean = false;
+          whole = false;
           break;
         }
       }
-      if (text.length > 0 && !text.endsWith("\n")) clean = false;
-      // Only the last segment may be short.
-      if (!clean || count < CHAIN_SEGMENT) {
-        if (i < this.chainFiles - 1) clean = false;
+      if (!whole) this.chainDirtyFrom = Math.min(this.chainDirtyFrom, i);
+      // Only the last segment may be short: anything after a short one isn't read.
+      if (!whole || count < CHAIN_SEGMENT) {
+        if (i < this.chainFiles - 1) this.chainDirtyFrom = Math.min(this.chainDirtyFrom, i);
         break;
       }
     }
     this.chainWritten = versions.slice();
-    this.chainClean = clean;
+    const before = await this.readWhole(`${this.root}/chain.json`, true);
+    if (before !== null && (before as unknown[]).length >= versions.length) {
+      this.chainWritten = [];
+      this.chainDirtyFrom = 0;
+      return (before as unknown[]).map(parseSignedVersion);
+    }
     return versions.length > 0 ? versions : null;
+  }
+
+  /** Which segment files there may be (see loadChain); what they hold isn't known until they are read. */
+  private async listChain(): Promise<void> {
+    const folder = `${this.root}/chain`;
+    const names = (await this.files.exists(folder)) ? (await this.files.list(folder)).files.map(lastPart).filter((name) => SEGMENT.test(name)) : [];
+    this.chainFiles = names.reduce((most, name) => Math.max(most, Number(name.slice(0, 6)) + 1), 0);
+    this.chainWritten = [];
+    this.chainDirtyFrom = Infinity;
+    this.chainListed = true;
   }
 
   /** Store the record: from the first version that isn't on disk as it is in `versions` (see loadChain). */
   saveChain(versions: SignedVersion[]): Promise<void> {
     return this.queue(`${this.root}/chain`, async () => {
       const folder = `${this.root}/chain`;
+      // Never read here (a join, say): whatever segment files are there are written over, never appended to.
+      if (!this.chainListed) {
+        await this.listChain();
+        this.chainDirtyFrom = 0;
+      }
       const written = this.chainWritten;
       let same = 0;
       while (same < written.length && same < versions.length && written[same] === versions[same]) same++;
-      if (!this.chainClean || same < written.length) {
-        // From the segment of the first difference on, written again: the later segments removed first, so a stop
-        // half-way leaves a shorter record, never one with a gap or with another branch's versions.
-        const from = Math.floor(same / CHAIN_SEGMENT);
-        this.chainClean = false;
-        for (let i = this.chainFiles - 1; i > from; i--) if (await this.files.exists(`${folder}/${segmentName(i)}`)) await this.files.remove(`${folder}/${segmentName(i)}`);
+      if (same < written.length || this.chainDirtyFrom !== Infinity) {
+        // From the segment of the first difference (or the first not read cleanly) on, written again: every file of the
+        // later segments removed first, so a stop half-way leaves a shorter record, never one with a gap or with another
+        // branch's versions.
+        const from = Math.min(Math.floor(same / CHAIN_SEGMENT), this.chainDirtyFrom);
+        this.chainDirtyFrom = Math.min(this.chainDirtyFrom, from);
+        for (let i = this.chainFiles - 1; i > from; i--) {
+          for (const suffix of ["", ".tmp", ".old"]) if (await this.files.exists(`${folder}/${segmentName(i)}${suffix}`)) await this.files.remove(`${folder}/${segmentName(i)}${suffix}`);
+        }
         const end = Math.min(versions.length, (from + 1) * CHAIN_SEGMENT);
         await this.swapIn(`${folder}/${segmentName(from)}`, lines(versions.slice(from * CHAIN_SEGMENT, end)));
         this.chainFiles = from + 1;
         this.chainWritten = versions.slice(0, end);
-        this.chainClean = true;
+        this.chainDirtyFrom = Infinity;
       }
       // Then appended, segment by segment.
       for (let at = this.chainWritten.length; at < versions.length; ) {
@@ -280,7 +294,7 @@ export class DiskStore implements BlobStorage {
           await this.written(path, this.files.append(path, lines(versions.slice(at, end))));
         } catch (error) {
           // Part of it may be there: written whole next time.
-          this.chainClean = false;
+          this.chainDirtyFrom = segment;
           throw error;
         }
         this.chainWritten = versions.slice(0, end);
@@ -293,11 +307,13 @@ export class DiskStore implements BlobStorage {
 
   /**
    * What the record's files hold (see saveChain): these versions, by object (a version replaced by another isn't one of
-   * them), how many segment files there may be, and whether they hold exactly that, nothing torn or left over.
+   * them), how many segment files there may be, the first segment to be written again whole (Infinity: none), and
+   * whether the files were looked at yet.
    */
   private chainWritten: SignedVersion[] = [];
   private chainFiles = 0;
-  private chainClean = false;
+  private chainDirtyFrom = Infinity;
+  private chainListed = false;
 
   async loadJoins(): Promise<Array<{ join: JoinRecord; firstSeen: number }>> {
     return this.readList(`${this.root}/joins.json`, (entry) => ({ join: parseJoinRecord((entry as { join: unknown }).join), firstSeen: Number((entry as { firstSeen: unknown }).firstSeen) || Date.now() }));

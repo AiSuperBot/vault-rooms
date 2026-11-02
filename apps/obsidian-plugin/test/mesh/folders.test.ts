@@ -132,6 +132,8 @@ describe("the plugin's settings", () => {
     expect(plugin.settingsUnreadable).toBe(true);
     await expect(plugin.saveSettings()).rejects.toThrow("can't be read");
     await expect(plugin.leaveWorkspace()).rejects.toThrow("can't be read");
+    await expect(plugin.createWorkspace({ workspaceName: "Team", userName: "Ana", deviceName: "PC" })).rejects.toThrow("can't be read");
+    await expect(plugin.joinWorkspace({ link: "x", userName: "Ana", deviceName: "PC" })).rejects.toThrow("can't be read");
     expect(plugin.saveData).not.toHaveBeenCalled();
     // Readable again (the other program let go): read as usual on the next try.
     plugin.loadData = async () => ({ mountRoot: "Shared", mesh: { scope: "testscope0000000", workspace: null } });

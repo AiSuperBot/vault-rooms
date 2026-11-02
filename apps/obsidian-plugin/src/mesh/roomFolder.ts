@@ -749,7 +749,15 @@ export class RoomFolder {
     // Deepest first, so a folder whose only content was an emptied folder goes too.
     const folders = [...this.emptied].sort((a, b) => b.length - a.length);
     this.emptied.clear();
-    for (const folder of folders) if (!this.stopped) await this.o.vault.removeEmptyFolder?.(this.vaultPath(folder));
+    for (const folder of folders) {
+      if (this.stopped) return;
+      // One that can't go (in use, or holding something Obsidian doesn't list) stays: never a reason to stop the pass.
+      try {
+        await this.o.vault.removeEmptyFolder?.(this.vaultPath(folder));
+      } catch (error) {
+        this.o.log(`room folder, removing empty "${folder}": ${(error as Error).message}`);
+      }
+    }
   }
 
   /** Do something to a file that its vault event will report: `mark` says what to expect, dropped if it doesn't happen. */
@@ -1002,6 +1010,7 @@ export class RoomFolder {
     while (moves.size > 0 && !this.stopped) {
       let progressed = false;
       for (const [id, { from, to }] of moves) {
+        if (this.stopped) return;
         if (this.o.vault.stat(this.vaultPath(to)) && (pathKey(from) !== pathKey(to) || this.exactLocalPath(to))) continue;
         await this.move(from, to);
         this.setKnown(id, { ...this.known.get(id)!, path: to });

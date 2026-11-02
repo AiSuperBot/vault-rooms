@@ -375,6 +375,39 @@ describe("disk store", () => {
     expect(await new DiskStore(files, "m").loadChain()).toHaveLength(700);
   }, 60_000);
 
+  it("keeps the record readable whatever a save stopped half-way or left behind", async () => {
+    const w = world();
+    const userId = Object.keys(w.chain.head.body.state.users)[0]!;
+    for (let i = 0; i < 1_050; i++) w.chain.offer([nextVersion(w.workspaceId, w.chain.head, w.sign, (state) => (state.users[userId]!.name = `Ana ${i}`))]);
+    const all = w.chain.all();
+    // A store that never read the record (a join tried again) writes over the segments there, never appends to them.
+    const files = new MemoryFiles();
+    await new DiskStore(files, "m").saveChain(all);
+    await new DiskStore(files, "m").saveChain(all);
+    expect(await new DiskStore(files, "m").loadChain()).toHaveLength(1_052);
+    // The move from chain.json stopped while segment 0 was being written: chain.json, still whole, is read.
+    const moving = new MemoryFiles();
+    moving.data.set("m/chain.json", JSON.stringify(all));
+    moving.data.set("m/chain/000000.jsonl.tmp", '{"body":{"kin');
+    const store = new DiskStore(moving, "m");
+    expect(await store.loadChain()).toHaveLength(1_052);
+    await store.saveChain(all);
+    expect(moving.data.has("m/chain.json")).toBe(false);
+    expect(await new DiskStore(moving, "m").loadChain()).toHaveLength(1_052);
+    // Or once segment 0 was written whole, before the rest: chain.json holds more, and is read.
+    const halfway = new MemoryFiles();
+    halfway.data.set("m/chain.json", JSON.stringify(all));
+    halfway.data.set("m/chain/000000.jsonl", all.slice(0, 500).map((version) => `${JSON.stringify(version)}\n`).join(""));
+    expect(await new DiskStore(halfway, "m").loadChain()).toHaveLength(1_052);
+    // A segment's swap left a copy of another branch behind; a replaced branch removes it with the segment.
+    files.data.set("m/chain/000002.jsonl.old", files.data.get("m/chain/000002.jsonl")!);
+    const fork = new DiskStore(files, "m");
+    await fork.loadChain();
+    await fork.saveChain(all.slice(0, 700));
+    expect([...files.data.keys()].filter((key) => key.startsWith("m/chain/000002"))).toEqual([]);
+    expect(await new DiskStore(files, "m").loadChain()).toHaveLength(700);
+  }, 60_000);
+
   it("wipes everything on leaving", async () => {
     const w = world();
     const files = new MemoryFiles();
