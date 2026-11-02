@@ -241,7 +241,6 @@ export default class VaultRoomsPlugin extends Plugin {
       svc.onPresence((env) => this.presences.get(env.room)?.receive(env)),
       svc.onLocalRefused((roomId, docId, code) => this.onLocalRefused(roomId, docId, code)),
       svc.onLostRoom((roomId) => void this.forgetFolder(roomId)),
-      svc.onLateWork((roomId, docIds, run) => void this.lateWork(roomId, docIds, run)),
       // Without the room's folder (hidden, being moved) the clash waits for it, and is settled when it starts again.
       svc.onClash((roomId, docId, version) => this.folders.get(roomId)?.noteClashed(docId, version) ?? false)
     );
@@ -458,47 +457,6 @@ export default class VaultRoomsPlugin extends Plugin {
       await this.saveSettings();
       throw error;
     }
-  }
-
-  /**
-   * Work of someone who had lost write is taken out of a room's notes (see MeshNode.takeBackLateWork): editors on them
-   * are let go first, and each note's text as this computer had it is kept outside every room, on this computer only
-   * (what this user typed on top of that work goes with it, and isn't lost; nor is it shared).
-   */
-  private async lateWork(roomId: string, docIds: string[], run: () => Array<{ docId: string; path: string; text: string }>): Promise<void> {
-    for (const docId of docIds) this.editors.unbindNote(roomId, docId);
-    const changed = run();
-    const name = this.service?.rooms().find((room) => room.id === roomId)?.name ?? roomId.slice(1, 5);
-    for (const { path, text } of changed) {
-      const kept = await this.keepApart(name, path, text);
-      new Notice(kept
-        ? `"${path}" held edits that came from a computer after it was no longer allowed to edit this room. They were taken out; the note as you had it is kept on this computer only, as "${kept}". Take back what is yours, then delete that copy.`
-        : `"${path}" held edits that came from a computer after it was no longer allowed to edit this room. They were taken out, but the note as you had it couldn't be kept.`, 0);
-    }
-    this.syncEditorsSoon();
-  }
-
-  /** Write a note's text to a free name under "Vault Rooms kept", outside every room (so never shared). */
-  private async keepApart(room: string, path: string, text: string): Promise<string | null> {
-    const at = new Date();
-    const two = (n: number) => String(n).padStart(2, "0");
-    const stamp = `${at.getFullYear()}-${two(at.getMonth() + 1)}-${two(at.getDate())} ${two(at.getHours())}${two(at.getMinutes())}`;
-    const dir = normalizePath(`Vault Rooms kept/${folderName(room)} ${stamp}`);
-    const base = path.slice(path.lastIndexOf("/") + 1).replace(/\.md$/i, "");
-    for (let i = 1; i < 100; i++) {
-      const candidate = normalizePath(`${dir}/${base}${i > 1 ? ` ${i}` : ""}.md`);
-      if (this.roomAt(candidate) !== null) return null;
-      if (this.app.vault.getAbstractFileByPath(candidate)) continue;
-      try {
-        if (!this.app.vault.getAbstractFileByPath(dir)) await this.app.vault.createFolder(dir);
-        await this.app.vault.create(candidate, text);
-        return candidate;
-      } catch (error) {
-        console.debug(`Vault Rooms: keeping ${path}: ${(error as Error).message}`);
-        return null;
-      }
-    }
-    return null;
   }
 
   /** Rooms whose new folder is being made (see onReplica). */

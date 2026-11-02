@@ -157,7 +157,6 @@ export class MeshService {
   private activityListeners = new Set<(roomId: string, docId?: string, blob?: string) => void>();
   private refusedListeners = new Set<(roomId: string, docId: string, code: string) => void>();
   private lostRoomListeners = new Set<(roomId: string) => void>();
-  private lateWorkListeners = new Set<(roomId: string, docIds: string[], run: () => Array<{ docId: string; path: string; text: string }>) => void>();
   private clashListeners = new Set<(roomId: string, docId: string, version: string) => boolean>();
   private server: PeerServer | null = null;
   private manager: PeerManager | null = null;
@@ -188,7 +187,6 @@ export class MeshService {
     events: MeshEvents
   ) {
     events.chain = (result) => this.onChain(result);
-    events.lateWork = (room, docs, takeOut) => this.lateWork(room, docs, takeOut);
     events.membership = () => {
       this.saveSoon("joins", () => this.disk.saveJoins(this.node.joinEntries()));
       this.syncReplicas();
@@ -510,38 +508,6 @@ export class MeshService {
   }
 
   /** A room this device created didn't survive a conflict and couldn't be made again. */
-  /**
-   * Work of someone who had lost write is taken out of these notes (see MeshNode.takeBackLateWork). `run` does it and
-   * returns the notes whose text it changed, with their text and path from before, for the owner to keep apart.
-   */
-  onLateWork(listener: (roomId: string, docIds: string[], run: () => Array<{ docId: string; path: string; text: string }>) => void): () => void {
-    this.lateWorkListeners.add(listener);
-    return () => this.lateWorkListeners.delete(listener);
-  }
-
-  private lateWork(room: string, docs: string[], takeOut: () => void): void {
-    const replica = this.replicas.get(room);
-    const run = () => {
-      // The notes as this computer had them, before: what changes is kept apart by the owner.
-      const before = new Map<string, { path: string; text: string }>();
-      for (const doc of docs) {
-        const entry = doc === INDEX_DOC ? undefined : replica?.entry(doc);
-        if (replica && entry?.kind === "md" && replica.isComplete(doc)) before.set(doc, { path: entry.path, text: replica.noteText(doc) });
-      }
-      takeOut();
-      const changed: Array<{ docId: string; path: string; text: string }> = [];
-      for (const doc of docs) {
-        replica?.reload(doc);
-        const was = before.get(doc);
-        if (replica && was && replica.noteText(doc) !== was.text) changed.push({ docId: doc, ...was });
-        this.roomActivity(room, doc);
-      }
-      return changed;
-    };
-    if (this.lateWorkListeners.size === 0) return void run();
-    for (const listener of this.lateWorkListeners) listener(room, docs, run);
-  }
-
   onLostRoom(listener: (roomId: string) => void): () => void {
     this.lostRoomListeners.add(listener);
     return () => this.lostRoomListeners.delete(listener);
