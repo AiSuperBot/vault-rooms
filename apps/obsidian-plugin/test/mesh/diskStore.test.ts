@@ -404,8 +404,13 @@ describe("disk store", () => {
     await new DiskStore(gap, "m").saveChain(all);
     gap.data.delete("m/chain/000001.jsonl");
     const after = new DiskStore(gap, "m");
-    expect(await after.loadChain()).toHaveLength(500);
-    await after.saveChain(all);
+    const loaded = (await after.loadChain())!;
+    expect(loaded).toHaveLength(500);
+    // As the service does: the record it loaded, then what peers send.
+    const caughtUp = WorkspaceChain.load(loaded);
+    caughtUp.offer(all.slice(500));
+    await after.saveChain(caughtUp.all());
+    expect(gap.data.get("m/chain/000002.jsonl")!.split("\n").filter(Boolean)).toHaveLength(52);
     expect(WorkspaceChain.load((await new DiskStore(gap, "m").loadChain())!).headHash).toBe(w.chain.headHash);
     // A segment's swap left a copy of another branch behind; a replaced branch removes it with the segment.
     files.data.set("m/chain/000002.jsonl.old", files.data.get("m/chain/000002.jsonl")!);
