@@ -273,11 +273,6 @@ export class EnvelopeStore {
     for (const [author, seq] of Object.entries(dropped)) entry.dropped[author] = Math.max(entry.dropped[author] ?? 0, seq);
   }
 
-  has(env: StoredEnvelope): boolean {
-    if (env.k === "b") return this.blobsByRoom.get(env.room)?.has(blobKeyOf(env.author, env.id)) ?? false;
-    return this.signatures.has(envelopeKey(env));
-  }
-
   rooms(): string[] {
     return [...new Set([...this.docsByRoom.keys(), ...this.blobsByRoom.keys()])].sort();
   }
@@ -491,7 +486,18 @@ export class EnvelopeStore {
       const key = blobKeyOf(env.author, env.id);
       return this.blobsByRoom.get(env.room)?.has(key) === true || this.goneByRoom.get(env.room)?.has(key) === true;
     }
-    return this.signatures.get(envelopeKey(env)) === env.sig;
+    if (this.signatures.get(envelopeKey(env)) === env.sig) return true;
+    // Or one add() would refuse as a duplicate anyway (an update up to a mark, a snapshot dropped here): neither is
+    // stored, so its signature needn't be checked first (a relay sends dropped snapshots again and again).
+    const entry = this.docsByRoom.get(env.room)?.get(env.doc);
+    if (!entry) return false;
+    return env.k === "u" ? env.clock <= this.markOf(entry, env.author) : env.seq <= (entry.dropped[env.author] ?? 0);
+  }
+
+  /** Keys of the newest snapshot of each author dropped here (see compact): named as held when rooms are compared. */
+  droppedSnapshotKeys(room: string, doc: DocId): string[] {
+    const entry = this.docsByRoom.get(room)?.get(doc);
+    return entry ? Object.entries(entry.dropped).map(([author, seq]) => `${room}/${doc}/s/${author}/${seq}`) : [];
   }
 
   /**

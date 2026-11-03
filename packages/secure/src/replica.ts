@@ -66,6 +66,10 @@ interface DocState {
   undecryptable: Map<string, UpdateEnvelope | SnapshotEnvelope>;
 }
 
+/** Notes loaded at once past which those idle for MANY_LOADED_IDLE_MS are let go (see releaseIdle). */
+const MANY_LOADED = 2_000;
+const MANY_LOADED_IDLE_MS = 30_000;
+
 export interface ReplicaEvents {
   /** A local edit made outside `edit` (an editor) couldn't be shared ("read_only", "too_large", ...). */
   localRefused?(docId: string, code: string): void;
@@ -389,8 +393,11 @@ export class RoomReplica {
   releaseIdle(idleMs: number, keep: (docId: DocId) => boolean): void {
     if (this.passingOn) return;
     const now = Date.now();
+    // Many loaded at once (a catch-up loads a whole room: hundreds of MB): let go of them sooner, though not at once (a
+    // note others type in would be read again whole for each of their keystrokes).
+    const idle = this.docs.size > MANY_LOADED ? Math.min(idleMs, MANY_LOADED_IDLE_MS) : idleMs;
     for (const [docId, state] of [...this.docs]) {
-      if (docId === INDEX_DOC || now - (this.lastUsed.get(docId) ?? 0) < idleMs) continue;
+      if (docId === INDEX_DOC || now - (this.lastUsed.get(docId) ?? 0) < idle) continue;
       if (state.pending.size > 0 || this.unsent.has(docId) || this.waitingDocs.has(docId) || this.clashes.busy(docId) || keep(docId)) continue;
       state.doc.destroy();
       this.docs.delete(docId);

@@ -34,7 +34,8 @@ export class MemoryVault implements VaultLike {
     if (this.failReads?.(path)) throw new Error(`EBUSY ${path}`);
     const data = this.files.get(path);
     if (!data) throw new Error(`ENOENT ${path}`);
-    return Buffer.from(data).toString("utf8");
+    const text = Buffer.from(data).toString("utf8");
+    return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   }
 
   async readBytes(path: string): Promise<Uint8Array> {
@@ -79,6 +80,9 @@ export class MemoryVault implements VaultLike {
     return true;
   }
 
+  /** Names compared as on Windows: a name another file has in another case is refused, as Obsidian does there. */
+  windows = false;
+
   /** Moves of paths this is true for fail (a file another program holds open). */
   failMoves?: (from: string) => boolean;
 
@@ -86,7 +90,7 @@ export class MemoryVault implements VaultLike {
     if (this.failMoves?.(from)) throw new Error(`EBUSY ${from}`);
     const data = this.files.get(from);
     if (!data) throw new Error(`ENOENT ${from}`);
-    if (this.files.has(to)) throw new Error(`EEXIST ${to}`);
+    if (this.files.has(to) || (this.windows && [...this.files.keys()].some((path) => path !== from && path.toLowerCase() === to.toLowerCase()))) throw new Error(`EEXIST ${to}`);
     this.files.delete(from);
     this.put(to, data);
     this.listener.rename?.(from, to);

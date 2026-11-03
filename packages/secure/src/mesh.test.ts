@@ -511,6 +511,144 @@ describe("mesh", () => {
     expect(texts(deeNode, roomId, deeKey)).toEqual(["before Dee"]);
   });
 
+  it("takes in a burst of wraps with one event and a few messages, so no peer's send queue fills", async () => {
+    const { chain, ws, admin: ana } = founder();
+    const people: TestDevice[] = [];
+    for (let i = 0; i < 50; i++) people.push(invite(chain, ana, { userName: `P${i}` }).joiner);
+    const members = Object.fromEntries(people.map((person) => [person.userId, "write" as const]));
+    const rooms = Array.from({ length: 30 }, (_, i) => createRoom(chain, ana, `R${i}`, members));
+    const wraps = rooms.flatMap(({ roomId, key }) => people.map((person) => wrapRoomKey(ws, roomId, 1, key, { id: person.id, agree: person.agree.publicKey }, ana.sign)));
+    let told = 0;
+    const node = new MeshNode(WorkspaceChain.load(chain.all()), people[0]!.id, { wraps: () => void told++ });
+    const closed: string[] = [];
+    const sent: PeerMessage[] = [];
+    const channel = (name: string, out?: PeerMessage[]): Channel => ({ send: (message) => void out?.push(message), close: (reason) => void closed.push(`${name}:${reason}`), drained: () => new Promise<void>((resolve) => setImmediate(resolve)) });
+    const fromAna = node.connect(channel("ana"), ana.id);
+    node.connect(channel("p1", sent), people[1]!.id);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    sent.length = 0;
+    for (let i = 0; i < wraps.length; i += 500) {
+      fromAna.receive(JSON.parse(JSON.stringify({ t: "wraps", wraps: wraps.slice(i, i + 500) })));
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(node.allWraps()).toHaveLength(1_500);
+    expect(closed).toEqual([]);
+    expect(told).toBe(3);
+    expect(sent.filter((message) => message.t === "wraps").map((message) => message.t === "wraps" && message.wraps.length)).toEqual([500, 500, 500]);
+  }, 60_000);
+
+  it("isn't sent a snapshot it dropped again and again by a peer that only relays the room", async () => {
+    const { chain, ws, ana, ben, cy, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    const b = nodeFor(chain, ben);
+    const doc = randomId("f");
+    const ctx = (device: TestDevice) => ({ ws, room: roomId, n: 1, key, author: device.sign });
+    const cyDoc = new Y.Doc();
+    cyDoc.clientID = 5;
+    cyDoc.getText("content").insert(0, "cy line\n");
+    const anaDoc = new Y.Doc();
+    anaDoc.clientID = 9;
+    Y.applyUpdate(anaDoc, Y.encodeStateAsUpdate(cyDoc));
+    anaDoc.getText("content").insert(0, "ana\n");
+    const envelopes = [
+      sealUpdate(ctx(cy), doc, 1, Y.encodeStateAsUpdate(cyDoc)),
+      sealSnapshot(ctx(cy), doc, 1, { [cy.id]: 1 }, Y.encodeStateAsUpdate(cyDoc)),
+      sealUpdate(ctx(ana), doc, 1, Y.encodeStateAsUpdate(anaDoc, Y.encodeStateVector(cyDoc))),
+      sealSnapshot(ctx(ana), doc, 1, { [cy.id]: 1, [ana.id]: 1 }, Y.encodeStateAsUpdate(anaDoc))
+    ];
+    // Ana's computer, a member, drops Cy's snapshot (Ana's holds it); Ben's, which only relays the room, keeps both.
+    const replica = new RoomReplica(a, roomId, { sign: ana.sign, agree: ana.agree });
+    replica.addOwnKey(1, key);
+    a.events.envelope = (env) => replica.receive(env);
+    replica.noteDoc(doc);
+    for (const env of envelopes) {
+      a.publish(env);
+      b.publish(env);
+    }
+    expect(a.store.snapshotKeys(roomId, doc)).toHaveLength(1);
+    expect(b.store.snapshotKeys(roomId, doc)).toHaveLength(2);
+    const net = new Network();
+    const { ab } = net.link(a, b);
+    let sentToA = 0;
+    const receive = ab.receive.bind(ab);
+    ab.receive = (message: unknown) => {
+      if ((message as PeerMessage).t === "envelopes") sentToA += (message as { items: unknown[] }).items.length;
+      return receive(message);
+    };
+    await net.settle();
+    for (let i = 0; i < 3; i++) {
+      ab.askAgain();
+      await net.settle();
+    }
+    expect(sentToA).toBe(0);
+    // Even sent, it would be let go before its signature is checked (as add would refuse it).
+    expect(a.store.holds(envelopes[1]!)).toBe(true);
+  });
+
+  it("passes a catch-up on by comparing, not by pushing it to peers that hold it", async () => {
+    const { chain, ws, ana, ben, cy, roomId, key } = setup();
+    const { joiner: dee } = invite(chain, ana, { userName: "Dee" });
+    const [a, b, c, d] = [ana, ben, cy, dee].map((device) => nodeFor(chain, device));
+    const envelopes = Array.from({ length: 300 }, (_, i) => sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, INDEX_DOC, i + 1, utf8(`x${i + 1}`)));
+    const net = new Network();
+    net.link(b!, c!);
+    net.link(b!, d!);
+    net.pump();
+    for (const env of envelopes) a!.publish(env);
+    // Cy's and Dee's computers have all of it but the last.
+    for (const env of envelopes.slice(0, 299)) {
+      c!.store.add(env);
+      d!.store.add(env);
+    }
+    let pushes = 0;
+    for (const session of (b as unknown as { sessions: Set<{ remoteDevice: string; channel: Channel }> }).sessions) {
+      const send = session.channel.send.bind(session.channel);
+      session.channel.send = (message) => {
+        if (message.t === "push") pushes++;
+        send(message);
+      };
+    }
+    net.link(a!, b!);
+    await net.settle();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await net.settle();
+    expect(pushes).toBe(0);
+    for (const node of [b, c, d]) expect(node!.store.envelopesOf(roomId, INDEX_DOC).updates).toHaveLength(300);
+  });
+
+  it("checks the record a join gets message by message, and gives up on a peer that goes quiet", () => {
+    const { chain, ana } = setup();
+    const other = founder();
+    const join = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: randomId("i"), secret: newRoomKey(), user: { id: randomId("u"), name: "Eve" }, deviceName: "Eve", deviceKey: ana.sign, agreementPublicKey: ana.agree.publicKey, tlsFingerprint: "A".repeat(43) });
+    const outcome = () => {
+      const result: { failed?: string; chain?: WorkspaceChain } = {};
+      const handshake = new JoinHandshake({ send: () => {}, close: () => {} }, chain.workspaceId, join, (got) => (result.chain = got), (reason) => (result.failed = reason));
+      handshake.start();
+      return { handshake, result };
+    };
+    // Another workspace's record: refused at its first version, not after a million.
+    const stranger = outcome();
+    stranger.handshake.receive({ t: "hello", ws: chain.workspaceId, head: 1_000_000 });
+    stranger.handshake.receive(JSON.parse(JSON.stringify({ t: "versions", versions: other.chain.all() })));
+    expect(stranger.result.failed).toMatch(/^other_workspace/);
+    // Versions that don't extend what came before: refused at once.
+    const broken = outcome();
+    broken.handshake.receive({ t: "hello", ws: chain.workspaceId, head: 1_000_000 });
+    broken.handshake.receive(JSON.parse(JSON.stringify({ t: "versions", versions: [chain.all()[0], chain.all()[2]] })));
+    expect(broken.result.failed).toMatch(/bad_chain|unknown_parent|gap/);
+    // A peer that says nothing more: given up on, so the link's next address is tried.
+    vi.useFakeTimers();
+    try {
+      const quiet = outcome();
+      quiet.handshake.receive({ t: "hello", ws: chain.workspaceId, head: 5 });
+      vi.advanceTimersByTime(30_001);
+      expect(quiet.result.failed).toBe("join_timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a revoked device and refuses its later writes", () => {
     const { chain, ana, cy, roomId, seal } = setup();
     const net = new Network();
@@ -974,7 +1112,7 @@ describe("mesh", () => {
   it("refuses presence that isn't fresh", () => {
     const { chain, ws, ana, roomId, key } = setup();
     const a = nodeFor(chain, ana);
-    expect(a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now() - 5 * 60_000, utf8("old")))).toBe(false);
+    expect(a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now() - 11 * 60_000, utf8("old")))).toBe(false);
     expect(a.publish(sealPresence({ ws, room: roomId, n: 1, key, author: ana.sign }, Date.now(), utf8("now")))).toBe(true);
   });
 

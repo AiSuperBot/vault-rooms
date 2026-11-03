@@ -428,7 +428,8 @@ export class MeshService {
     );
   }
 
-  async stop(): Promise<void> {
+  /** Nothing more is started, sent or timed, whether this service stops cleanly (stop) or is let go of (discard). */
+  private halt(): void {
     this.stopped = true;
     this.node.stop();
     this.adoptFirstLink?.channel.close("stopped");
@@ -436,6 +437,10 @@ export class MeshService {
     for (const timer of this.timers) clearInterval(timer as ReturnType<typeof setInterval>);
     if (this.compareTimer) clearTimeout(this.compareTimer);
     if (this.automateTimer) clearTimeout(this.automateTimer);
+  }
+
+  async stop(): Promise<void> {
+    this.halt();
     this.discovery?.stop();
     this.manager?.stop();
     await this.server?.close();
@@ -625,13 +630,9 @@ export class MeshService {
 
   /** Let go of a service that was opened but never started: nothing is written (another instance may be using its files). */
   discard(): void {
-    this.stopped = true;
-    this.node.stop();
-    this.adoptFirstLink?.channel.close("stopped");
-    this.adoptFirstLink = null;
+    this.halt();
     for (const timer of this.saveTimers.values()) clearTimeout(timer);
     this.saveTimers.clear();
-    if (this.automateTimer) clearTimeout(this.automateTimer);
     this.disk.discard();
     for (const replica of this.replicas.values()) replica.destroy();
     this.replicas.clear();
