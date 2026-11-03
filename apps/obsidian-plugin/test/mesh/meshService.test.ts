@@ -203,6 +203,24 @@ describe("mesh service", () => {
     }
   }, 60_000);
 
+  it("keeps trying to store a change made here until it is stored", async () => {
+    const ana = await MeshService.create(deps("AnaRetry"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" });
+    const disk = (ana as unknown as { disk: { saveChain: (versions: unknown[]) => Promise<void> } }).disk;
+    const save = disk.saveChain.bind(disk);
+    let failures = 0;
+    let saved = 0;
+    disk.saveChain = async (versions) => {
+      if (failures++ < 3) throw new Error("EBUSY: chain held by a backup tool");
+      await save(versions);
+      saved = versions.length;
+    };
+    // The change is made (and would be sent) though storing it fails three times.
+    await ana.createRoom("Plans");
+    await until(() => saved === ana.node.chain.all().length, 5_000);
+    expect(failures).toBeGreaterThanOrEqual(4);
+    await ana.stop();
+  });
+
   it("finishes stopping when storing the record fails, and writes nothing later", async () => {
     const ana = await MeshService.create(deps("AnaStop"), { workspaceName: "Team", userName: "Ana", deviceName: "Ana PC" });
     const roomId = await ana.createRoom("Plans");

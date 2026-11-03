@@ -412,6 +412,15 @@ describe("disk store", () => {
     await after.saveChain(caughtUp.all());
     expect(gap.data.get("m/chain/000002.jsonl")!.split("\n").filter(Boolean)).toHaveLength(52);
     expect(WorkspaceChain.load((await new DiskStore(gap, "m").loadChain())!).headHash).toBe(w.chain.headHash);
+    // A chain.json left over (it couldn't be removed) holding another, older branch: the segments win, though shorter.
+    const branch = WorkspaceChain.load(all.slice(0, 699));
+    branch.offer([nextVersion(w.workspaceId, branch.head, w.sign, (state) => (state.users[userId]!.name = "Ana elsewhere"))]);
+    const leftover = new MemoryFiles();
+    await new DiskStore(leftover, "m").saveChain(branch.all());
+    leftover.data.set("m/chain.json", JSON.stringify(all));
+    const kept = (await new DiskStore(leftover, "m").loadChain())!;
+    expect(kept).toHaveLength(700);
+    expect(WorkspaceChain.load(kept).headHash).toBe(branch.headHash);
     // A segment's swap left a copy of another branch behind; a replaced branch removes it with the segment.
     files.data.set("m/chain/000002.jsonl.old", files.data.get("m/chain/000002.jsonl")!);
     const fork = new DiskStore(files, "m");

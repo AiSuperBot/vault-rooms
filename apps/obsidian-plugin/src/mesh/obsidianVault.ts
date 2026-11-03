@@ -101,9 +101,4 @@ export class ObsidianVault implements VaultLike {
   folderExists(path: string): boolean {
     return this.app.vault.getAbstractFileByPath(normalizePath(path)) instanceof TFolder;
   }
-
-  async removeEmptyFolder(path: string): Promise<void> {
-    const folder = this.app.vault.getAbstractFileByPath(normalizePath(path));
-    if (folder instanceof TFolder && folder.children.length === 0) await this.app.vault.delete(folder);
-  }
 }

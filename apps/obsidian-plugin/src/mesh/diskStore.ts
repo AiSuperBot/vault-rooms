@@ -7,6 +7,7 @@ import {
   parseJoinRecord,
   parseKeyWrap,
   parseSignedVersion,
+  versionHash,
   type BlobEnvelope,
   type BlobMeta,
   type BlobStorage,
@@ -243,9 +244,13 @@ export class DiskStore implements BlobStorage {
     this.chainWritten = versions.slice();
     const before = await this.readWhole(`${this.root}/chain.json`, true);
     if (before !== null && (before as unknown[]).length > versions.length) {
-      this.chainWritten = [];
-      this.chainDirtyFrom = 0;
-      return (before as unknown[]).map(parseSignedVersion);
+      const older = (before as unknown[]).map(parseSignedVersion);
+      // The record is hash-linked: the same version at the segments' end means the same start.
+      if (versions.length === 0 || versionHash(older[versions.length - 1]!) === versionHash(versions[versions.length - 1]!)) {
+        this.chainWritten = [];
+        this.chainDirtyFrom = 0;
+        return older;
+      }
     }
     return versions.length > 0 ? versions : null;
   }
