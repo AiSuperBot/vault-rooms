@@ -3310,3 +3310,96 @@ describe("room folder, round 52", () => {
     s.net.pump();
   }, 40_000);
 });
+
+describe("room folder, round 53", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const deletedOf = (pc: { replica: RoomReplica }) => [...pc.replica.entries().values()].filter((entry) => entry.deleted);
+  const leaked = (a: Pc) => [...a.vault.files.keys()].filter((path) => a.vault.text(path)?.includes("PRIVATE"));
+
+  /** Rae, a reader, has her own copy of Rules.md, then may write. */
+  async function privateCopy() {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    await a.vault.writeText("Team/plan.md", "the plan\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    await r.vault.writeText("Team/Rules.md", "PRIVATE\n");
+    await s.settle();
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("(your copy"))!;
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+    await s.settle();
+    return { s, a, r, copy };
+  }
+
+  for (const mode of ["rewrite", "temp"] as const) {
+    it(`keeps a private copy private when saved by deleting and writing again (${mode})`, async () => {
+      const { s, a, r, copy } = await privateCopy();
+      if (mode === "rewrite") {
+        await r.vault.trash(copy);
+        await r.vault.writeText(copy, "PRIVATE edited\n");
+      } else {
+        r.vault.silently(`${copy}.tmp`, "PRIVATE edited\n");
+        await r.vault.trash(copy);
+        await r.vault.rename(`${copy}.tmp`, copy);
+      }
+      await sleep(2_300);
+      await s.settle();
+      await r.vault.writeText(copy, "PRIVATE edited again\n");
+      await s.settle();
+      expect(leaked(a)).toEqual([]);
+    }, 40_000);
+  }
+
+  it("keeps a private copy private when edited, then renamed while Obsidian is closed", async () => {
+    const { s, a, r, copy } = await privateCopy();
+    await r.vault.writeText(copy, "PRIVATE and more\n");
+    await s.settle();
+    await r.folder.stop();
+    r.vault.silently("Team/Mine.md", r.vault.text(copy)!);
+    r.vault.files.delete(copy);
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(leaked(a)).toEqual([]);
+  }, 40_000);
+
+  it("shares a note moved onto the name a private copy had", async () => {
+    const { s, a, r, copy } = await privateCopy();
+    await r.vault.rename(copy, "Team/Mine.md");
+    await s.settle();
+    await a.vault.rename("Team/plan.md", "Team/Mine.md");
+    await s.settle();
+    await r.vault.writeText("Team/Mine.md", "the plan, edited by Rae\n");
+    await s.settle();
+    expect(a.vault.text("Team/Mine.md")).toBe("the plan, edited by Rae\n");
+    expect(leaked(a)).toEqual([]);
+  }, 40_000);
+
+  it("puts back, on Cancel, also the files deleted while asking", async () => {
+    const files = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { s, a, c } = await pair(files);
+    let answer!: (share: boolean) => void;
+    (c.folder as unknown as { o: RoomFolderOptions }).o.confirmDeletions = () => new Promise<boolean>((resolve) => (answer = resolve));
+    for (let i = 0; i < 25; i++) await c.vault.trash(`Team/n${i}.md`);
+    await sleep(2_300);
+    await c.folder.settled();
+    for (let i = 25; i < 30; i++) await c.vault.trash(`Team/n${i}.md`);
+    await sleep(500);
+    answer(false);
+    await sleep(2_500);
+    await s.settle();
+    expect(deletedOf(a)).toEqual([]);
+    expect(c.vault.text("Team/n27.md")).toBe("note 27\n");
+    expect(c.vault.text("Team/n3.md")).toBe("note 3\n");
+  }, 40_000);
+});
