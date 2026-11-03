@@ -9,7 +9,7 @@ import { RoomPresence } from "./mesh/presence.js";
 import { RoomFolder, type RoomFolderState, type RoomHealth } from "./mesh/roomFolder.js";
 import { folderProblem, normalizeNote } from "./mesh/roomPaths.js";
 import { isScope, obsidianSecrets } from "./mesh/secrets.js";
-import { JoinModal } from "./ui/modals.js";
+import { confirmAction, JoinModal } from "./ui/modals.js";
 import { ROOMS_VIEW, RoomsView } from "./ui/roomsView.js";
 import { RoomsSettingTab } from "./ui/settingsTab.js";
 
@@ -584,6 +584,13 @@ export default class VaultRoomsPlugin extends Plugin {
       loadState: () => svc.disk.loadRoomState<RoomFolderState>(roomId),
       saveState: (state) => svc.disk.saveRoomState(roomId, state),
       saveStateChanges: (changes) => svc.disk.appendRoomChanges(roomId, changes),
+      confirmDeletions: (count) =>
+        confirmAction(
+          this.app,
+          "Delete files for everyone?",
+          `${count} files were deleted from "${folderPath}" on this computer.\n\nIf you meant to delete them, they are deleted for everyone in the room (on the other computers they go to the trash). If not (moving or deleting the whole folder outside Obsidian, say), choose Cancel: they come back here, and nothing changes for anyone.`,
+          "Delete for everyone"
+        ),
       loadSaves: () => svc.disk.loadRoomState(roomId, ".saves"),
       saveSaves: (saves) => svc.disk.saveRoomState(roomId, saves, ".saves"),
       notify: (message) => new Notice(message, 8000),

@@ -67,6 +67,8 @@ export interface RoomPresenceDeps {
   userOf(deviceId: string): { id: string; name: string } | null;
 }
 
+const MAX_AUTHORS = 2_000;
+
 export class RoomPresence {
   private remote = new Map<string, Map<number, Remote>>();
   private facades = new Map<string, Set<AwarenessFacade>>();
@@ -133,10 +135,17 @@ export class RoomPresence {
   }
 
   /** Feed a verified presence envelope of this room. */
+  /** The newest cursor taken from each author (see receive), for so many authors at most. */
+  private newest = new Map<string, number>();
+
   receive(env: PresenceEnvelope): void {
     const key = this.deps.replica.keyFor(env.n);
     const user = this.deps.userOf(env.author);
     if (!key || !user) return;
+    // Older than the last one taken from its author: a replay, or out of order. Not shown.
+    if (env.at < (this.newest.get(env.author) ?? 0)) return;
+    if (this.newest.size >= MAX_AUTHORS && !this.newest.has(env.author)) this.newest.clear();
+    this.newest.set(env.author, env.at);
     let payload: { d?: unknown; c?: unknown; a?: unknown; h?: unknown };
     try {
       payload = JSON.parse(fromUtf8(openEnvelope(env, key)));

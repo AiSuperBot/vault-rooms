@@ -9,6 +9,7 @@
 // - setTimeout( 27 -> 30, clearTimeout( 25 -> 27: deletions counted from the last one (roomFolder.ts, waitForDeletions), a
 //   catch-up passed on by one comparison (mesh.ts, compareOthersSoon), a join's peer given up on when quiet (mesh.ts,
 //   JoinHandshake). window.setTimeout 5 -> 6: settings saved again when a save failed (plugin.ts, saveSettingsLater).
+// - clearTimeout( 27 -> 28: the comparison after a catch-up waits for it to be quiet (mesh.ts, compareOthersSoon).
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -19,7 +20,7 @@ const TIER2_STRICT_ZERO = ["fastify", "Fastify", "ajv", "new Function", "eval(",
 const TIER3_APPROVED_BASELINE = {
   "setTimeout(": 30,
   "setInterval(": 5,
-  "clearTimeout(": 27,
+  "clearTimeout(": 28,
   "clearInterval(": 5,
   "globalThis": 6,
   "fetch(": 0,
