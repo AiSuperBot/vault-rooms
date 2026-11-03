@@ -521,7 +521,7 @@ describe("room replica", () => {
   async function quiet(s: ReturnType<typeof setup>) {
     s.net.pump();
     // Long enough for a computer that caught up to ask its other peers to compare (MeshNode.compareOthersSoon).
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
     s.net.pump();
   }
 

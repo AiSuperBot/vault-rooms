@@ -611,7 +611,7 @@ describe("mesh", () => {
     }
     net.link(a!, b!);
     await net.settle();
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
     await net.settle();
     expect(pushes).toBe(0);
     for (const node of [b, c, d]) expect(node!.store.envelopesOf(roomId, INDEX_DOC).updates).toHaveLength(300);
@@ -644,6 +644,41 @@ describe("mesh", () => {
       quiet.handshake.receive({ t: "hello", ws: chain.workspaceId, head: 5 });
       vi.advanceTimersByTime(30_001);
       expect(quiet.result.failed).toBe("join_timeout");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes two catch-ups that reach a computer at once on to each other's sources", async () => {
+    const { chain, ws, ana, ben, cy, roomId, key } = setup();
+    step(chain, ana, (state) => void (state.rooms[roomId]!.members[ben.userId] = "write"));
+    const [a, b, n] = [ana, ben, cy].map((device) => nodeFor(chain, device));
+    for (let i = 1; i <= 5; i++) {
+      a!.store.add(sealUpdate({ ws, room: roomId, n: 1, key, author: ana.sign }, INDEX_DOC, i, utf8(`a${i}`)));
+      b!.store.add(sealUpdate({ ws, room: roomId, n: 1, key, author: ben.sign }, INDEX_DOC, i, utf8(`b${i}`)));
+    }
+    const net = new Network();
+    net.link(a!, n!);
+    net.link(b!, n!);
+    await net.settle();
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    await net.settle();
+    for (const node of [a, b, n]) expect(node!.store.envelopesOf(roomId, INDEX_DOC).updates).toHaveLength(10);
+  });
+
+  it("gives up on a join whose peer keeps talking but sends no record", () => {
+    const { chain, ana } = setup();
+    const join = createJoinRecord({ workspaceId: chain.workspaceId, inviteId: randomId("i"), secret: newRoomKey(), user: { id: randomId("u"), name: "Eve" }, deviceName: "Eve", deviceKey: ana.sign, agreementPublicKey: ana.agree.publicKey, tlsFingerprint: "A".repeat(43) });
+    vi.useFakeTimers();
+    try {
+      let failed = "";
+      const handshake = new JoinHandshake({ send: () => {}, close: () => {} }, chain.workspaceId, join, () => {}, (reason) => (failed = reason));
+      handshake.start();
+      for (let i = 0; i < 3; i++) {
+        handshake.receive({ t: "hello", ws: chain.workspaceId, head: 5 });
+        vi.advanceTimersByTime(11_000);
+      }
+      expect(failed).toBe("join_timeout");
     } finally {
       vi.useRealTimers();
     }

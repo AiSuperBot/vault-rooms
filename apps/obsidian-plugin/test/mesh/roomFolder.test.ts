@@ -26,6 +26,9 @@ interface Pc {
   stateLocked?: boolean;
   bound: Set<string>;
   gone: string[];
+  /** What the user answers when asked whether many deletions go out (asked: how many). */
+  deleteAnswer?: boolean;
+  asked?: number[];
 }
 
 function setup(raeRole: "read" | "write" = "read") {
@@ -60,6 +63,10 @@ function setup(raeRole: "read" | "write" = "read") {
         pc.saved.saves = structuredClone(saves);
       },
       notify: (message) => pc.notices.push(message),
+      confirmDeletions: async (count) => {
+        (pc.asked ??= []).push(count);
+        return pc.deleteAnswer ?? true;
+      },
       log: (message) => process.env.FOLDER_LOG && console.log(`[${pc.device.name}] ${message}`),
       now: () => new Date("2026-10-26T12:30:00Z")
     });
@@ -2929,19 +2936,74 @@ describe("room folder, deletions from Explorer", () => {
     expect(c.gone).toEqual(["Team"]);
   }, 30_000);
 
-  it("shares many deletions at once only after the longer wait, and says so", async () => {
-    const files = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
-    const { s, a, c } = await pair(files);
-    await deleteSlowly(c, c.vault.listFiles("Team"), 0);
+  const deleted = (pc: { replica: RoomReplica }) => [...pc.replica.entries().values()].filter((entry) => entry.deleted);
+  const many = () => Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+
+  it("asks before many deletions at once go out: shared if the user says so, put back if not", async () => {
+    for (const answer of [true, false]) {
+      const { s, a, c } = await pair(many());
+      c.deleteAnswer = answer;
+      await deleteSlowly(c, c.vault.listFiles("Team"), 0);
+      await sleep(2_300);
+      s.net.pump();
+      await s.settle();
+      expect(c.asked).toEqual([25]);
+      expect(deleted(a)).toHaveLength(answer ? 25 : 0);
+      // Put back: every file is there again here, the same; nothing changed for anyone.
+      // (Shared: Ana made them minutes ago, so her computer keeps hers and shares them again, as ever.)
+      if (!answer) expect(c.vault.listFiles("Team")).toHaveLength(25);
+      if (!answer) expect(a.vault.listFiles("Team")).toHaveLength(25);
+    }
+  }, 40_000);
+
+  it("writes nothing back into a folder whose files are being deleted, so a move can take it away", async () => {
+    const { s, a, c } = await pair(many());
+    c.deleteAnswer = true;
+    const paths = c.vault.listFiles("Team");
+    await deleteSlowly(c, paths.slice(0, 10), 50);
+    // Meanwhile Ana changes a note already gone here, and adds one: neither is written into the folder going away.
+    await a.vault.writeText("Team/n0.md", "changed by Ana\n");
+    await a.vault.writeText("Team/new.md", "new\n");
+    await a.folder.settled();
+    s.net.pump();
+    await sleep(300);
+    expect(c.vault.files.has("Team/n0.md")).toBe(false);
+    expect(c.vault.files.has("Team/new.md")).toBe(false);
+    await deleteSlowly(c, paths.slice(10), 50);
+    c.vault.folders.delete("Team");
     await sleep(2_300);
     s.net.pump();
-    // Held: the folder is still there, but a whole-folder move may not be over.
-    expect([...a.replica.entries().values()].filter((entry) => entry.deleted)).toEqual([]);
-    await sleep(10_300);
+    await s.settle();
+    expect(c.gone).toEqual(["Team"]);
+    expect(deleted(a)).toEqual([]);
+    expect(c.asked ?? []).toEqual([]);
+  }, 40_000);
+
+  it("doesn't ask a computer that trashes what someone else deleted, nor tell it anything went out", async () => {
+    const { s, a, c } = await pair(many());
+    for (const path of a.vault.listFiles("Team")) await a.vault.trash(path);
+    await sleep(2_300);
     s.net.pump();
     await s.settle();
-    expect([...a.replica.entries().values()].filter((entry) => entry.deleted)).toHaveLength(25);
-    expect(c.notices.some((n) => n.includes("25 files deleted"))).toBe(true);
+    await sleep(2_300);
+    await s.settle();
+    expect(c.vault.listFiles("Team")).toEqual([]);
+    expect(c.asked ?? []).toEqual([]);
+    expect(a.asked).toEqual([25]);
+  }, 40_000);
+
+  it("shares none of them when it stops while asking", async () => {
+    const { s, a, c } = await pair(many());
+    let answer!: (share: boolean) => void;
+    (c.folder as unknown as { o: RoomFolderOptions }).o.confirmDeletions = () => new Promise<boolean>((resolve) => (answer = resolve));
+    await deleteSlowly(c, c.vault.listFiles("Team"), 0);
+    await sleep(2_300);
+    await c.folder.stop();
+    answer(true);
+    await sleep(100);
+    s.net.pump();
+    await s.settle();
+    expect(deleted(a)).toEqual([]);
   }, 40_000);
 });
 
@@ -3092,5 +3154,79 @@ describe("room folder, its stored state", () => {
     const read = (await new DiskStore(files, "m").loadRoomState<RoomFolderState>(room))!;
     expect(read.known).toEqual({});
     expect(read.localOnly).toEqual(["Mine.md"]);
+  });
+});
+
+describe("room folder, round 51", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  it("deletes a file and renames another onto its name, for everyone, without a duplicate", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "old plan\n", "Draft.md": "new draft\n" });
+    await c.vault.trash("Team/Plan.md");
+    await c.vault.rename("Team/Draft.md", "Team/Plan.md");
+    await sleep(2_300);
+    await c.folder.settled();
+    // What Cy's computer shares: the old note deleted, the draft under its name (not both under one name).
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["Plan.md"]);
+    expect(c.replica.noteText([...c.replica.files().keys()][0]!)).toBe("new draft\n");
+    expect([...c.replica.entries().values()].filter((entry) => entry.deleted).map((entry) => entry.path)).toEqual(["Plan.md"]);
+  });
+
+  it("renames onto a name an untracked file has here in another case: that file is kept aside", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/plan.md", "plan\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    // Rae (a reader) has a note of her own, not shared; Ana renames hers onto its name in another case.
+    await r.vault.writeText("Team/Notes.md", "mine\n");
+    await s.settle();
+    await a.vault.rename("Team/plan.md", "Team/NOTES.md");
+    await s.settle();
+    expect(r.vault.files.has("Team/NOTES.md")).toBe(true);
+    expect(text(r.vault, "Team/NOTES.md")).toBe("plan\n");
+    expect(r.folder.health().failing).toEqual([]);
+    // Hers is kept, as a copy.
+    expect([...r.vault.files.keys()].some((path) => path.includes("conflict") && text(r.vault, path) === "mine\n")).toBe(true);
+  });
+
+  it("keeps a reader's copy on this computer only after it was renamed while Obsidian was closed", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    await r.vault.writeText("Team/Rules.md", "anything goes\n");
+    await s.settle();
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("(your copy"))!;
+    // Closed; the copy renamed in Explorer; she may now edit; Obsidian starts again.
+    await r.folder.stop();
+    const bytes = r.vault.files.get(copy)!;
+    r.vault.files.delete(copy);
+    r.vault.files.set("Team/Mine elsewhere.md", bytes);
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+    await s.settle();
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect([...a.replica.files().values()].map((entry) => entry.path)).toEqual(["Rules.md"]);
+    expect(a.vault.files.has("Team/Mine elsewhere.md")).toBe(false);
   });
 });

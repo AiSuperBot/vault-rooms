@@ -85,7 +85,9 @@ const MAX_PENDING = 2000;
 const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
-/** A join whose peer sends nothing more for this long is given up on (see JoinHandshake). */
+/** A catch-up quiet for this long has the other peers compare (see MeshNode.compareOthersSoon). */
+const CATCH_UP_QUIET_MS = 1_000;
+/** A join whose peer makes no progress for this long is given up on (see JoinHandshake). */
 const JOIN_IDLE_MS = 30_000;
 /** Every key a peer message may carry (each kind checks its own). */
 const MESSAGE_KEYS = ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"];
@@ -345,21 +347,26 @@ export class MeshNode {
     this.events.membership?.();
   }
 
-  /** Compare rooms with every other peer, soon and once for a burst (see the "envelopes" message). */
-  compareOthersSoon(except: PeerSession): void {
-    this.compareExcept.add(except);
-    if (this.stopped || this.compareTimer) return;
+  /**
+   * Compare rooms with the other peers once a catch-up has been quiet for a moment (see the "envelopes" message): one
+   * comparison for a catch-up of any length, not one per batch (each costs a room summary, and they are rationed).
+   * Its source is left out only when it was the only one: two catch-ups at once must reach each other.
+   */
+  compareOthersSoon(source: PeerSession): void {
+    this.compareSources.add(source);
+    if (this.stopped) return;
+    if (this.compareTimer) clearTimeout(this.compareTimer);
     this.compareTimer = setTimeout(() => {
       this.compareTimer = null;
-      const except = this.compareExcept;
-      this.compareExcept = new Set();
-      for (const session of this.sessions) if (!except.has(session)) session.resync();
-    }, 100);
+      const sources = this.compareSources;
+      this.compareSources = new Set();
+      for (const session of this.sessions) if (!(sources.size === 1 && sources.has(session))) session.resync();
+    }, CATCH_UP_QUIET_MS);
     this.compareTimer.unref?.();
   }
 
   private compareTimer: ReturnType<typeof setTimeout> | null = null;
-  private compareExcept = new Set<PeerSession>();
+  private compareSources = new Set<PeerSession>();
 
   /** Compare rooms with every peer again (e.g. after forgetting that a blob was dropped). */
   resync(): void {
@@ -1244,16 +1251,17 @@ export class JoinHandshake {
 
   receive(raw: unknown): void {
     if (this.done) return;
-    this.waitForMore();
     try {
       const message = v.obj(raw, "message", MESSAGE_KEYS);
       if (message.t === "hello") {
         if (message.ws !== this.workspaceId) fail("other_workspace");
+        if (this.targetHead < 0) this.waitForMore();
         this.targetHead = v.int(message.head, "hello.head", 0, MAX_JOIN_VERSIONS);
         this.channel.send({ t: "hello", ws: this.workspaceId, head: -1, recent: [] });
       } else if (message.t === "versions") {
         if (!Array.isArray(message.versions) || message.versions.length > MAX_ITEMS) v.bad("versions");
         const versions = message.versions.map(parseSignedVersion);
+        const before = this.chain?.head.body.v ?? -1;
         if (!this.chain && versions.length > 0) {
           this.chain = new WorkspaceChain(versions.shift()!);
           if (this.chain.workspaceId !== this.workspaceId) fail("other_workspace");
@@ -1263,6 +1271,7 @@ export class JoinHandshake {
           const result = this.chain.offer(versions, Date.now(), true);
           if (result.status !== "appended" && result.status !== "duplicate") fail("bad_chain", result.status === "rejected" ? result.reason : result.status);
         }
+        if ((this.chain?.head.body.v ?? -1) > before) this.waitForMore();
       }
       if (this.targetHead >= 0 && this.chain && this.chain.head.body.v >= this.targetHead) {
         const chain = this.chain;
