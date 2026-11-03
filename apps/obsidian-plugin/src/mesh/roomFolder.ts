@@ -295,12 +295,15 @@ export class RoomFolder {
   /** A copy kept here only, edited: known by its content now if renamed while Obsidian is closed (see claimedLocalOnly). */
   private async noteLocalOnlyContent(vaultPath: string): Promise<void> {
     const relative = vaultPath.slice(this.prefix.length);
-    const size = this.o.vault.stat(vaultPath)?.size;
-    if (!size || size > MAX_BYTES.b) return; // shortcut: a larger one is known by name only (never shared either way)
-    const hash = sha(await this.o.vault.readBytes(vaultPath));
     const entry = this.localOnly.get(pathKey(relative));
-    if (!entry || (entry.hash === hash && entry.size === size)) return;
-    this.setLocalOnly(relative, hash, size);
+    if (!entry) return;
+    const size = this.o.vault.stat(vaultPath)?.size ?? 0;
+    // A larger one is never shared whatever it holds (too large), so it isn't read.
+    const bytes = size > 0 && size <= MAX_BYTES.b ? await this.o.vault.readBytes(vaultPath) : undefined;
+    // Size and hash of the same read. Emptied or too large: known by name only, no old content to claim another file by.
+    const [hash, length] = bytes?.length ? [sha(bytes), bytes.length] : [undefined, undefined];
+    if (entry.hash === hash && entry.size === length) return;
+    this.setLocalOnly(relative, hash, length);
     this.saveSoon();
   }
 
@@ -550,13 +553,25 @@ export class RoomFolder {
       for (const [id, known] of Object.entries(saved?.known ?? {})) this.setKnown(id, known);
       this.stateGen = typeof saved?.gen === "number" ? saved.gen : 0;
       // Copies kept on this computer only: where they still are (in any case), else known by their content later.
+      const found: string[] = [];
       for (const raw of Array.isArray(saved?.localOnly) ? saved.localOnly : []) {
         const entry: LocalOnly | null = typeof raw === "string" ? { path: raw } : raw && typeof raw.path === "string" ? raw : null;
         if (!entry) continue;
         const here = [...(this.localNamesNow().get(pathKey(entry.path)) ?? [])][0];
-        if (here !== undefined) this.setLocalOnly(here, entry.hash, entry.size);
+        if (here !== undefined) {
+          this.setLocalOnly(here, entry.hash, entry.size);
+          found.push(here);
+        }
         // Missing: known by its content for a while (renamed while Obsidian was closed), not for good.
         else if (entry.hash && entry.size && Date.now() - (entry.missing ?? Date.now()) < LOCAL_ONLY_MISSING_MS) this.localOnlyMissing.set(entry.hash, { ...entry, missing: entry.missing ?? Date.now() });
+      }
+      // Edited while Obsidian was closed: known by what they hold now, should they be renamed later.
+      for (const here of found) {
+        try {
+          await this.noteLocalOnlyContent(this.vaultPath(here));
+        } catch {
+          // Not readable now (in use): known by the content stored before, as until now, and read again at its next edit.
+        }
       }
       // Stored with the state before 0.3.2, apart since. Saves that can't be read only miss a clash, never lose anything.
       this.o.replica.restoreSaves(saved?.saves);
@@ -1655,6 +1670,8 @@ export class RoomFolder {
         if (this.deletions.size > 0) this.waitForDeletions(DELETE_QUIET_MS);
       } else {
         // Not shared, nor those deleted meanwhile (the same move, most likely): written back from the shared state.
+        // Those not shared are gone for good (a copy kept here only): their marks go with them.
+        for (const path of this.deletions) if (!this.o.vault.stat(path)) this.dropMarks(path);
         this.deletions.clear();
         this.remoteChanged();
       }
