@@ -94,6 +94,10 @@ export interface RoomFolderChanges {
 export interface LocalOnly {
   path: string;
   hash?: string;
+  /** Its size: only a file of that size is read to compare (see claimedLocalOnly). */
+  size?: number;
+  /** When it was first found missing (ms): forgotten after LOCAL_ONLY_MISSING_MS. */
+  missing?: number;
 }
 
 /** See RoomFolder.health. */
@@ -163,6 +167,8 @@ const IDLE_NOTE_MS = 5 * 60_000;
 const DELETE_QUIET_MS = 2_000;
 /** Entries stored as changes on top of the whole state before it is stored whole again (see saveNow). */
 const MAX_JOURNALED = 2_000;
+/** A copy kept here only that went missing is known by its content this long (see LocalOnly.missing). */
+const LOCAL_ONLY_MISSING_MS = 30 * 86_400_000;
 /** As many as this at once, the folder still there: shared only once the user says so (see flushDeletions). */
 const MASS_DELETE = 20;
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
@@ -275,8 +281,8 @@ export class RoomFolder {
     return vaultPath.startsWith(this.prefix) && this.localOnly.has(pathKey(vaultPath.slice(this.prefix.length)));
   }
 
-  private setLocalOnly(relative: string, hash?: string): void {
-    this.localOnly.set(pathKey(relative), { path: relative, ...(hash ? { hash } : {}) });
+  private setLocalOnly(relative: string, hash?: string, size?: number): void {
+    this.localOnly.set(pathKey(relative), { path: relative, ...(hash ? { hash } : {}), ...(size !== undefined ? { size } : {}) });
     this.localOnlyChanged = this.stateChanged = true;
   }
 
@@ -293,9 +299,12 @@ export class RoomFolder {
   /** A file not tracked yet that is a copy kept here only under another name: it stays so (see localOnlyMissing). */
   private async claimedLocalOnly(relative: string): Promise<boolean> {
     if (this.localOnlyMissing.size === 0) return false;
+    // Read only a file of a missing copy's size (never an empty one): no large file is read for nothing.
+    const size = this.o.vault.stat(this.vaultPath(relative))?.size;
+    if (!size || ![...this.localOnlyMissing.values()].some((entry) => entry.size === size)) return false;
     const hash = sha(await this.o.vault.readBytes(this.vaultPath(relative)));
-    if (!this.localOnlyMissing.delete(hash)) return false;
-    this.setLocalOnly(relative, hash);
+    if (this.localOnlyMissing.get(hash)?.size !== size || !this.localOnlyMissing.delete(hash)) return false;
+    this.setLocalOnly(relative, hash, size);
     this.saveSoon();
     return true;
   }
@@ -306,7 +315,7 @@ export class RoomFolder {
    * it is, and is looked at again), rather than written unmarked.
    */
   private async markLocalOnly(relative: string, content: string | Uint8Array): Promise<void> {
-    this.setLocalOnly(relative, sha(content));
+    this.setLocalOnly(relative, sha(content), typeof content === "string" ? Buffer.byteLength(content, "utf8") : content.length);
     await this.saveNow();
   }
   private told = new Set<string>();
@@ -533,8 +542,9 @@ export class RoomFolder {
         const entry: LocalOnly | null = typeof raw === "string" ? { path: raw } : raw && typeof raw.path === "string" ? raw : null;
         if (!entry) continue;
         const here = [...(this.localNamesNow().get(pathKey(entry.path)) ?? [])][0];
-        if (here !== undefined) this.setLocalOnly(here, entry.hash);
-        else if (entry.hash) this.localOnlyMissing.set(entry.hash, entry);
+        if (here !== undefined) this.setLocalOnly(here, entry.hash, entry.size);
+        // Missing: known by its content for a while (renamed while Obsidian was closed), not for good.
+        else if (entry.hash && entry.size && Date.now() - (entry.missing ?? Date.now()) < LOCAL_ONLY_MISSING_MS) this.localOnlyMissing.set(entry.hash, { ...entry, missing: entry.missing ?? Date.now() });
       }
       // Stored with the state before 0.3.2, apart since. Saves that can't be read only miss a clash, never lose anything.
       this.o.replica.restoreSaves(saved?.saves);
@@ -945,11 +955,13 @@ export class RoomFolder {
     const kept = this.keptAside.get(pathKey(relative));
     if (kept?.hash === hash && this.o.vault.stat(this.vaultPath(kept.name))) return kept.name;
     const name = this.copyName(relative, "conflict");
-    if (!this.o.replica.canWrite()) await this.markLocalOnly(name, content);
-    // Writers share the copy as a local addition; readers keep it on this computer.
+    // Writers share the copy as a local addition; readers keep it on this computer, and so does anyone for a copy of a
+    // file that was itself kept on this computer only.
+    const here = !this.o.replica.canWrite() || this.isLocalOnly(this.vaultPath(relative));
+    if (here) await this.markLocalOnly(name, content);
     await this.writeCopy(this.vaultPath(name), content);
     this.keptAside.set(pathKey(relative), { hash, name });
-    this.o.notify(`"${relative}" was changed here and by someone else at the same time. Your version is kept as "${name}"${this.o.replica.canWrite() ? ", which the others get too" : ""}: compare the two, and delete the one you don't need.`);
+    this.o.notify(`"${relative}" was changed here and by someone else at the same time. Your version is kept as "${name}"${here ? " on this computer only" : ", which the others get too"}: compare the two, and delete the one you don't need.`);
     return name;
   }
 
@@ -1289,6 +1301,8 @@ export class RoomFolder {
     // note now): left as it is and looked at again next time.
     const wrote = await this.writeShared(entry.path, remote, remoteHash, basedOn, () => this.o.isBound(id));
     if (wrote && entry.kind === "md") this.noteWrites.set(id, performance.now());
+    // The shared file is there now, not a copy kept here only (that was kept aside first, see keepAside).
+    if (wrote) this.dropLocalOnly(entry.path);
     if (wrote) this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     else if (!this.o.isBound(id)) {
       const known = this.known.get(id);
@@ -1370,11 +1384,11 @@ export class RoomFolder {
 
   private async createEntry(relative: string): Promise<void> {
     if (!isShareable(relative)) return this.notShared(relative, "type");
-    if (await this.claimedLocalOnly(relative)) return;
     const replica = this.o.replica;
     const path = this.vaultPath(relative);
     // Too large to share whatever it holds: not even read (it may be huge). A note's line endings can halve it at most.
     if (!this.fitsBeforeRead(relative, isMarkdownPath(relative))) return;
+    if (await this.claimedLocalOnly(relative)) return;
     const id = randomId("f");
     if (isMarkdownPath(relative)) {
       const text = await this.readNote(path);
@@ -1592,27 +1606,33 @@ export class RoomFolder {
 
   private askAboutDeletions(): void {
     this.askingAboutDeletions = true;
-    const answer = this.o.confirmDeletions?.(this.deletions.size) ?? Promise.resolve(false);
+    // The answer is about these: any deleted after the question was shown are asked about on their own.
+    const asked = [...this.deletions];
+    const answer = this.o.confirmDeletions?.(asked.length) ?? Promise.resolve(false);
     void answer.then(
-      (share) => this.settleDeletions(share),
-      () => this.settleDeletions(false)
+      (share) => this.settleDeletions(share, asked),
+      () => this.settleDeletions(false, asked)
     );
   }
 
-  private settleDeletions(share: boolean): Promise<void> {
+  private settleDeletions(share: boolean, asked: string[]): Promise<void> {
     return this.run(async () => {
       this.askingAboutDeletions = false;
-      if (this.stopped) return;
+      if (this.stopped) {
+        if (share) this.o.notify(`The ${asked.length} files deleted from "${this.o.folder}" weren't deleted for everyone: the room's folder was moved or closed meanwhile. They come back there.`);
+        return;
+      }
       if (!this.movedAway && !this.o.vault.folderExists(this.o.folder)) {
         this.deletions.clear();
         this.o.folderGone?.();
         return;
       }
-      const paths = [...this.deletions];
-      this.deletions.clear();
-      if (share) for (const vaultPath of paths) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
+      for (const path of asked) this.deletions.delete(path);
+      if (share) for (const vaultPath of asked) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
       // Not shared: what was deleted here is written back from the shared state (a whole pass).
       else this.remoteChanged();
+      // Deleted meanwhile: settled on their own (asked about again if they are many).
+      if (this.deletions.size > 0) this.waitForDeletions(DELETE_QUIET_MS);
       this.resumeWrites();
     });
   }
@@ -1659,15 +1679,20 @@ export class RoomFolder {
       if (this.moving.delete(movingMark(oldVaultPath, newVaultPath))) return;
       const from = this.relative(oldVaultPath);
       const to = this.relative(newVaultPath);
+      // A file deleted here moments ago (in any case), its name now taken by a tracked file or a copy kept here only:
+      // that deletion first, not taken for the file come back. An untracked file renamed onto it (a program saving
+      // through a temporary file) is that file's new content: the deletion is left to settle as such.
+      if (to !== null && from !== null && (this.isLocalOnly(oldVaultPath) || this.idAt(from) !== undefined || this.queuedPaths.has(from))) {
+        const pending = [...this.deletions].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === pathKey(to));
+        if (pending !== undefined && this.deletions.delete(pending)) await this.safely(pending, () => this.applyLocalDelete(pending, true));
+      }
       // A copy on this computer only stays so under its new name (and leaves the list if it leaves the room).
       if (this.isLocalOnly(oldVaultPath)) {
         const entry = this.dropLocalOnly(oldVaultPath.slice(this.prefix.length));
-        if (to !== null) this.setLocalOnly(to, entry?.hash);
+        if (to !== null) this.setLocalOnly(to, entry?.hash, entry?.size);
         this.saveSoon();
         return;
       }
-      // A file deleted here moments ago, now taken by another one's rename: the deletion first (not "back already").
-      if (this.deletions.delete(newVaultPath)) await this.safely(newVaultPath, () => this.applyLocalDelete(newVaultPath, true));
       if (oldVaultPath.startsWith(this.prefix) && this.rejected.delete(oldVaultPath.slice(this.prefix.length))) this.o.healthChanged?.();
       const id = from === null ? undefined : (this.idAt(from) ?? this.queuedPaths.get(from));
       const unusable = (to === null && this.unsafeInside(newVaultPath)) || (to !== null && !isShareable(to));
@@ -1718,6 +1743,10 @@ export class RoomFolder {
       }
       if (to !== null && !this.idAt(to)) {
         if (!this.o.replica.canWrite()) return this.readOnlyNotice(staysHere(to));
+        await this.tryLocalWrite(newVaultPath);
+      } else if (to !== null && !id) {
+        // An untracked file renamed onto a tracked one's name (a program saving through a temporary file): that file's
+        // new content.
         await this.tryLocalWrite(newVaultPath);
       }
     });

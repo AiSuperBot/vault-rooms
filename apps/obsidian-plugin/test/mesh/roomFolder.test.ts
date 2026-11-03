@@ -3230,3 +3230,83 @@ describe("room folder, round 51", () => {
     expect(a.vault.files.has("Team/Mine elsewhere.md")).toBe(false);
   });
 });
+
+describe("room folder, round 52", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const deletedOf = (pc: { replica: RoomReplica }) => [...pc.replica.entries().values()].filter((entry) => entry.deleted);
+
+  it("shares only the deletions it asked about; those made while asking are asked about on their own", async () => {
+    const files = Object.fromEntries(Array.from({ length: 45 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { c } = await pair(files);
+    let answer!: (share: boolean) => void;
+    const asked: number[] = [];
+    (c.folder as unknown as { o: RoomFolderOptions }).o.confirmDeletions = (count) => {
+      asked.push(count);
+      return new Promise<boolean>((resolve) => (answer = resolve));
+    };
+    for (let i = 0; i < 25; i++) await c.vault.trash(`Team/n${i}.md`);
+    await sleep(2_300);
+    for (let i = 25; i < 45; i++) await c.vault.trash(`Team/n${i}.md`);
+    await sleep(2_300);
+    answer(true);
+    await sleep(2_300);
+    await c.folder.settled();
+    // The 20 deleted while it asked are asked about on their own (not answered yet): only the first 25 went out.
+    expect(asked).toEqual([25, 20]);
+    expect(deletedOf(c)).toHaveLength(25);
+  }, 40_000);
+
+  it("keeps a copy private when it is renamed onto the name of a file just deleted", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    await r.vault.writeText("Team/Rules.md", "PRIVATE\n");
+    await s.settle();
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("(your copy"))!;
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+    await s.settle();
+    await r.vault.trash("Team/Rules.md");
+    await r.vault.rename(copy, "Team/Rules.md");
+    await sleep(2_300);
+    await s.settle();
+    r.folder.remoteChanged();
+    await s.settle();
+    expect([...a.vault.files.keys()].some((path) => a.vault.text(path) === "PRIVATE\n")).toBe(false);
+    // Still on Rae's computer, kept aside there only when Ana's computer shared its note under that name again.
+    expect([...r.vault.files.keys()].some((path) => r.vault.text(path) === "PRIVATE\n")).toBe(true);
+  }, 40_000);
+
+  it("takes a program's save through a temporary file for the same note's new content", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "old plan\n" });
+    const before = [...a.replica.files().keys()];
+    c.vault.silently("Team/Plan.md.tmp", "edited plan\n");
+    await c.vault.trash("Team/Plan.md");
+    await c.vault.rename("Team/Plan.md.tmp", "Team/Plan.md");
+    await sleep(2_300);
+    await s.settle();
+    expect([...a.replica.files().keys()]).toEqual(before);
+    expect(deletedOf(a)).toEqual([]);
+    expect(a.vault.text("Team/Plan.md")).toBe("edited plan\n");
+  }, 40_000);
+
+  it("deletes a file renamed over in another case, without a suffixed copy for everyone", async () => {
+    const { s, c } = await pair({ "a.md": "old a\n", "B.md": "bee\n" });
+    await c.vault.trash("Team/a.md");
+    await c.vault.rename("Team/B.md", "Team/A.md");
+    await sleep(2_300);
+    await c.folder.settled();
+    expect([...c.replica.files().values()].map((entry) => entry.path)).toEqual(["A.md"]);
+    expect(deletedOf(c).map((entry) => entry.path)).toEqual(["a.md"]);
+    s.net.pump();
+  }, 40_000);
+});
