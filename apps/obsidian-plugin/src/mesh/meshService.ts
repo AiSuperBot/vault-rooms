@@ -534,14 +534,18 @@ export class MeshService {
     this.deps.notify(`"${name}" has reached its storage limit on this computer; new changes to it aren't stored or shared.`);
   }
 
-  private saveSoon(key: string, save: () => Promise<void>): void {
-    if (this.saveTimers.has(key)) return;
+  private saveSoon(key: string, save: () => Promise<void>, delay = 200): void {
+    if (this.saveTimers.has(key) || this.stopped) return;
     this.saveTimers.set(
       key,
       setTimeout(() => {
         this.saveTimers.delete(key);
-        save().catch((error: Error) => this.deps.log(`save ${key}: ${error.message}`));
-      }, 200)
+        // Failed (a file held by another program, a full disk): tried again, less often, until it is saved.
+        save().catch((error: Error) => {
+          this.deps.log(`save ${key}: ${error.message}`);
+          this.saveSoon(key, save, Math.min(delay * 2, 30_000));
+        });
+      }, delay)
     );
   }
 

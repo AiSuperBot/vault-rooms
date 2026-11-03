@@ -39,8 +39,6 @@ export interface VaultLike {
   /** Vault paths of every file under `folder`, recursively. */
   listFiles(folder: string): string[];
   folderExists(path: string): boolean;
-  /** Remove a folder if nothing at all is in it (no file, no folder); never one that holds anything. */
-  removeEmptyFolder?(path: string): Promise<void>;
 }
 
 /**
@@ -738,28 +736,6 @@ export class RoomFolder {
 
   // ---- writing to disk (ours, so the resulting vault events are ignored) ----
 
-  /** Folders a file was moved or trashed out of, with theirs: removed by the pass if that left them empty. */
-  private emptied = new Set<string>();
-
-  private leftFolder(relative: string): void {
-    for (let at = relative.lastIndexOf("/"); at > 0; at = relative.lastIndexOf("/", at - 1)) this.emptied.add(relative.slice(0, at));
-  }
-
-  private async removeEmptied(): Promise<void> {
-    // Deepest first, so a folder whose only content was an emptied folder goes too.
-    const folders = [...this.emptied].sort((a, b) => b.length - a.length);
-    this.emptied.clear();
-    for (const folder of folders) {
-      if (this.stopped) return;
-      // One that can't go (in use, or holding something Obsidian doesn't list) stays: never a reason to stop the pass.
-      try {
-        await this.o.vault.removeEmptyFolder?.(this.vaultPath(folder));
-      } catch (error) {
-        this.o.log(`room folder, removing empty "${folder}": ${(error as Error).message}`);
-      }
-    }
-  }
-
   /** Do something to a file that its vault event will report: `mark` says what to expect, dropped if it doesn't happen. */
   private async expecting<T>(path: string, mark: string, act: () => Promise<T>, happened: (result: T) => boolean = () => true): Promise<T> {
     this.expected.set(path, mark);
@@ -793,7 +769,6 @@ export class RoomFolder {
   }
 
   private trash(relative: string): Promise<void> {
-    this.leftFolder(relative);
     const path = this.vaultPath(relative);
     return this.expecting(path, DELETED, () => this.o.vault.trash(path));
   }
@@ -803,7 +778,6 @@ export class RoomFolder {
    * the same pass must not make this move look like the user's (and the new file be renamed for everyone).
    */
   private async move(from: string, to: string): Promise<void> {
-    this.leftFolder(from);
     const [oldPath, newPath] = [this.vaultPath(from), this.vaultPath(to)];
     const mark = movingMark(oldPath, newPath);
     this.moving.add(mark);
@@ -926,7 +900,6 @@ export class RoomFolder {
         }
       }
       whole = (await this.safely("renames", () => this.applyRenames(desired))) && whole;
-      await this.removeEmptied();
       // What failed (a file in use, say) is looked at again by the full pass of the next retry (see retrySoon).
       if (!whole) {
         this.retryAll = true;
