@@ -10,7 +10,7 @@ import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, veri
 import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
-import { activeDevice, parseSignedVersion, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
+import { activeDevice, MAX_CLOCK_SKEW_MS, parseSignedVersion, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
 
 /**
  * A mesh node: this device's copy of the workspace (record, pending joins, key wraps, encrypted room content) and
@@ -79,11 +79,14 @@ const MAX_ITEMS = 500;
 const MAX_ADDRESSES = 64;
 const MAX_BATCH_BYTES = 8 << 20;
 const PRESENCE_MEMORY = 2000;
-const PRESENCE_WINDOW_MS = 60_000;
+/** Cursors this far from this computer's clock are let go: as far as the record allows clocks to differ (no NTP offline). */
+const PRESENCE_WINDOW_MS = MAX_CLOCK_SKEW_MS;
 const MAX_PENDING = 2000;
 const MAX_PENDING_WRAPS = 500;
 const MAX_STALE = 10_000;
 const MAX_JOIN_VERSIONS = 1_000_000;
+/** A join whose peer sends nothing more for this long is given up on (see JoinHandshake). */
+const JOIN_IDLE_MS = 30_000;
 /** Every key a peer message may carry (each kind checks its own). */
 const MESSAGE_KEYS = ["t", "ws", "head", "recent", "versions", "end", "hash", "joins", "wraps", "rooms", "room", "docs", "blobs", "items", "env", "join"];
 const MAX_BRANCH_BYTES = 256 << 20;
@@ -342,6 +345,22 @@ export class MeshNode {
     this.events.membership?.();
   }
 
+  /** Compare rooms with every other peer, soon and once for a burst (see the "envelopes" message). */
+  compareOthersSoon(except: PeerSession): void {
+    this.compareExcept.add(except);
+    if (this.stopped || this.compareTimer) return;
+    this.compareTimer = setTimeout(() => {
+      this.compareTimer = null;
+      const except = this.compareExcept;
+      this.compareExcept = new Set();
+      for (const session of this.sessions) if (!except.has(session)) session.resync();
+    }, 100);
+    this.compareTimer.unref?.();
+  }
+
+  private compareTimer: ReturnType<typeof setTimeout> | null = null;
+  private compareExcept = new Set<PeerSession>();
+
   /** Compare rooms with every peer again (e.g. after forgetting that a blob was dropped). */
   resync(): void {
     if (this.stopped || this.resyncTimer) return;
@@ -482,9 +501,25 @@ export class MeshNode {
       return false;
     }
     this.setWrap(slot, wrap);
-    this.events.wraps?.();
-    this.broadcast({ t: "wraps", wraps: [wrap] }, from);
+    // Told and passed on together, once the message (or loop) that brought it is done: one event and a few messages
+    // for a burst of thousands, not one each (that froze the app and filled every peer's send queue).
+    const queued = this.wrapsOut.get(from) ?? [];
+    if (queued.push(wrap) === 1) this.wrapsOut.set(from, queued);
+    if (this.wrapsOut.size === 1 && queued.length === 1) queueMicrotask(() => this.flushWraps());
     return true;
+  }
+
+  /** Wraps taken in since the last flush, by the session they came from (not sent back to it). */
+  private wrapsOut = new Map<PeerSession | undefined, KeyWrap[]>();
+
+  /** @internal Tell of and pass on the wraps taken in since the last flush (at once: after a message, in tests). */
+  flushWraps(): void {
+    const out = this.wrapsOut;
+    this.wrapsOut = new Map();
+    if (out.size === 0) return;
+    this.events.wraps?.();
+    if (this.stopped) return;
+    for (const [from, wraps] of out) for (const chunk of chunks(wraps, MAX_ITEMS)) this.broadcast({ t: "wraps", wraps: chunk }, from);
   }
 
   /** Store and pass on a room envelope (presence is only passed on). False if invalid, already known or refused. */
@@ -551,8 +586,8 @@ export class MeshNode {
   /** Stop: nothing more is sent, stored or retried (the owner closes the connections). */
   stop(): void {
     this.stopped = true;
-    if (this.resyncTimer) clearTimeout(this.resyncTimer);
-    this.resyncTimer = null;
+    for (const timer of [this.resyncTimer, this.compareTimer]) if (timer) clearTimeout(timer);
+    this.resyncTimer = this.compareTimer = null;
   }
 
   /** Whether an envelope made here (or the one with this key, see envelopeKey) is still waiting to be stored, so isn't sent yet. */
@@ -828,14 +863,22 @@ export class PeerSession {
       case "joins":
         return this.each(message.joins, (join) => this.node.addJoin(parseJoinRecord(join), this));
       case "wraps":
-        return this.each(message.wraps, (wrap) => this.node.addWrap(parseKeyWrap(wrap), this));
+        this.each(message.wraps, (wrap) => this.node.addWrap(parseKeyWrap(wrap), this));
+        return this.node.flushWraps();
       case "digests":
         if (!this.allow("digests", 20, 3_000)) return;
         return this.onDigests(message.rooms);
       case "room":
         return this.onRoom(message);
-      case "envelopes":
-        return this.each(message.items, (item) => this.node.publish(parseEnvelope(item), this));
+      case "envelopes": {
+        // An answer to our comparison: not pushed to the other peers, one by one (most hold it already); they are asked
+        // to compare with us instead, once, and ask for what they lack.
+        const told = this.node.connectedDevices();
+        let added = false;
+        this.each(message.items, (item) => void (this.node.publish(parseEnvelope(item), this, told) && (added = true)));
+        if (added) this.node.compareOthersSoon(this);
+        return;
+      }
       case "push": {
         const told = Array.isArray(message.items) ? message.items.slice(0, MAX_TOLD).filter((id): id is string => isId(id, "d")) : [];
         return this.each([message.env], (item) => this.node.publish(parseEnvelope(item), this, told));
@@ -1050,7 +1093,8 @@ export class PeerSession {
       blobs.push(key);
     }
     for (const doc of store.docs(room).slice(0, 100_000)) {
-      const summary = { vv: store.vv(room, doc), snaps: store.snapshotKeys(room, doc).slice(0, 100) };
+      // Snapshots dropped here count as held: a peer that keeps one (a relay) doesn't send it at every comparison.
+      const summary = { vv: store.vv(room, doc), snaps: [...store.snapshotKeys(room, doc), ...store.droppedSnapshotKeys(room, doc)].slice(0, 100) };
       if (!fits({ [doc]: summary })) break;
       docs[doc] = summary;
     }
@@ -1162,9 +1206,15 @@ function parseRoomSummary(raw: unknown): Map<string, DocSummary> {
  * caller starts a normal node and session on the same channel.
  */
 export class JoinHandshake {
-  private versions: SignedVersion[] = [];
+  /**
+   * The record as it comes, checked message by message (the first version must be this workspace's genesis, each next
+   * one must extend it): whoever answers at an address of the link isn't known yet, so nothing unchecked is held, and
+   * one that stops sending is given up on (JOIN_IDLE_MS), so the link's next address is tried.
+   */
+  private chain: WorkspaceChain | null = null;
   private targetHead = -1;
   private done = false;
+  private idle: ReturnType<typeof setTimeout> | null = null;
 
   constructor(
     private readonly channel: Channel,
@@ -1176,10 +1226,25 @@ export class JoinHandshake {
 
   start(): void {
     this.channel.send({ t: "join", join: this.join });
+    this.waitForMore();
+  }
+
+  private waitForMore(): void {
+    if (this.idle) clearTimeout(this.idle);
+    this.idle = setTimeout(() => this.finish(() => this.onFail("join_timeout")), JOIN_IDLE_MS);
+    this.idle.unref?.();
+  }
+
+  private finish(then: () => void): void {
+    if (this.done) return;
+    this.done = true;
+    if (this.idle) clearTimeout(this.idle);
+    then();
   }
 
   receive(raw: unknown): void {
     if (this.done) return;
+    this.waitForMore();
     try {
       const message = v.obj(raw, "message", MESSAGE_KEYS);
       if (message.t === "hello") {
@@ -1188,21 +1253,26 @@ export class JoinHandshake {
         this.channel.send({ t: "hello", ws: this.workspaceId, head: -1, recent: [] });
       } else if (message.t === "versions") {
         if (!Array.isArray(message.versions) || message.versions.length > MAX_ITEMS) v.bad("versions");
-        if (this.versions.length + message.versions.length > MAX_JOIN_VERSIONS) fail("too_many_versions");
-        for (const version of message.versions) this.versions.push(parseSignedVersion(version));
+        const versions = message.versions.map(parseSignedVersion);
+        if (!this.chain && versions.length > 0) {
+          this.chain = new WorkspaceChain(versions.shift()!);
+          if (this.chain.workspaceId !== this.workspaceId) fail("other_workspace");
+        }
+        if (this.chain && versions.length > 0) {
+          if (this.chain.head.body.v + versions.length > MAX_JOIN_VERSIONS) fail("too_many_versions");
+          const result = this.chain.offer(versions, Date.now(), true);
+          if (result.status !== "appended" && result.status !== "duplicate") fail("bad_chain", result.status === "rejected" ? result.reason : result.status);
+        }
       }
-      if (this.targetHead >= 0 && this.versions.length >= this.targetHead + 1) {
-        const chain = WorkspaceChain.load(this.versions.slice(0, this.targetHead + 1), Date.now());
-        if (chain.workspaceId !== this.workspaceId) fail("other_workspace");
+      if (this.targetHead >= 0 && this.chain && this.chain.head.body.v >= this.targetHead) {
+        const chain = this.chain;
         // The record must know this invite: still open for this join, or already recorded for this device.
         const invite = chain.state.invites[this.join.body.invite];
         if (invite?.used !== this.join.body.device.id) verifyJoinRecord(chain.state, this.workspaceId, this.join, Date.now());
-        this.done = true;
-        this.onChain(chain);
+        this.finish(() => this.onChain(chain));
       }
     } catch (error) {
-      this.done = true;
-      this.onFail(errorText(error));
+      this.finish(() => this.onFail(errorText(error)));
     }
   }
 }

@@ -42,9 +42,13 @@ export function isShareable(path: string): boolean {
   return dot > path.lastIndexOf("/") + 1 && SHARED_EXTENSIONS.has(path.slice(dot + 1).toLowerCase());
 }
 
-/** Notes are compared and shared with "\n" line endings, as Obsidian's editor holds them (and saves them, once edited). */
+/**
+ * Without a leading byte-order mark either (Windows tools write one; Obsidian drops it when it reads a note, but not
+ * in what a guarded write is checked against): every comparison of a note's text goes through here, so all agree.
+ */
 export function normalizeNote(text: string): string {
-  return text.includes("\r") ? text.replace(/\r\n?/g, "\n") : text;
+  const unmarked = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  return unmarked.includes("\r") ? unmarked.replace(/\r\n?/g, "\n") : unmarked;
 }
 
 export function sha(bytes: Uint8Array | string): string {

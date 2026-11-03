@@ -90,7 +90,12 @@ export class Network {
   links: Array<{ a: string; b: string; cut: () => void }> = [];
 
   /** Connect two nodes, as if the transport had authenticated both ends. */
+  /** Every node linked, for flushing their wraps (see pump). */
+  private nodes = new Set<MeshNode>();
+
   link(a: MeshNode, b: MeshNode): { ab: PeerSession; ba: PeerSession; cut: () => void } {
+    this.nodes.add(a);
+    this.nodes.add(b);
     let open = true;
     const sessions: { ab?: PeerSession; ba?: PeerSession } = {};
     // Closing either end closes the connection, so the other end's session ends too (as with a real socket).
@@ -118,9 +123,15 @@ export class Network {
 
   pump(limit = 100_000): number {
     let delivered = 0;
+    // Wraps a node took in locally are passed on when its turn ends (see MeshNode.flushWraps): here, before each delivery.
+    const flush = () => {
+      for (const node of this.nodes) node.flushWraps();
+    };
+    flush();
     while (this.queue.length > 0 && delivered < limit) {
       this.queue.shift()!();
       delivered++;
+      flush();
     }
     if (this.queue.length > 0) throw new Error("network did not settle");
     return delivered;

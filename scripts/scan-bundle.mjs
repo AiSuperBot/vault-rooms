@@ -6,27 +6,30 @@
 //
 // Baselines are the counts of 0.3.9's bundle: lowered to what the code uses, so any new use is looked at.
 // - setTimeout( 26 -> 27: a swap's rename held a moment by another program is tried again after a pause (diskStore.ts, held).
+// - setTimeout( 27 -> 30, clearTimeout( 25 -> 27: deletions counted from the last one (roomFolder.ts, waitForDeletions), a
+//   catch-up passed on by one comparison (mesh.ts, compareOthersSoon), a join's peer given up on when quiet (mesh.ts,
+//   JoinHandshake). window.setTimeout 5 -> 6: settings saved again when a save failed (plugin.ts, saveSettingsLater).
 
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-export const TIER2_STRICT_ZERO = ["fastify", "Fastify", "ajv", "new Function", "eval(", "process.env", "node:fs", "console.log(", "console.info(", "console.trace("];
+const TIER2_STRICT_ZERO = ["fastify", "Fastify", "ajv", "new Function", "eval(", "process.env", "node:fs", "console.log(", "console.info(", "console.trace("];
 
-export const TIER3_APPROVED_BASELINE = {
-  "setTimeout(": 27,
+const TIER3_APPROVED_BASELINE = {
+  "setTimeout(": 30,
   "setInterval(": 5,
-  "clearTimeout(": 25,
+  "clearTimeout(": 27,
   "clearInterval(": 5,
   "globalThis": 6,
   "fetch(": 0,
-  "window.setTimeout": 5
+  "window.setTimeout": 6
 };
 
-export const REQUIRED_PRESENT = ["TLSv1.3", "EXPORTER-vault-rooms-peer-auth"];
+const REQUIRED_PRESENT = ["TLSv1.3", "EXPORTER-vault-rooms-peer-auth"];
 
 // Modules matched as a require/import specifier, not a substring.
-export const STRICT_ZERO_MODULES = ["child_process", "fs"];
+const STRICT_ZERO_MODULES = ["child_process", "fs"];
 
 const moduleReferences = (bundle, name) =>
   bundle.match(new RegExp(`(?:require\\(\\s*|from\\s*)["'](?:node:)?${name}["']`, "g"))?.length ?? 0;
@@ -45,7 +48,7 @@ const countOf = (bundle, token) => {
  * @param {string} bundle
  * @returns {{ failed: boolean, lines: string[] }}
  */
-export function scanBundle(bundle) {
+function scanBundle(bundle) {
   let failed = false;
   const lines = [];
 
@@ -89,17 +92,15 @@ export function scanBundle(bundle) {
   return { failed, lines };
 }
 
-const isMain = process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
-if (isMain) {
-  const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
-  const bundle = readFileSync(resolve(root, "main.js"), "utf8");
-  const { failed, lines } = scanBundle(bundle);
+// Run as a script by build:plugin (nothing imports it).
+const root = resolve(fileURLToPath(new URL(".", import.meta.url)), "..");
+const bundle = readFileSync(resolve(root, "main.js"), "utf8");
+const { failed, lines } = scanBundle(bundle);
 
-  // The scan report is command output, not diagnostic logging.
-  process.stdout.write(lines.join("\n") + "\n");
+// The scan report is command output, not diagnostic logging.
+process.stdout.write(lines.join("\n") + "\n");
 
-  if (failed) {
-    process.stderr.write("\nBundle scan FAILED - see FAIL lines above.\n");
-    process.exitCode = 1;
-  }
+if (failed) {
+  process.stderr.write("\nBundle scan FAILED - see FAIL lines above.\n");
+  process.exitCode = 1;
 }

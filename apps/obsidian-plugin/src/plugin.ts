@@ -146,6 +146,17 @@ export default class VaultRoomsPlugin extends Plugin {
     await this.saveSettings();
   }
 
+  /** Save the settings again soon, and again less often until it works (never once unloaded, or while unreadable). */
+  private saveSettingsLater(delay = 1_000): void {
+    window.setTimeout(() => {
+      if (this.unloaded || this.settingsUnreadable) return;
+      this.saveSettings().catch((error: Error) => {
+        console.debug(`Vault Rooms: settings: ${error.message}`);
+        this.saveSettingsLater(Math.min(delay * 2, 60_000));
+      });
+    }, delay);
+  }
+
   async saveSettings(): Promise<void> {
     if (this.settingsUnreadable) throw new Error(SETTINGS_UNREADABLE);
     await this.saveData(this.settings);
@@ -244,15 +255,17 @@ export default class VaultRoomsPlugin extends Plugin {
       // Without the room's folder (hidden, being moved) the clash waits for it, and is settled when it starts again.
       svc.onClash((roomId, docId, version) => this.folders.get(roomId)?.noteClashed(docId, version) ?? false)
     );
-    for (const room of svc.rooms()) {
-      const replica = svc.replica(room.id);
-      if (replica) await this.onReplica(room.id, replica);
-      if (this.unloaded) return;
-    }
+    // Online first: a room's first pass (a minute or more for a large room after a crash) doesn't keep this computer
+    // from the others. What arrives before a room's folder is there is taken in by that pass.
     try {
       await svc.start();
     } catch (error) {
       this.serviceError = `Couldn't start sharing on this computer: ${(error as Error).message}`;
+    }
+    for (const room of svc.rooms()) {
+      const replica = svc.replica(room.id);
+      if (replica) await this.onReplica(room.id, replica);
+      if (this.unloaded) return;
     }
     this.syncEditors();
     this.changed();
@@ -347,7 +360,10 @@ export default class VaultRoomsPlugin extends Plugin {
   private roomAt(path: string): string | null {
     const key = pathKey(path);
     let best: { roomId: string; length: number } | null = null;
-    for (const [roomId, room] of Object.entries(this.settings.mesh.workspace?.rooms ?? {})) {
+    const rooms = this.settings.mesh.workspace?.rooms ?? {};
+    // Asked for every file of every pass: no list of the rooms is made each time.
+    for (const roomId in rooms) {
+      const room = rooms[roomId]!;
       if (room.hidden) continue;
       let folderKey = this.folderKeys.get(room.folder);
       if (folderKey === undefined) this.folderKeys.set(room.folder, (folderKey = `${pathKey(room.folder)}/`));
@@ -567,6 +583,7 @@ export default class VaultRoomsPlugin extends Plugin {
       healthChanged: () => this.changed(),
       loadState: () => svc.disk.loadRoomState<RoomFolderState>(roomId),
       saveState: (state) => svc.disk.saveRoomState(roomId, state),
+      saveStateChanges: (changes) => svc.disk.appendRoomChanges(roomId, changes),
       loadSaves: () => svc.disk.loadRoomState(roomId, ".saves"),
       saveSaves: (saves) => svc.disk.saveRoomState(roomId, saves, ".saves"),
       notify: (message) => new Notice(message, 8000),
@@ -691,7 +708,8 @@ export default class VaultRoomsPlugin extends Plugin {
       this.folders.get(roomId)?.folderMoved();
       room.folder = newPath + room.folder.slice(oldPath.length);
     }
-    await this.saveSettings();
+    // Held a moment by another program: the move still goes on (the settings here have it), saved again until saved.
+    await this.saveSettings().catch(() => this.saveSettingsLater());
     for (const [roomId] of moved) {
       const replica = this.service?.replica(roomId);
       await this.unmount(roomId);

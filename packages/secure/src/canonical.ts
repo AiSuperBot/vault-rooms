@@ -1,7 +1,6 @@
 import { fail } from "./errors.js";
 
 /** The only values that may be signed: JSON without floats, so every implementation serializes them identically. */
-export type Canonical = null | boolean | number | string | Canonical[] | { readonly [key: string]: Canonical };
 
 /**
  * Deterministic JSON: object keys sorted by UTF-16 code unit, no whitespace, safe integers only.
@@ -94,14 +93,3 @@ function encodeNow(value: unknown, depth: number): string {
   }
 }
 
-/** Parse untrusted JSON and require that it is already in canonical form (no duplicate keys, floats, padding). */
-export function parseCanonical(text: string): Canonical {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    return fail("bad_json");
-  }
-  if (canonicalJson(parsed) !== text) fail("not_canonical");
-  return parsed as Canonical;
-}

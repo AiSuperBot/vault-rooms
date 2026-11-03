@@ -214,3 +214,37 @@ describe("envelope store", () => {
     }
   });
 });
+
+describe("envelope store, attachment limits", () => {
+  it("lets a room it only relays drop its oldest attachments past the limit, and refuses more past a member's", () => {
+    const { ctx, writer } = setup();
+    const [relayLimit, memberLimit] = [STORE_LIMITS.relayBlobBytes, STORE_LIMITS.memberBlobBytes];
+    try {
+      let clock = 1_000;
+      const store = new EnvelopeStore();
+      store.now = () => clock;
+      const blobs = [1, 2, 3].map((i) => sealBlob(ctx(writer), utf8(`attachment ${i} `.repeat(40))));
+      STORE_LIMITS.relayBlobBytes = blobs[0]!.ct.length * 2 + 10;
+      store.isMember = () => false;
+      for (const blob of blobs) {
+        clock += 1_000;
+        expect(store.add(blob)).toBe("added");
+      }
+      // The oldest went, remembered as gone (not taken in again); the newest two stay.
+      const held = store.blobsOf(blobs[0]!.room).map((meta) => meta.id);
+      expect(held.sort()).toEqual([blobs[1]!.id, blobs[2]!.id].sort());
+      expect(store.gone(blobs[0]!.room).map(([key]) => key)).toEqual([`${writer.id}/${blobs[0]!.id}`]);
+      expect(store.add(blobs[0]!)).toBe("duplicate");
+      // A room it is in keeps what it has, and refuses more.
+      const member = new EnvelopeStore();
+      member.isMember = () => true;
+      STORE_LIMITS.memberBlobBytes = blobs[0]!.ct.length + 10;
+      expect(member.add(blobs[0]!)).toBe("added");
+      expect(member.add(blobs[1]!)).toBe("quota");
+      expect(member.blobsOf(blobs[0]!.room)).toHaveLength(1);
+    } finally {
+      STORE_LIMITS.relayBlobBytes = relayLimit;
+      STORE_LIMITS.memberBlobBytes = memberLimit;
+    }
+  });
+});

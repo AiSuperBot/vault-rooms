@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { INDEX_DOC, keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
-import { RoomFolder, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { RoomFolder, type RoomFolderOptions, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { DiskStore, fileNameOf } from "../../src/mesh/diskStore.js";
+import { MemoryFiles } from "./memoryFiles.js";
 import { folderProblem } from "../../src/mesh/roomPaths.js";
 import { MemoryVault } from "./memoryVault.js";
 
@@ -2897,5 +2899,198 @@ describe("room folder, stopping and scratch files", () => {
     await a.folder.stop();
     expect(saves).toBe(first + 1);
     expect(a.saved.state!.known[id]!.mtime).toBe(a.vault.stat("Team/Plan.md")!.mtime);
+  });
+});
+
+describe("room folder, deletions from Explorer", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const deleteSlowly = async (pc: { vault: MemoryVault }, paths: string[], gapMs: number) => {
+    for (const path of paths) {
+      pc.vault.files.delete(path);
+      pc.vault.listener.delete?.(path);
+      await sleep(gapMs);
+    }
+  };
+
+  it("deletes nothing for anyone when the whole folder goes file by file, slowly (a move to another drive)", async () => {
+    const files = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { s, a, c } = await pair(files);
+    // As Obsidian reports what Explorer does: one file at a time, a pause longer than a second midway, the folder last.
+    const paths = c.vault.listFiles("Team");
+    await deleteSlowly(c, paths.slice(0, 5), 300);
+    await sleep(1_200);
+    await deleteSlowly(c, paths.slice(5), 300);
+    c.vault.folders.delete("Team");
+    await sleep(2_300);
+    s.net.pump();
+    await s.settle();
+    expect([...a.replica.entries().values()].filter((entry) => entry.deleted)).toEqual([]);
+    expect(a.vault.trashed).toEqual([]);
+    expect(c.gone).toEqual(["Team"]);
+  }, 30_000);
+
+  it("shares many deletions at once only after the longer wait, and says so", async () => {
+    const files = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { s, a, c } = await pair(files);
+    await deleteSlowly(c, c.vault.listFiles("Team"), 0);
+    await sleep(2_300);
+    s.net.pump();
+    // Held: the folder is still there, but a whole-folder move may not be over.
+    expect([...a.replica.entries().values()].filter((entry) => entry.deleted)).toEqual([]);
+    await sleep(10_300);
+    s.net.pump();
+    await s.settle();
+    expect([...a.replica.entries().values()].filter((entry) => entry.deleted)).toHaveLength(25);
+    expect(c.notices.some((n) => n.includes("25 files deleted"))).toBe(true);
+  }, 40_000);
+});
+
+describe("room folder, a reader's own copies", () => {
+  async function readerWithCopy() {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    return { s, a, r };
+  }
+  const copies = (vault: MemoryVault) => [...vault.files.keys()].filter((path) => path.includes("(your copy") || path.includes("Mine"));
+
+  it("stay on this computer after a restart, also renamed, once the reader may write", async () => {
+    const { s, a, r } = await readerWithCopy();
+    await r.vault.writeText("Team/Rules.md", "anything goes\n");
+    await s.settle();
+    const copy = copies(r.vault)[0]!;
+    await r.vault.rename(copy, "Team/Mine.md");
+    await s.settle();
+    // Rae may now edit, and Obsidian starts again: her copy is still hers alone.
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+    await s.settle();
+    await r.folder.stop();
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(copies(r.vault)).toEqual(["Team/Mine.md"]);
+    expect(copies(a.vault)).toEqual([]);
+    expect([...a.replica.files().values()].map((entry) => entry.path)).toEqual(["Rules.md"]);
+  });
+
+  it("aren't written unless they can be stored as such, and nothing of the reader's is lost", async () => {
+    const { s, r } = await readerWithCopy();
+    const save = (r.folder as unknown as { o: { saveState: (state: RoomFolderState) => Promise<void> } }).o;
+    save.saveState = async () => {
+      throw new Error("EBUSY: state held");
+    };
+    await r.vault.writeText("Team/Rules.md", "anything goes\n");
+    await s.settle();
+    expect(copies(r.vault)).toEqual([]);
+    expect(text(r.vault, "Team/Rules.md")).toBe("anything goes\n");
+  });
+});
+
+describe("room folder, Windows files", () => {
+  it("writes others' changes to a note saved with a byte-order mark (a Windows script)", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "one\n" });
+    // PowerShell 5.1 (Set-Content -Encoding UTF8) rewrites it with a byte-order mark, the same text.
+    c.vault.silently("Team/Plan.md", "\uFEFFone\n");
+    await c.folder.onLocalWrite("Team/Plan.md");
+    await s.settle();
+    await a.vault.writeText("Team/Plan.md", "two\n");
+    await s.settle();
+    expect(c.vault.text("Team/Plan.md")).toBe("two\n");
+    expect(c.folder.health().failing).toEqual([]);
+  });
+
+  it("makes two renames that arrived while it was closed, one taking the other's old name in another case", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/draft.md", "draft\n");
+    await a.vault.writeText("Team/meeting.md", "meeting\n");
+    const windows = new MemoryVault();
+    windows.windows = true;
+    let c = s.make(s.cy, "Team", windows);
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.cy);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    const link = s.net.link(a.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    link.cut();
+    await s.hide(c);
+    await a.vault.rename("Team/meeting.md", "Team/old.md");
+    await a.vault.rename("Team/draft.md", "Team/Meeting.md");
+    await a.folder.settled();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    // Obsidian starts again on Cy's computer.
+    c = s.make(s.cy, "Team", c.vault, c);
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    expect([...c.vault.files.keys()].sort()).toEqual(["Team/Meeting.md", "Team/old.md"]);
+    expect(c.vault.text("Team/Meeting.md")).toBe("draft\n");
+    expect(c.folder.health().failing).toEqual([]);
+  });
+});
+
+describe("room folder, its stored state", () => {
+  it("stores only what changed while someone types, and reads back the same after a crash", async () => {
+    const { s, a, c } = await pair({ "Plan.md": "plan\n", "Other.md": "other\n" });
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const o = (a.folder as unknown as { o: RoomFolderOptions }).o;
+    const writes = { whole: 0, changes: 0 };
+    o.saveState = (state) => {
+      writes.whole++;
+      return disk.saveRoomState(s.roomId, state);
+    };
+    o.saveStateChanges = (changes) => {
+      writes.changes++;
+      return disk.appendRoomChanges(s.roomId, changes);
+    };
+    (a.folder as unknown as { wholeNext: boolean }).wholeNext = true;
+    const known = () => JSON.parse(JSON.stringify(Object.fromEntries((a.folder as unknown as { known: Map<string, unknown> }).known)));
+    for (let i = 0; i < 5; i++) {
+      await c.vault.writeText("Team/Plan.md", `plan ${i}\n`);
+      await s.settle();
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    }
+    expect(writes.whole).toBe(1);
+    expect(writes.changes).toBeGreaterThan(0);
+    // Obsidian stops here without saving: what is read back is what this computer had remembered.
+    const read = await new DiskStore(files, "m").loadRoomState<RoomFolderState>(s.roomId);
+    expect(read!.known).toEqual(known());
+    // A clean stop stores it whole, and the changes go.
+    await a.folder.stop();
+    expect(writes.whole).toBe(2);
+    expect([...files.data.keys()].some((key) => key.endsWith(".changes.jsonl"))).toBe(false);
+    expect((await new DiskStore(files, "m").loadRoomState<RoomFolderState>(s.roomId))!.known).toEqual(known());
+  }, 30_000);
+
+  it("ignores changes stored on top of an older whole state", async () => {
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const room = randomId("r");
+    await disk.saveRoomState(room, { gen: 1, known: { f1: { path: "a.md", hash: "x", size: 1, mtime: 1 } } });
+    await disk.appendRoomChanges(room, { gen: 1, known: { f2: { path: "b.md", hash: "y", size: 1, mtime: 1 } }, localOnly: [] });
+    // A whole state of the next generation, whose removal of the changes didn't happen (a stop right then).
+    files.data.set(`m/rooms/${fileNameOf(room)}.json`, JSON.stringify({ gen: 2, known: { f1: { path: "a.md", hash: "x", size: 1, mtime: 1 } } }));
+    await disk.appendRoomChanges(room, { gen: 2, known: { f1: null }, localOnly: ["Mine.md"] });
+    await files.append(`m/rooms/${fileNameOf(room)}.changes.jsonl`, '{"gen":2,"known":{"f3"');
+    const read = (await new DiskStore(files, "m").loadRoomState<RoomFolderState>(room))!;
+    expect(read.known).toEqual({});
+    expect(read.localOnly).toEqual(["Mine.md"]);
   });
 });

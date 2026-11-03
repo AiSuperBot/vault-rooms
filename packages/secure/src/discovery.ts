@@ -4,7 +4,7 @@ import { canonicalJson } from "./canonical.js";
 import { sign, verify, type KeyPair } from "./crypto.js";
 import { workspaceTag } from "./transport.js";
 import * as v from "./validate.js";
-import { activeDevice, type WorkspaceState } from "./workspace.js";
+import { activeDevice, MAX_CLOCK_SKEW_MS, type WorkspaceState } from "./workspace.js";
 
 /**
  * LAN discovery: every peer announces "device D of workspace W listens on port P" by UDP multicast and broadcast.
@@ -16,7 +16,8 @@ import { activeDevice, type WorkspaceState } from "./workspace.js";
 const DISCOVERY_PORT = 47879;
 const DISCOVERY_GROUP = "239.255.86.83";
 const ANNOUNCE_EVERY_MS = 15_000;
-const MAX_AGE_MS = 120_000;
+/** Announcements this far from this computer's clock are let go: as far as the record allows clocks to differ. */
+const MAX_AGE_MS = MAX_CLOCK_SKEW_MS;
 const MAX_PACKETS_PER_SECOND = 100;
 /** Per sender address, so one noisy machine can't drown out everyone else's announcements. */
 const MAX_PACKETS_PER_SOURCE = 10;

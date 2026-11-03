@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
@@ -178,6 +178,32 @@ describe("room replica", () => {
       expect(c.replica.noteText(id)).toBe(all.getText("content").toString());
       expect(c.replica.isComplete(id)).toBe(true);
       for (const doc of [...writers, all]) doc.destroy();
+    }
+  });
+
+  it("lets notes idle for half a minute go once very many are loaded (a catch-up), not those just used", () => {
+    const s = setup();
+    const c = s.member(s.cy);
+    const docs = () => (c.replica as unknown as { docs: Map<string, unknown> }).docs;
+    vi.useFakeTimers();
+    try {
+      const ids = Array.from({ length: 2_100 }, () => randomId("f"));
+      for (const id of ids) c.replica.noteDoc(id);
+      vi.advanceTimersByTime(31_000);
+      const recent = ids[0]!;
+      c.replica.noteDoc(recent);
+      c.replica.releaseIdle(5 * 60_000, (doc) => doc === ids[1]);
+      // Idle 31 s of 5 min: let go, but for the one used just now and the one kept (open in an editor).
+      expect(docs().size).toBe(3);
+      expect(docs().has(recent)).toBe(true);
+      expect(docs().has(ids[1]!)).toBe(true);
+      // Few loaded: the usual 5 minutes.
+      c.replica.noteDoc(ids[2]!);
+      vi.advanceTimersByTime(31_000);
+      c.replica.releaseIdle(5 * 60_000, () => false);
+      expect(docs().has(ids[2]!)).toBe(true);
+    } finally {
+      vi.useRealTimers();
     }
   });
 
@@ -494,7 +520,8 @@ describe("room replica", () => {
   /** Let the network, and what waits for a microtask, run. */
   async function quiet(s: ReturnType<typeof setup>) {
     s.net.pump();
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    // Long enough for a computer that caught up to ask its other peers to compare (MeshNode.compareOthersSoon).
+    await new Promise((resolve) => setTimeout(resolve, 150));
     s.net.pump();
   }
 

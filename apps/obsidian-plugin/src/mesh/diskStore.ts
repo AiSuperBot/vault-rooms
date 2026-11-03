@@ -347,13 +347,58 @@ export class DiskStore implements BlobStorage {
     return `${this.root}/rooms/${fileNameOf(roomId)}${kind}.json`;
   }
 
-  /** Null if there is none; throws if it is there but can't be read (better than taking it for none). */
+  /**
+   * Null if there is none; throws if it is there but can't be read (better than taking it for none). A room's state
+   * comes with the changes stored on top of it folded in (see appendRoomChanges), those of its own generation only.
+   */
   async loadRoomState<T>(roomId: string, kind = ""): Promise<T | null> {
-    return (await this.readWhole(this.roomStatePath(roomId, kind), true)) as T | null;
+    const state = (await this.readWhole(this.roomStatePath(roomId, kind), true)) as (T & { gen?: number; known?: Record<string, unknown>; localOnly?: unknown }) | null;
+    if (kind !== "" || state === null || typeof state !== "object") return state;
+    const path = this.roomChangesPath(roomId);
+    if (!(await this.files.exists(path))) return state;
+    let text: string;
+    try {
+      text = await this.files.read(path);
+    } catch {
+      throw new Error(`${lastPart(path)} can't be read now (in use by another program?): close that program, then try again`);
+    }
+    for (const line of text.split("\n")) {
+      let changes: { gen?: unknown; known?: Record<string, unknown>; localOnly?: unknown };
+      try {
+        changes = JSON.parse(line) as typeof changes;
+      } catch {
+        continue; // a torn last line: what it held is stored whole at the next save
+      }
+      if (changes.gen !== (state.gen ?? 0) || typeof changes.known !== "object" || changes.known === null) continue;
+      state.known ??= {};
+      for (const [id, known] of Object.entries(changes.known)) {
+        if (known === null) delete state.known[id];
+        else state.known[id] = known;
+      }
+      if (Array.isArray(changes.localOnly)) state.localOnly = changes.localOnly;
+    }
+    return state;
   }
 
-  saveRoomState(roomId: string, state: unknown, kind = ""): Promise<void> {
-    return this.writeWhole(this.roomStatePath(roomId, kind), JSON.stringify(state));
+  async saveRoomState(roomId: string, state: unknown, kind = ""): Promise<void> {
+    await this.writeWhole(this.roomStatePath(roomId, kind), JSON.stringify(state));
+    // The changes stored on top of the state before are in this one (and of another generation, so ignored anyway).
+    if (kind === "") await this.queue(this.roomChangesPath(roomId), async () => {
+      if (await this.files.exists(this.roomChangesPath(roomId))) await this.files.remove(this.roomChangesPath(roomId));
+    }).catch(() => {});
+  }
+
+  /** Changes of a room's state on top of the one stored whole (see RoomFolder.saveNow): one line each, appended. */
+  appendRoomChanges(roomId: string, changes: unknown): Promise<void> {
+    const path = this.roomChangesPath(roomId);
+    return this.queue(path, async () => {
+      await this.ensureFolder(path);
+      await this.written(path, this.files.append(path, `\n${JSON.stringify(changes)}\n`));
+    });
+  }
+
+  private roomChangesPath(roomId: string): string {
+    return `${this.root}/rooms/${fileNameOf(roomId)}.changes.jsonl`;
   }
 
   // ---- envelopes ----

@@ -324,7 +324,9 @@ describe("discovery announcements", () => {
     const now = Date.now();
     const good = Buffer.from(JSON.stringify(makeAnnouncement(w.ws, w.cy.id, w.cy.sign, 4567, now)));
     expect(readAnnouncement(good, w.ws, w.chain.state, now)).toEqual({ device: w.cy.id, port: 4567 });
-    expect(readAnnouncement(good, w.ws, w.chain.state, now + 121_000)).toBeNull();
+    // Clocks may differ as much as the record allows (no NTP offline), not more.
+    expect(readAnnouncement(good, w.ws, w.chain.state, now + 5 * 60_000)).toEqual({ device: w.cy.id, port: 4567 });
+    expect(readAnnouncement(good, w.ws, w.chain.state, now + 11 * 60_000)).toBeNull();
     expect(readAnnouncement(good, founder().ws, w.chain.state, now)).toBeNull();
     const forged = Buffer.from(JSON.stringify(makeAnnouncement(w.ws, w.cy.id, newSigningKeyPair(), 4567, now)));
     expect(readAnnouncement(forged, w.ws, w.chain.state, now)).toBeNull();

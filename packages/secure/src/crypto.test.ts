@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { b64u, fromB64u, utf8 } from "./bytes.js";
 import { Budget } from "./mesh.js";
-import { canonicalJson, freezeDeep, keepEncoding, parseCanonical } from "./canonical.js";
+import { canonicalJson, freezeDeep, keepEncoding } from "./canonical.js";
 import {
   hashTagged,
   isSmallOrderSigningKey,
@@ -51,13 +51,6 @@ describe("canonical JSON", () => {
     expect(code(() => canonicalJson({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: { k: { l: record } } } } } } } } } } } }))).toBe("canonical_too_deep");
     expect(code(() => canonicalJson({ a: { b: { c: { d: { e: { f: { g: { h: { i: { j: { k: { l: fresh } } } } } } } } } } } }))).toBe("canonical_too_deep");
     expect(Object.isFrozen((record as { a: { d: object } }).a.d)).toBe(true);
-  });
-  it("parses only canonical text", () => {
-    expect(parseCanonical('{"a":1}')).toEqual({ a: 1 });
-    expect(code(() => parseCanonical('{ "a": 1 }'))).toBe("not_canonical");
-    expect(code(() => parseCanonical('{"b":1,"a":2}'))).toBe("not_canonical");
-    expect(code(() => parseCanonical('{"a":1,"a":2}'))).toBe("not_canonical");
-    expect(code(() => parseCanonical("{"))).toBe("bad_json");
   });
 });
 
