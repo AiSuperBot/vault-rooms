@@ -3317,11 +3317,12 @@ describe("room folder, round 53", () => {
   const leaked = (a: Pc) => [...a.vault.files.keys()].filter((path) => a.vault.text(path)?.includes("PRIVATE"));
 
   /** Rae, a reader, has her own copy of Rules.md, then may write. */
-  async function privateCopy() {
+  async function privateCopy(files: Record<string, string> = {}) {
     const s = setup();
     const a = s.make(s.ana, "Team");
     await a.vault.writeText("Team/Rules.md", "be nice\n");
     await a.vault.writeText("Team/plan.md", "the plan\n");
+    for (const [path, content] of Object.entries(files)) await a.vault.writeText(`Team/${path}`, content);
     const r = s.make(s.rae, "Team");
     s.giveKey(a, s.ana);
     s.giveKey(a, s.rae);
@@ -3401,5 +3402,48 @@ describe("room folder, round 53", () => {
     expect(deletedOf(a)).toEqual([]);
     expect(c.vault.text("Team/n27.md")).toBe("note 27\n");
     expect(c.vault.text("Team/n3.md")).toBe("note 3\n");
+  }, 40_000);
+
+  it("keeps a private copy private when edited outside Obsidian while it was closed, then renamed while closed", async () => {
+    const { s, a, r, copy } = await privateCopy();
+    await r.folder.stop();
+    r.vault.silently(copy, "PRIVATE edited elsewhere\n");
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    await again.folder.stop();
+    r.vault.silently("Team/Mine.md", r.vault.text(copy)!);
+    r.vault.files.delete(copy);
+    const third = s.make(s.rae, "Team", r.vault, again);
+    third.replica.refreshKeys();
+    await third.folder.start();
+    await s.settle();
+    expect(leaked(a)).toEqual([]);
+  }, 40_000);
+
+  it("forgets an emptied private copy's old content, so it claims no other file", async () => {
+    const { s, r, copy } = await privateCopy();
+    await r.vault.writeText(copy, "");
+    await s.settle();
+    await r.folder.stop();
+    const entry = (r.saved.state?.localOnly ?? []).find((item) => typeof item !== "string" && copy.endsWith(item.path));
+    expect(entry).toEqual({ path: copy.slice("Team/".length) });
+  }, 40_000);
+
+  it("drops the private mark of a copy deleted along with many files, when Cancel puts the shared ones back", async () => {
+    const files = Object.fromEntries(Array.from({ length: 24 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { s, a, r, copy } = await privateCopy(files);
+    (r.folder as unknown as { o: RoomFolderOptions }).o.confirmDeletions = () => Promise.resolve(false);
+    await r.vault.trash(copy);
+    for (let i = 0; i < 24; i++) await r.vault.trash(`Team/n${i}.md`);
+    await sleep(2_300);
+    await s.settle();
+    expect(r.vault.text("Team/n3.md")).toBe("note 3\n");
+    await a.vault.rename("Team/plan.md", copy);
+    await s.settle();
+    await r.vault.writeText(copy, "the plan, edited by Rae\n");
+    await s.settle();
+    expect(a.vault.text(copy)).toBe("the plan, edited by Rae\n");
   }, 40_000);
 });

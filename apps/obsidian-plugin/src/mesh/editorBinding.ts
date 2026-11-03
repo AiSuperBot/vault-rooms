@@ -188,7 +188,9 @@ export class EditorBinding {
     }
     const now = view.state.doc.toString();
     if (!safeToBind(now, shared, disk, target.fromShared)) return false;
-    const undo = new Y.UndoManager(target.ytext);
+    // What this editor's typing changed, nothing else (yCollab adds its own origin): not others' edits, nor this
+    // computer's own (a change made by another program, a line moved out of a clash).
+    const undo = new Y.UndoManager(target.ytext, { trackedOrigins: new Set() });
     const facade = target.presence.facade(target.fileId, target.ytext.doc!);
     const extension: Extension = [WHOLE_CHARACTERS, SHARED_UNDO, yCollab(target.ytext, facade, { undoManager: undo }), target.readOnly ? READ_ONLY : []];
     try {
