@@ -7,7 +7,7 @@ import { fail, SecureError } from "./errors.js";
 import { MAX_FRAME, PROVEN_MAX_FRAME } from "./frames.js";
 import { isId } from "./ids.js";
 import { applyJoins, joinHash, parseJoinRecord, PEER_PATTERN, takenBackOut, verifyJoinRecord, type JoinRecord } from "./invite.js";
-import { parseKeyWrap, verifyKeyWrap, wrapSignatureValid, type KeyWrap } from "./keys.js";
+import { parseKeyWrap, verifyKeyWrap, wrapCounts, wrapSignatureValid, type KeyWrap } from "./keys.js";
 import { EnvelopeStore, type VersionVector } from "./store.js";
 import * as v from "./validate.js";
 import { activeDevice, MAX_CLOCK_SKEW_MS, parseSignedVersion, roleIn, versionHash, type SignedVersion, type WorkspaceState } from "./workspace.js";
@@ -312,11 +312,11 @@ export class MeshNode {
       }
     }
     this.effectiveCache = null;
-    // Wraps of a key the record no longer has (a rotation that lost a race) stop counting, receipts included, so the
-    // right key can take their place; they are set aside, not dropped, and count again if the record names the key.
+    // Wraps that stop counting (a key the record no longer has, a room deleted, someone who lost access) are set aside as
+    // at start (see restore): kept while worth keeping, so a key that lost a race counts again if the record names it.
     let wrapsChanged = false;
     for (const [slot, wrap] of this.wraps) {
-      if (this.effective().rooms[wrap.body.room]?.epochs[wrap.body.n - 1]?.commit === wrap.body.commit) continue;
+      if (wrapCounts(this.effective(), this.workspaceId, wrap.body)) continue;
       this.dropWrap(slot);
       this.keepAside(wrap);
       wrapsChanged = true;
@@ -715,6 +715,9 @@ export class PeerSession {
   private earlyHello: Record<string, unknown> | null = null;
   /** Our hello was sent and its answer hasn't ended yet (see MeshNode.recordCompared). */
   private awaiting = false;
+  /** Since our hello: versions came (its answer has begun); and the head its own last hello named. */
+  private answering = false;
+  private theirHead = -1;
   private branch: { chain: WorkspaceChain; start: number; end: number; hash: string; bytes: number; timer: ReturnType<typeof setTimeout> } | null = null;
   private outbound: Promise<void> = Promise.resolve();
   private queuedSends = 0;
@@ -741,6 +744,7 @@ export class PeerSession {
     this.channel.ready?.();
     this.send(this.hello());
     this.awaiting = answered;
+    this.answering = false;
     const items = this.node.addressBook().slice(0, MAX_ADDRESSES);
     if (items.length > 0) this.send({ t: "addresses", items });
     // A hello it sent before it was let in is answered now, as any hello is (with what it lacks, and our rooms).
@@ -754,6 +758,7 @@ export class PeerSession {
     if (!this.ready) return;
     this.send(this.hello());
     this.awaiting = true;
+    this.answering = false;
   }
 
   /** Compare rooms again (envelopes refused earlier may verify now). */
@@ -855,7 +860,10 @@ export class PeerSession {
   private handle(raw: unknown): void {
     const message = v.obj(raw, "message", MESSAGE_KEYS);
     // An answer to our hello always ends with digests: the records have been compared (see MeshNode.recordCompared).
-    if (this.awaiting && message.t === "digests") {
+    // Digests it sent before it read our hello (a comparison of its own) don't count while it named a newer head and
+    // the versions it owes us haven't begun.
+    if (this.awaiting && message.t === "versions") this.answering = true;
+    if (this.awaiting && message.t === "digests" && (this.answering || this.node.chain.head.body.v >= this.theirHead)) {
       this.awaiting = false;
       this.node.noteAnswer(this.remoteDevice);
     }
@@ -990,6 +998,7 @@ export class PeerSession {
     // If the other side's head isn't ours, send everything after the newest version both have; a joiner (head -1)
     // gets the whole record from genesis.
     const { theirHead, theirHeadHash, common } = this.readHello(message);
+    this.theirHead = theirHead;
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
       const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
       if (versions.length > 0) this.send({ t: "versions", versions });

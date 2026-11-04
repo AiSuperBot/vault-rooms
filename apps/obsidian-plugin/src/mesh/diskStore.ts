@@ -138,11 +138,11 @@ export class DiskStore implements BlobStorage {
     await this.ensureFolder(path);
     await this.written(path, this.files.write(`${path}.tmp`, data));
     if (await this.files.exists(path)) {
-      if (await this.files.exists(`${path}.old`)) await this.files.remove(`${path}.old`);
+      if (await this.files.exists(`${path}.old`)) await held(() => this.files.remove(`${path}.old`));
       await held(() => this.files.rename(path, `${path}.old`));
     }
     await held(() => this.files.rename(`${path}.tmp`, path));
-    if (await this.files.exists(`${path}.old`)) await this.files.remove(`${path}.old`);
+    if (await this.files.exists(`${path}.old`)) await held(() => this.files.remove(`${path}.old`));
   }
 
   private writeWhole(path: string, data: string): Promise<void> {
@@ -150,19 +150,18 @@ export class DiskStore implements BlobStorage {
   }
 
   /**
-   * Read a whole file, recovering from a swap that was interrupted. `strict`: one that is there but can't be read now
-   * (locked, say) throws, rather than reading as no file.
+   * The parsed JSON of a file swapped in whole (see writeWhole), parsed once (attachments can be tens of MB), recovering
+   * from a swap that was interrupted. `strict`: one that is there but can't be read now (locked, say) throws, rather
+   * than reading as no file or as an older copy.
    */
-  /** The parsed JSON of a file swapped in whole (see writeWhole), parsed once (attachments can be tens of MB). */
   private async readWhole(path: string, strict = false): Promise<unknown> {
-    let locked = false;
     for (const candidate of [path, `${path}.tmp`, `${path}.old`]) {
       if (!(await this.files.exists(candidate))) continue;
       let text: string;
       try {
         text = await this.files.read(candidate);
       } catch {
-        locked = true;
+        if (strict) throw new Error(`${lastPart(path)} can't be read now (in use by another program?): close that program, then try again`);
         continue;
       }
       try {
@@ -171,7 +170,6 @@ export class DiskStore implements BlobStorage {
         // A torn copy: try the next one.
       }
     }
-    if (locked && strict) throw new Error(`${lastPart(path)} can't be read now (in use by another program?): close that program, then try again`);
     return null;
   }
 
@@ -352,7 +350,7 @@ export class DiskStore implements BlobStorage {
    * comes with the changes stored on top of it folded in (see appendRoomChanges), those of its own generation only.
    */
   async loadRoomState<T>(roomId: string, kind = ""): Promise<T | null> {
-    const state = (await this.readWhole(this.roomStatePath(roomId, kind), true)) as (T & { gen?: number; known?: Record<string, unknown>; localOnly?: unknown }) | null;
+    const state = (await this.readWhole(this.roomStatePath(roomId, kind), true)) as (T & { gen?: number; known?: Record<string, unknown>; localOnly?: unknown; localOnlyEdits?: unknown[] }) | null;
     if (kind !== "" || state === null || typeof state !== "object") return state;
     const path = this.roomChangesPath(roomId);
     if (!(await this.files.exists(path))) return state;
@@ -363,7 +361,7 @@ export class DiskStore implements BlobStorage {
       throw new Error(`${lastPart(path)} can't be read now (in use by another program?): close that program, then try again`);
     }
     for (const line of text.split("\n")) {
-      let changes: { gen?: unknown; known?: Record<string, unknown>; localOnly?: unknown };
+      let changes: { gen?: unknown; known?: Record<string, unknown>; localOnly?: unknown; localOnlyEdits?: unknown };
       try {
         changes = JSON.parse(line) as typeof changes;
       } catch {
@@ -375,7 +373,9 @@ export class DiskStore implements BlobStorage {
         if (known === null) delete state.known[id];
         else state.known[id] = known;
       }
-      if (Array.isArray(changes.localOnly)) state.localOnly = changes.localOnly;
+      // The whole list (as 0.3.10 stored it), or its changes since (folded in by the room folder, in order).
+      if (Array.isArray(changes.localOnly)) [state.localOnly, state.localOnlyEdits] = [changes.localOnly, []];
+      if (Array.isArray(changes.localOnlyEdits)) state.localOnlyEdits = [...(state.localOnlyEdits ?? []), ...(changes.localOnlyEdits as unknown[])];
     }
     return state;
   }
@@ -674,7 +674,8 @@ export class DiskStore implements BlobStorage {
     this.rewrites.clear();
     this.goneWrites.clear();
     if (!store) return;
-    await Promise.all([
+    // One failing (a full disk, a held file) stops none of the others; it is tried again with the next ones.
+    const results = await Promise.allSettled([
       ...docs.map((target) => {
         // Never written over before it is read: what it holds isn't all in the store (written once it is, see retryUnread).
         if (this.unread.has(target)) return Promise.resolve();
@@ -690,6 +691,11 @@ export class DiskStore implements BlobStorage {
       }),
       ...rooms.map((room) => this.writeWhole(this.gonePath(room), JSON.stringify(store.gone(room))))
     ]);
+    results.forEach((result, i) => {
+      if (result.status === "fulfilled") return;
+      if (i < docs.length) this.rewrites.add(docs[i]!);
+      else this.goneWrites.add(rooms[i - docs.length]!);
+    });
   }
 
   /** Wait for every write queued so far (call before shutting down). */

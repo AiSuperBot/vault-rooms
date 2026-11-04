@@ -465,6 +465,36 @@ describe("room replica", () => {
     expect(back.vv(s.roomId, fileId)[s.ana.id]).toBe(2);
   });
 
+  it("a snapshot that builds on what no one has takes nothing away from members", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Plan.md", "Ana's text");
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe("Ana's text");
+    // Cy, a writer, seals the real state together with one item that builds on a client no one has: it never goes in.
+    const other = new Y.Doc();
+    other.clientID = 999;
+    other.getText("content").insert(0, "abc");
+    const before = Y.encodeStateVector(other);
+    other.getText("content").insert(3, "def");
+    const dangling = Y.mergeUpdates([Y.encodeStateAsUpdate(c.replica.noteDoc(fileId)), Y.encodeStateAsUpdate(other, before)]);
+    const covers = { [s.ana.id]: a.node.store.maxClock(s.roomId, fileId, s.ana.id) };
+    expect(c.node.publish(sealSnapshot({ ws: s.ws, room: s.roomId, n: 1, key: s.key, author: s.cy.sign }, fileId, 1, covers, dangling))).toBe(true);
+    s.net.pump();
+    // Ana keeps her updates (the snapshot proves nothing), so her text survives a reload.
+    expect(a.node.store.envelopesOf(s.roomId, fileId).updates.length).toBeGreaterThan(0);
+    expect(a.node.store.marksOf(s.roomId, fileId).marks).toEqual({});
+    expect(a.replica.reload(fileId).getText("content").toString()).toBe("Ana's text");
+    other.destroy();
+  });
+
   it("a snapshot that lies about what it covers takes nothing away from members and freezes nothing", () => {
     const s = setup();
     const a = s.member(s.ana);
@@ -1092,6 +1122,19 @@ describe("room replica", () => {
     s.wrapFor(s.cy, 2, ka);
     s.net.pump();
     expect(a.replica.noteText(fileId)).toBe("Start by Cy");
+    // What Cy sealed under her lost key holds nothing anyone can read now: the note doesn't wait for a key for it, and
+    // it doesn't keep her later edits from being compacted.
+    for (let i = 0; i < 5; i++) c.replica.noteDoc(fileId).getText("content").insert(0, "x");
+    s.net.pump();
+    a.replica.noteText(fileId);
+    expect(a.replica.snapshot(fileId, true)).not.toBeNull();
+    s.net.pump();
+    for (const m of [a, c]) {
+      expect(m.node.store.envelopesOf(s.roomId, fileId).updates.filter((u) => u.author === s.cy.id)).toEqual([]);
+      m.replica.reload(fileId);
+      expect(m.replica.waitsForKey(fileId)).toBe(false);
+    }
+    expect(c.replica.noteText(fileId)).toBe("xxxxxStart by Cy");
   });
 
   it("refuses an edit it can't share and rebuilds the document without it", () => {

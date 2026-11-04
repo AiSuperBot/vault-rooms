@@ -362,7 +362,8 @@ export class MeshService {
     if (this.stopped) return this.abandonStart();
     if (this.port !== this.settings.boundPort && this.settings.port !== 0) {
       this.settings.boundPort = this.port;
-      await this.deps.save();
+      // Only a nicety (the port tried first next time): saved with the next settings save if it fails now.
+      await this.deps.save().catch((error) => this.deps.log(`settings not saved: ${String(error)}`));
       if (this.stopped) return this.abandonStart();
     }
     this.manager.ownAddresses = () => this.addresses();
@@ -1014,7 +1015,7 @@ export class MeshService {
     const book = (this.manager?.addressBook() ?? []).filter(([device]) => device !== this.settings.deviceId).sort();
     if (book.length === 0 || JSON.stringify(book) === JSON.stringify(this.settings.addresses ?? [])) return;
     this.settings.addresses = book;
-    void this.deps.save();
+    void this.deps.save().catch((error) => this.deps.log(`settings not saved: ${String(error)}`));
   }
 
   private entitled(state: WorkspaceState, roomId: string, deviceId: string): boolean {

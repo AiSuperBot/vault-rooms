@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { INDEX_DOC, keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
-import { RoomFolder, type RoomFolderOptions, type RoomFolderState } from "../../src/mesh/roomFolder.js";
+import { RoomFolder, type RoomFolderChanges, type RoomFolderOptions, type RoomFolderState } from "../../src/mesh/roomFolder.js";
 import { DiskStore, fileNameOf } from "../../src/mesh/diskStore.js";
 import { MemoryFiles } from "./memoryFiles.js";
 import { folderProblem } from "../../src/mesh/roomPaths.js";
@@ -3440,10 +3440,230 @@ describe("room folder, round 53", () => {
     await sleep(2_300);
     await s.settle();
     expect(r.vault.text("Team/n3.md")).toBe("note 3\n");
-    await a.vault.rename("Team/plan.md", copy);
+    // A new note Rae writes under that name later is hers to share.
+    await r.vault.writeText(copy, "for everyone\n");
     await s.settle();
-    await r.vault.writeText(copy, "the plan, edited by Rae\n");
+    expect(a.vault.text(copy)).toBe("for everyone\n");
+  }, 40_000);
+});
+
+describe("room folder, round 55", () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Ana shares Rules.md; Rae, who can only read, is in step. */
+  async function reader(files: Record<string, string> = {}) {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    for (const [path, content] of Object.entries(files)) await a.vault.writeText(`Team/${path}`, content);
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
     await s.settle();
-    expect(a.vault.text(copy)).toBe("the plan, edited by Rae\n");
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    const promote = async () => {
+      a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+      await s.settle();
+    };
+    return { s, a, r, promote };
+  }
+
+  it("keeps a file a reader added on their computer, as told, also once they may write and restart", async () => {
+    const { s, a, r, promote } = await reader();
+    await r.vault.writeText("Team/My thoughts.md", "PRIVATE\n");
+    await s.settle();
+    expect(r.notices.some((n) => n.includes("stays on this computer and isn't shared"))).toBe(true);
+    await promote();
+    await r.vault.writeText("Team/My thoughts.md", "PRIVATE, more\n");
+    await s.settle();
+    await r.folder.stop();
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect(a.vault.text("Team/My thoughts.md")).toBeUndefined();
+  }, 40_000);
+
+  it("keeps a reader's files that were in the folder before Obsidian started, once they may write", async () => {
+    const { s, a, r, promote } = await reader();
+    await r.folder.stop();
+    r.vault.silently("Team/Old diary.md", "PRIVATE\n");
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    await promote();
+    await again.folder.stop();
+    const third = s.make(s.rae, "Team", r.vault, again);
+    third.replica.refreshKeys();
+    await third.folder.start();
+    await s.settle();
+    expect(a.vault.text("Team/Old diary.md")).toBeUndefined();
+  }, 40_000);
+
+  it("stores many copies kept here only a line each, not the whole list each time", async () => {
+    const n = 500;
+    const { s, a, r, promote } = await reader(Object.fromEntries(Array.from({ length: n }, (_, i) => [`note ${i}.md`, `line ${i}\n`])));
+    // Stored as the plugin stores it: whole, with changes appended on top.
+    let bytes = 0;
+    const disk = new DiskStore(new MemoryFiles(), "m");
+    const folder = r.folder as unknown as { wholeNext: boolean; o: { loadState(): Promise<RoomFolderState | null>; saveState(state: RoomFolderState): Promise<void>; saveStateChanges?(changes: RoomFolderChanges): Promise<void> } };
+    folder.o.saveState = async (state) => { bytes += JSON.stringify(state).length; await disk.saveRoomState(s.roomId, state); };
+    folder.o.saveStateChanges = async (change) => { bytes += JSON.stringify(change).length; await disk.appendRoomChanges(s.roomId, change); };
+    folder.wholeNext = true;
+    for (let i = 0; i < n; i++) r.vault.silently(`Team/note ${i}.md`, `changed ${i}\n`);
+    for (let i = 0; i < n; i++) void r.folder.onLocalWrite(`Team/note ${i}.md`);
+    await s.settle();
+    expect([...r.vault.files.keys()].filter((path) => path.includes("your copy"))).toHaveLength(n);
+    expect(bytes).toBeLessThan(1_000_000);
+    // And they all stay here after a crash (the whole save at stop lost: the changes folded in), once Rae may write.
+    await promote();
+    folder.o.saveState = async () => { throw new Error("crashed"); };
+    await r.folder.stop().catch(() => {});
+    const again = s.make(s.rae, "Team", r.vault, r);
+    (again.folder as unknown as typeof folder).o.loadState = () => disk.loadRoomState(s.roomId);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    expect([...a.vault.files.keys()].filter((path) => a.vault.text(path)?.startsWith("changed"))).toEqual([]);
+  }, 120_000);
+
+  it("doesn't read a copy kept here only again at start while it is unchanged", async () => {
+    const { s, r } = await reader();
+    await r.vault.writeText("Team/Rules.md", "PRIVATE\n");
+    await s.settle();
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("your copy"))!;
+    await r.vault.writeText(copy, "PRIVATE, edited\n");
+    await s.settle();
+    await r.folder.stop();
+    const reads: string[] = [];
+    const readBytes = r.vault.readBytes.bind(r.vault);
+    r.vault.readBytes = async (path: string) => { reads.push(path); return readBytes(path); };
+    const again = s.make(s.rae, "Team", r.vault, r);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    expect(reads).not.toContain(copy);
+  }, 40_000);
+
+  it("moves a file in a shared file's way aside without reading it", async () => {
+    const { s, a, c } = await pair({ "x.pdf": "shared bytes" });
+    await c.vault.writeText("Team/talk.pdf", "big recording");
+    await s.settle();
+    const readBytes = c.vault.readBytes.bind(c.vault);
+    c.vault.readBytes = async (path: string) => {
+      if (path === "Team/talk.pdf") throw new Error("too large to read");
+      return readBytes(path);
+    };
+    // Cy's own file, shared by now: renamed away on Ana's side first, so a new untracked one takes its name on Cy's.
+    await a.vault.rename("Team/talk.pdf", "Team/talk old.pdf");
+    await s.settle();
+    await c.folder.stop();
+    c.vault.silently("Team/talk.pdf", "another recording");
+    const again = s.make(s.cy, "Team", c.vault, c);
+    again.replica.refreshKeys();
+    again.folder.start();
+    await a.vault.rename("Team/x.pdf", "Team/talk.pdf");
+    await s.settle();
+    await sleep(100);
+    await s.settle();
+    expect(c.vault.text("Team/talk.pdf")).toBe("shared bytes");
+    expect([...c.vault.files.keys()].some((path) => path.includes("(conflict") && c.vault.text(path) === "another recording")).toBe(true);
+  }, 40_000);
+
+  it("doesn't ask about deleting files that were never shared", async () => {
+    const { s, c } = await pair({ "a.md": "a\n" });
+    const asked: number[] = [];
+    (c.folder as unknown as { o: RoomFolderOptions }).o.confirmDeletions = async (count) => { asked.push(count); return false; };
+    for (let i = 0; i < 25; i++) c.vault.silently(`Team/tool ${i}.exe`, "MZ");
+    for (let i = 0; i < 25; i++) await c.vault.trash(`Team/tool ${i}.exe`);
+    await sleep(2_300);
+    await s.settle();
+    expect(asked).toEqual([]);
+  }, 40_000);
+
+  it("doesn't take the files it trashes for others' deletions as deletions made here", async () => {
+    const files = Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`n${i}.md`, `note ${i}\n`]));
+    const { s, a, c } = await pair(files);
+    a.deleteAnswer = true;
+    for (let i = 0; i < 25; i++) await a.vault.trash(`Team/n${i}.md`);
+    await sleep(2_300);
+    await s.settle();
+    await sleep(2_300);
+    await s.settle();
+    expect(a.asked).toEqual([25]);
+    expect(c.vault.files.has("Team/n3.md")).toBe(false);
+    expect(c.asked ?? []).toEqual([]);
+  }, 40_000);
+
+  it("shares the edits of a promoted reader whose folder held the room's files before its index came", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Rules.md", "be nice\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    // Rae's folder already has the room's file (copied from a colleague) when she starts, before anything came.
+    r.vault.silently("Team/Rules.md", "be nice\n");
+    r.replica.refreshKeys();
+    await r.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await s.settle();
+    await sleep(300);
+    await s.settle();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.rae.userId] = "write"))]);
+    await s.settle();
+    await r.vault.writeText("Team/Rules.md", "be nice, always\n");
+    await s.settle();
+    await sleep(700);
+    await s.settle();
+    expect(a.vault.text("Team/Rules.md")).toBe("be nice, always\n");
+  }, 40_000);
+
+  it("shares a note given the name of a copy kept here only that went missing while Obsidian was closed", async () => {
+    const { s, a, r, promote } = await reader();
+    await r.vault.writeText("Team/A.md", "PRIVATE\n");
+    await s.settle();
+    await promote();
+    const disk = new DiskStore(new MemoryFiles(), "m");
+    const wire = (pc: typeof r) => {
+      const o = (pc.folder as unknown as { o: { loadState(): Promise<unknown>; saveState(state: unknown): Promise<void>; saveStateChanges?(changes: unknown): Promise<void> } }).o;
+      o.loadState = () => disk.loadRoomState(s.roomId);
+      o.saveState = (state) => disk.saveRoomState(s.roomId, state);
+      o.saveStateChanges = (changes) => disk.appendRoomChanges(s.roomId, changes);
+    };
+    wire(r);
+    (r.folder as unknown as { stateChanged: boolean }).stateChanged = true;
+    await r.folder.stop();
+    r.vault.files.delete("Team/A.md");
+    const again = s.make(s.rae, "Team", r.vault, r);
+    wire(again);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    await s.settle();
+    await again.vault.writeText("Team/A.md", "for everyone\n");
+    await s.settle();
+    await sleep(700);
+    await s.settle();
+    expect(a.vault.text("Team/A.md")).toBe("for everyone\n");
+    await again.folder.stop();
+    const third = s.make(s.rae, "Team", r.vault, again);
+    wire(third);
+    third.replica.refreshKeys();
+    await third.folder.start();
+    await s.settle();
+    await third.vault.writeText("Team/A.md", "for everyone, edited\n");
+    await s.settle();
+    await sleep(700);
+    await s.settle();
+    expect(a.vault.text("Team/A.md")).toBe("for everyone, edited\n");
   }, 40_000);
 });
