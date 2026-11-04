@@ -727,7 +727,7 @@ describe("mesh", () => {
     const delivered = net.pump();
     expect(seen).toEqual([ana.id]);
     expect(delivered).toBeLessThan(20);
-    expect(c.store.rooms()).toEqual([]);
+    expect(c.store.docs(roomId)).toEqual([]);
   });
 
   it("ends a session with a device that speaks for another workspace", () => {
@@ -1176,6 +1176,52 @@ describe("mesh", () => {
     handshake.receive({ t: "hello", ws, head: chain.head.body.v, recent: [] });
     handshake.receive({ t: "versions", versions: JSON.parse(JSON.stringify(chain.all())) });
     expect(outcome).toEqual([expect.stringMatching(/join_no_invite/)]);
+  });
+
+  it("lets a wrap stop counting once it can't, as at a start, so peers' wraps digests agree and wraps aren't sent again", () => {
+    const { chain, ws, ana, cy, roomId, key } = setup();
+    const a = nodeFor(chain, ana);
+    for (const d of [ana, cy]) a.addWrap(wrapRoomKey(ws, roomId, 1, key, { id: d.id, agree: d.agree.publicKey }, ana.sign));
+    a.flushWraps();
+    // Cy leaves the room: the wrap of the newest key to Cy no longer counts, but is kept (it shows the key must change).
+    a.offerVersions([step(chain, ana, (state) => void delete state.rooms[roomId]!.members[cy.userId])]);
+    expect(a.allWraps().map((w) => w.body.to)).toEqual([ana.id]);
+    expect(a.savedWraps().map((w) => w.body.to).sort()).toEqual([ana.id, cy.id].sort());
+    // The key is replaced: that wrap is let go.
+    const k2 = newRoomKey();
+    a.offerVersions([step(chain, ana, (state) => void state.rooms[roomId]!.epochs.push({ n: 2, commit: keyCommitment(ws, roomId, 2, k2) }))]);
+    expect(a.savedWraps().map((w) => w.body.to)).toEqual([ana.id]);
+    // A computer that starts now holds the same wraps: the hello's digest spares sending them again.
+    const b = nodeFor(chain, ana);
+    b.restore([], a.savedWraps());
+    expect(b.wrapsDigest()).toBe(a.wrapsDigest());
+  });
+
+  it("counts as the answer to its hello no digests the member sent before it read that hello", () => {
+    const { chain, ana, cy } = setup();
+    const a = nodeFor(chain, ana);
+    let comparedAt = -1;
+    const c = new MeshNode(WorkspaceChain.load(chain.all()), cy.id, { compared: () => (comparedAt = c.chain.length) });
+    // Apart, Ana's record moves on; as they meet, Ana compares rooms of her own accord.
+    for (let i = 0; i < 3; i++) a.offerVersions([nextVersion(a.workspaceId, a.chain.head, ana.sign, (state) => void (state.name = `Team ${i}`))]);
+    const net = new Network();
+    const { ab } = net.link(a, c);
+    ab.resync();
+    net.pump();
+    expect(c.chain.length).toBe(a.chain.length);
+    expect(comparedAt).toBe(a.chain.length);
+    // Its answer still counts when it names a longer record that loses to ours (a branch of its own, here Cy's).
+    let answered = -1;
+    const x = new MeshNode(WorkspaceChain.load(chain.all()), ana.id, { compared: () => (answered = x.chain.length) });
+    const y = nodeFor(chain, cy);
+    x.offerVersions([nextVersion(x.workspaceId, x.chain.head, ana.sign, (state) => void (state.name = "Ana's"))]);
+    for (let i = 0; i < 3; i++) y.offerVersions([nextVersion(y.workspaceId, y.chain.head, cy.sign, (state) => void (state.users[cy.userId]!.name = `Cy ${i}`))]);
+    const net2 = new Network();
+    const { ba } = net2.link(x, y);
+    ba.resync();
+    net2.pump();
+    expect(y.chain.headHash).toBe(x.chain.headHash);
+    expect(answered).toBe(x.chain.length);
   });
 
   it("counts its record as compared once a device the record lists answers, or when it lists no other, and asks again after a time away", () => {

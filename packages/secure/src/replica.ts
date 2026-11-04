@@ -621,6 +621,12 @@ export class RoomReplica {
     try {
       bytes = openEnvelope(env, key);
     } catch {
+      // Sealed under a key the record doesn't back (a rotation that lost a race): no one can read it under this record,
+      // and its author sealed what it held again under the right key (see rescue). It holds nothing to wait for.
+      if (env.k === "u" && this.backed(env.n, key)) {
+        this.markApplied(state, env.author, env.clock);
+        return false;
+      }
       // Not with the key held now: tried again when keys change (ours may have lost a race, see checkKeys).
       state.undecryptable.set(envelopeKey(env), env);
       return false;
@@ -868,7 +874,8 @@ export class RoomReplica {
     const probe = new Y.Doc({ gc: true });
     try {
       Y.applyUpdate(probe, openEnvelope(snapshot, key));
-      return Y.snapshot(probe);
+      // Part of it builds on what no one has: it never goes in whole, so it proves nothing (see compact).
+      return waitsForDependencies(probe) ? null : Y.snapshot(probe);
     } catch {
       return null;
     } finally {
@@ -898,8 +905,15 @@ export class RoomReplica {
       const contains = (env: StoredEnvelope): boolean => {
         const key = this.keys.get(env.n);
         if (!key) return false;
+        let bytes: Uint8Array;
         try {
-          return Y.snapshotContainsUpdate(contents, openEnvelope(env, key));
+          bytes = openEnvelope(env, key);
+        } catch {
+          // An update the record's key can't open holds nothing (see applyEnvelope): it never blocks compaction.
+          return env.k === "u" && this.backed(env.n, key);
+        }
+        try {
+          return Y.snapshotContainsUpdate(contents, bytes);
         } catch {
           return false;
         }

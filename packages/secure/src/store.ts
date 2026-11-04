@@ -273,10 +273,6 @@ export class EnvelopeStore {
     for (const [author, seq] of Object.entries(dropped)) entry.dropped[author] = Math.max(entry.dropped[author] ?? 0, seq);
   }
 
-  rooms(): string[] {
-    return [...new Set([...this.docsByRoom.keys(), ...this.blobsByRoom.keys()])].sort();
-  }
-
   docs(room: string): DocId[] {
     return [...(this.docsByRoom.get(room)?.keys() ?? [])].sort();
   }

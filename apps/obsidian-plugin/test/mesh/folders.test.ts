@@ -26,6 +26,7 @@ function setup(folder: string, folders: string[], hidden = false) {
   const app: any = {
     vault: {
       getAbstractFileByPath: (path: string) => items.get(path) ?? null,
+      getRoot: () => Object.assign(folderAt(""), { children: [] }),
       getAllLoadedFiles: () => [...items.values()],
       createFolder: async (path: string) => { created.push(path); items.set(path, folderAt(path)); }
     },
@@ -104,6 +105,9 @@ describe("a room's folder on this computer", () => {
     // Already in the room, or a note outside any room: Obsidian's choice stays.
     expect(plugin.attachmentInRoom("Team/files/x.png", "x.png", "Team/Plan.md")).toBe("Team/files/x.png");
     expect(plugin.attachmentInRoom("x.png", "x.png", "Private/Plan.md")).toBe("x.png");
+    // Obsidian's choice is in a room the note isn't in (attachments set to go there): next to the note instead.
+    expect(plugin.attachmentInRoom("Team/Images/scan.png", "scan.png", "Diary/Today.md")).toBe("Diary/scan.png");
+    expect(plugin.attachmentInRoom("Team/Images/scan.png", "scan.png", "Today.md")).toBe("scan.png");
   });
 
   it("gives an attachment a name no file of that folder has, whatever its case", () => {

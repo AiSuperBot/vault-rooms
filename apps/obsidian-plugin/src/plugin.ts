@@ -372,17 +372,19 @@ export default class VaultRoomsPlugin extends Plugin {
     return best?.roomId ?? null;
   }
 
-  /** Where an attachment of `note` goes: `path` (Obsidian's choice) if that is in the note's room, else next to the note. */
+  /**
+   * Where an attachment of `note` goes: `path` (Obsidian's choice) if that is in the note's room (or, for a note in no
+   * room, in no room either), else next to the note: a note's picture never goes to a room it isn't in.
+   */
   attachmentInRoom(path: string, filename: string, note: string): string {
-    const room = this.roomAt(note);
-    if (!room || this.roomAt(path) === room) return path;
-    const dir = note.slice(0, note.lastIndexOf("/"));
+    if (this.roomAt(path) === this.roomAt(note)) return path;
+    const dir = note.includes("/") ? note.slice(0, note.lastIndexOf("/")) : "";
     const dot = filename.lastIndexOf(".");
     const [stem, ext] = dot > 0 ? [filename.slice(0, dot), filename.slice(dot)] : [filename, ""];
-    const folder = this.app.vault.getAbstractFileByPath(dir);
+    const folder = dir ? this.app.vault.getAbstractFileByPath(dir) : this.app.vault.getRoot();
     const taken = new Set(folder instanceof TFolder ? folder.children.map((child) => pathKey(child.path)) : []);
     for (let i = 1; ; i++) {
-      const candidate = `${dir}/${stem}${i > 1 ? ` ${i}` : ""}${ext}`;
+      const candidate = `${dir ? `${dir}/` : ""}${stem}${i > 1 ? ` ${i}` : ""}${ext}`;
       if (!taken.has(pathKey(candidate)) && !this.app.vault.getAbstractFileByPath(candidate)) return candidate;
     }
   }

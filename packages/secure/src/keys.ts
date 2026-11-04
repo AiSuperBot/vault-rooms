@@ -112,15 +112,17 @@ export function parseKeyWrap(value: unknown): KeyWrap {
  * Anyone (members or not) can check this; only the recipient can open it.
  */
 export function verifyKeyWrap(state: WorkspaceState, workspaceId: string, wrap: KeyWrap): boolean {
-  const { body } = wrap;
+  return wrapCounts(state, workspaceId, wrap.body) && verify(activeDevice(state, wrap.body.by)!.sign, WRAP_SIG, utf8(canonicalJson(wrap.body)), wrap.sig);
+}
+
+/** verifyKeyWrap without the signature (checked when the wrap came): whether it counts in `state`. */
+export function wrapCounts(state: WorkspaceState, workspaceId: string, body: KeyWrapBody): boolean {
   if (body.ws !== workspaceId) return false;
   const room = liveRoom(state, body.room);
   if (!room || room.epochs[body.n - 1]?.commit !== body.commit) return false;
   const wrapper = activeDevice(state, body.by);
   const recipient = activeDevice(state, body.to);
-  if (!wrapper || !recipient) return false;
-  if (!roleIn(state, body.room, wrapper.user) || !roleIn(state, body.room, recipient.user)) return false;
-  return verify(wrapper.sign, WRAP_SIG, utf8(canonicalJson(body)), wrap.sig);
+  return !!wrapper && !!recipient && !!roleIn(state, body.room, wrapper.user) && !!roleIn(state, body.room, recipient.user);
 }
 
 /** Whether a wrap's signature holds, when its wrapper is an active device of `state` (null when the wrapper isn't known there). */

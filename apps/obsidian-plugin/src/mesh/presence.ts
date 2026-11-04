@@ -134,10 +134,10 @@ export class RoomPresence {
     this.lastSent.set(fileId, { clientId, cursor, at });
   }
 
-  /** Feed a verified presence envelope of this room. */
   /** The newest cursor taken from each author (see receive), for so many authors at most. */
   private newest = new Map<string, number>();
 
+  /** Feed a verified presence envelope of this room. */
   receive(env: PresenceEnvelope): void {
     const key = this.deps.replica.keyFor(env.n);
     const user = this.deps.userOf(env.author);

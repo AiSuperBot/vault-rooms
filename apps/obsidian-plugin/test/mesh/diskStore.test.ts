@@ -439,3 +439,50 @@ describe("disk store", () => {
     expect([...files.data.keys()].filter((key) => key.startsWith("m/"))).toEqual([]);
   });
 });
+
+describe("disk store, round 55", () => {
+  it("refuses a room state held by another program rather than reading its older copy", async () => {
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const room = "rAAAAAAAAAAAAAAAAAAAAAA";
+    await disk.saveRoomState(room, { gen: 1, known: { fOld: { path: "old.md" } } });
+    // The next whole save: removing the older copy fails (a virus scanner holding it), so it stays next to the new one.
+    const remove = files.remove.bind(files);
+    let held = 0;
+    files.remove = async (path) => {
+      if (path.endsWith(".json.old") && held++ < 20) throw new Error("EBUSY");
+      return remove(path);
+    };
+    await disk.saveRoomState(room, { gen: 2, known: { fOld: { path: "old.md" }, fNew: { path: "new.md" } } }).catch(() => {});
+    files.remove = remove;
+    // Next start: the room state itself is held a moment.
+    files.failReads = (path) => /rooms[\\/][^\\/]+\.json$/.test(path);
+    await expect(disk.loadRoomState(room)).rejects.toThrow(/can't be read now/);
+    files.failReads = undefined;
+    expect(await disk.loadRoomState<{ known: Record<string, unknown> }>(room)).toMatchObject({ gen: 2, known: { fNew: { path: "new.md" } } });
+  });
+
+  it("waits for every write under way at flush, even when a rewrite fails", async () => {
+    const { chain, ws, admin } = founder();
+    const { roomId, key } = createRoom(chain, admin, "Files", {});
+    const files = new MemoryFiles();
+    const disk = new DiskStore(files, "m");
+    const store = await disk.open();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const append = files.append.bind(files);
+    let appended = false;
+    files.append = async (path, data) => {
+      await gate;
+      await append(path, data);
+      appended = true;
+    };
+    store.add(sealUpdate({ ws, room: roomId, n: 1, key, author: admin.sign }, randomId("f"), 1, utf8("x")));
+    const d = disk as unknown as { later(set: Set<string>, item: string): void; goneWrites: Set<string> };
+    d.later(d.goneWrites, roomId);
+    files.failNextWriteTo = "gone.json.tmp";
+    setTimeout(release, 200);
+    await disk.flush();
+    expect(appended).toBe(true);
+  });
+});

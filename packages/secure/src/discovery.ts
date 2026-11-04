@@ -9,7 +9,7 @@ import { activeDevice, MAX_CLOCK_SKEW_MS, type WorkspaceState } from "./workspac
 /**
  * LAN discovery: every peer announces "device D of workspace W listens on port P" by UDP multicast and broadcast.
  * Announcements carry a tag derived from the workspace id (not the id itself) and are signed by the device key;
- * receivers drop anything not signed by a current member or older than two minutes. Even a valid announcement only
+ * receivers drop anything not signed by a current member or more than ten minutes from their clock. Even a valid announcement only
  * ever leads to a dial, which then has to pass the certificate pin and the signed exchange.
  */
 
