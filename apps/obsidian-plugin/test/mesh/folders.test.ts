@@ -126,6 +126,20 @@ describe("a room's folder on this computer", () => {
   });
 });
 
+describe("whether another plugin may change a file", () => {
+  it("follows the room's role: false for a reader, true for an editor, null outside rooms or while the room isn't loaded", () => {
+    const { plugin, replica } = setup("Team", ["Team"]);
+    (replica as any).canWrite = () => false;
+    expect(plugin.canWrite("Team/Plan.md")).toBe(false);
+    (replica as any).canWrite = () => true;
+    expect(plugin.canWrite("Team/Sub/Plan.md")).toBe(true);
+    expect(plugin.canWrite("Elsewhere/Plan.md")).toBeNull();
+    expect(plugin.canWrite("Teamwork/Plan.md")).toBeNull();
+    plugin.service.replica = () => null;
+    expect(plugin.canWrite("Team/Plan.md")).toBeNull();
+  });
+});
+
 describe("the plugin's settings", () => {
   it("are never saved over when data.json is there but can't be read, and nothing starts", async () => {
     const app: any = { vault: { adapter: { exists: async () => true } } };

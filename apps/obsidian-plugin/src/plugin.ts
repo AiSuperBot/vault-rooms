@@ -427,6 +427,17 @@ export default class VaultRoomsPlugin extends Plugin {
     }
   }
 
+  /**
+   * For other plugins (e.g. a task board writing frontmatter): may this computer change the file at `path`? `false` inside a room you can
+   * only read (a change there would be put back, your version kept as a local copy), `true` inside a room you can edit, `null` outside
+   * rooms or while the room isn't loaded. Listen to `onChange` to hear when a role changes.
+   */
+  canWrite(path: string): boolean | null {
+    const roomId = this.roomAt(path);
+    const replica = roomId ? this.service?.replica(roomId) : null;
+    return replica ? replica.canWrite() : null;
+  }
+
   folderOf(roomId: string): string | null {
     const room = this.settings.mesh.workspace?.rooms[roomId];
     return room && !room.hidden ? room.folder : null;
