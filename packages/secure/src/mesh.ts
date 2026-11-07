@@ -996,11 +996,12 @@ export class PeerSession {
   private onHello(message: Record<string, unknown>): void {
     if (message.ws !== this.node.workspaceId) return this.close("other_workspace");
     // If the other side's head isn't ours, send everything after the newest version both have; a joiner (head -1)
-    // gets the whole record from genesis.
+    // gets the whole record from genesis. With none of its latest versions ours, only a branch from inside them could
+    // win there (see MAX_FORK_DEPTH): when this side is behind, that is nothing.
     const { theirHead, theirHeadHash, common } = this.readHello(message);
     this.theirHead = theirHead;
     if (theirHead !== this.node.chain.head.body.v || theirHeadHash !== this.node.chain.headHash) {
-      const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : 1);
+      const versions = theirHead === -1 ? this.node.chain.all() : this.node.chain.since(common >= 0 ? common + 1 : Math.max(1, theirHead - RECENT + 1));
       if (versions.length > 0) this.send({ t: "versions", versions });
     }
     const joins = this.node.pendingJoinRecords();
