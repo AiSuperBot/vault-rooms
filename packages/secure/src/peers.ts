@@ -59,6 +59,8 @@ export class PeerManager {
   ownAddresses: () => string[] = () => [];
   /** The address book as peers were last told it. */
   private shared = "";
+  /** Addresses given in the settings ("host:port"), and the device that answered there last. */
+  private addressOwners = new Map<string, string>();
 
   constructor(
     private readonly node: MeshNode,
@@ -183,7 +185,9 @@ export class PeerManager {
   /** A peer known only by address: dial, then check who answered against the record. */
   private dialAddress(address: Address): void {
     const key = `${address.host}:${address.port}`;
-    if (this.stopped || this.dialing.has(key) || this.inBackoff(key)) return;
+    // Not while the device that answered there is connected, whichever side dialled (nor this device's own address).
+    const owner = this.addressOwners.get(key);
+    if (this.stopped || this.dialing.has(key) || this.inBackoff(key) || (owner !== undefined && (owner === this.config.deviceId || this.links.has(owner)))) return;
     if ([...this.links.values()].some(({ link }) => link.direction === "out" && link.endpoint?.host.toLowerCase() === address.host.toLowerCase() && link.endpoint.port === address.port)) return;
     this.dialing.add(key);
     dial(this.config, address.host, address.port)
@@ -192,7 +196,9 @@ export class PeerManager {
           link.channel.close("unverified_peer");
           return this.failed(key, "unverified_peer");
         }
-        if (link.remoteDevice === this.config.deviceId || this.links.has(link.remoteDevice)) return link.channel.close("duplicate");
+        this.addressOwners.set(key, link.remoteDevice);
+        if (link.remoteDevice === this.config.deviceId) return link.channel.close("duplicate");
+        // A connection there already (both dialled at once) is settled as both ends settle it: see attach.
         this.attach(link);
       })
       .catch((error: Error) => this.failed(key, error.message))
