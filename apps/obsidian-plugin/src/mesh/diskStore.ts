@@ -492,7 +492,7 @@ export class DiskStore implements BlobStorage {
       try {
         const raw = JSON.parse(line) as Record<string, unknown>;
         if ("marks" in raw) {
-          store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed), numbers(raw.dropped));
+          store.restoreMarks(room, doc, numbers(raw.marks), numbers(raw.claimed), numbers(raw.dropped), ranges(raw.gone));
           continue;
         }
         const env = parseEnvelope(raw);
@@ -754,5 +754,17 @@ function numbers(value: unknown): Record<string, number> {
   const out: Record<string, number> = {};
   if (typeof value !== "object" || value === null) return out;
   for (const [key, clock] of Object.entries(value)) if (/^d[A-Za-z0-9_-]{22}$/.test(key) && Number.isSafeInteger(clock) && (clock as number) > 0) out[key] = clock as number;
+  return out;
+}
+
+/** Clock ranges per author (see EnvelopeStore.marksOf), the well-formed ones only. */
+function ranges(value: unknown): Record<string, Array<[number, number]>> {
+  const out: Record<string, Array<[number, number]>> = {};
+  if (typeof value !== "object" || value === null) return out;
+  for (const [key, list] of Object.entries(value)) {
+    if (!/^d[A-Za-z0-9_-]{22}$/.test(key) || !Array.isArray(list)) continue;
+    const valid = list.filter((range): range is [number, number] => Array.isArray(range) && range.length === 2 && Number.isSafeInteger(range[0]) && Number.isSafeInteger(range[1]) && range[0] > 0 && range[0] <= range[1]);
+    if (valid.length > 0) out[key] = valid;
+  }
   return out;
 }

@@ -10,6 +10,19 @@ export function vvDominates(a: VersionVector, b: VersionVector): boolean {
   return Object.entries(b).every(([author, clock]) => (a[author] ?? 0) >= clock);
 }
 
+/** `ranges` sorted and merged, without what is at or below `mark` (the mark covers that). */
+function mergeRanges(ranges: Array<[number, number]>, mark: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (const [from, to] of ranges.filter(([, to]) => to > mark).sort((a, b) => a[0] - b[0])) {
+    const last = out[out.length - 1];
+    if (last && from <= last[1] + 1) last[1] = Math.max(last[1], to);
+    else out.push([Math.max(from, mark + 1), to]);
+  }
+  return out;
+}
+
+const inRanges = (ranges: Array<[number, number]> | undefined, clock: number) => ranges?.some(([from, to]) => clock >= from && clock <= to) ?? false;
+
 interface DocEntry {
   updates: Map<string, Map<number, UpdateEnvelope>>;
   snapshots: Map<string, SnapshotEnvelope>;
@@ -23,6 +36,12 @@ interface DocEntry {
    * a dropped snapshot that is still going around the mesh from being taken in and passed on again, forever.
    */
   dropped: VersionVector;
+  /**
+   * Per author: clock ranges [from, to] above the mark, dropped as checked to be in a kept snapshot (see compact) though
+   * an earlier update of theirs never was here (folded into a snapshot before this device had it): the mark can't cover
+   * them without covering that one too, so they are refused again by range.
+   */
+  gone: Record<string, Array<[number, number]>>;
   /** See fingerprint: cleared whenever an envelope is added or removed. */
   fingerprint?: string;
   /** Its part of the room's digest, its encoding kept (see computeDigest): cleared with the fingerprint. */
@@ -135,7 +154,7 @@ export class EnvelopeStore {
     if (!docs) this.docsByRoom.set(room, (docs = new Map()));
     let entry = docs.get(doc);
     if (!entry) {
-      docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {}, adds: 0 }));
+      docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {}, gone: {}, adds: 0 }));
       this.touch(room);
     }
     return entry;
@@ -157,7 +176,7 @@ export class EnvelopeStore {
     const entry = this.entry(env.room, env.doc);
     const member = this.isMember(env.room);
     if (env.k === "u") {
-      if (env.clock <= this.markOf(entry, env.author)) return "duplicate";
+      if (env.clock <= this.markOf(entry, env.author) || inRanges(entry.gone[env.author], env.clock)) return "duplicate";
     } else {
       if (env.seq <= (entry.dropped[env.author] ?? 0)) return "duplicate";
       if (!member) for (const kept of entry.snapshots.values()) if (kept.author === env.author && vvDominates(kept.covers, env.covers)) return "duplicate";
@@ -213,6 +232,15 @@ export class EnvelopeStore {
     // Each snapshot dropped was checked to be in a kept one: never wanted again (a drop on a mere claim, in a room this
     // device only relays, is forgotten when it joins, like the claim).
     for (const env of remove) if (env.k === "s") entry.dropped[env.author] = Math.max(entry.dropped[env.author] ?? 0, env.seq);
+    // Updates past their author's mark (see DocEntry.gone).
+    const above = new Map<string, Array<[number, number]>>();
+    for (const env of remove) {
+      if (env.k !== "u" || env.clock <= (entry.marks[env.author] ?? 0)) continue;
+      let list = above.get(env.author);
+      if (!list) above.set(env.author, (list = [...(entry.gone[env.author] ?? [])]));
+      list.push([env.clock, env.clock]);
+    }
+    for (const [author, list] of above) entry.gone[author] = mergeRanges(list, entry.marks[author] ?? 0);
     this.touch(room);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
@@ -259,18 +287,19 @@ export class EnvelopeStore {
   }
 
   /** A document's marks, for saving next to its envelopes. */
-  marksOf(room: string, doc: DocId): { marks: VersionVector; claimed: VersionVector; dropped: VersionVector } {
+  marksOf(room: string, doc: DocId): { marks: VersionVector; claimed: VersionVector; dropped: VersionVector; gone: Record<string, Array<[number, number]>> } {
     const entry = this.docsByRoom.get(room)?.get(doc);
-    return { marks: { ...(entry?.marks ?? {}) }, claimed: { ...(entry?.claimed ?? {}) }, dropped: { ...(entry?.dropped ?? {}) } };
+    return { marks: { ...(entry?.marks ?? {}) }, claimed: { ...(entry?.claimed ?? {}) }, dropped: { ...(entry?.dropped ?? {}) }, gone: structuredClone(entry?.gone ?? {}) };
   }
 
   /** Put saved marks back (loading from disk). */
-  restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector, dropped: VersionVector = {}): void {
+  restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector, dropped: VersionVector = {}, gone: Record<string, Array<[number, number]>> = {}): void {
     const entry = this.entry(room, doc);
     this.touch(room);
     for (const [author, clock] of Object.entries(marks)) entry.marks[author] = Math.max(entry.marks[author] ?? 0, clock);
     for (const [author, clock] of Object.entries(claimed)) entry.claimed[author] = Math.max(entry.claimed[author] ?? 0, clock);
     for (const [author, seq] of Object.entries(dropped)) entry.dropped[author] = Math.max(entry.dropped[author] ?? 0, seq);
+    for (const [author, ranges] of Object.entries(gone)) entry.gone[author] = mergeRanges([...(entry.gone[author] ?? []), ...ranges], entry.marks[author] ?? 0);
   }
 
   docs(room: string): DocId[] {
@@ -302,6 +331,7 @@ export class EnvelopeStore {
     const entry = this.docsByRoom.get(room)?.get(doc);
     if (!entry) return 0;
     let max = this.markOf(entry, author);
+    for (const [, to] of entry.gone[author] ?? []) max = Math.max(max, to);
     for (const snapshot of entry.snapshots.values()) if (snapshot.author === author) max = Math.max(max, snapshot.covers[author] ?? 0);
     for (const clock of entry.updates.get(author)?.keys() ?? []) max = Math.max(max, clock);
     return max;
@@ -487,7 +517,7 @@ export class EnvelopeStore {
     // stored, so its signature needn't be checked first (a relay sends dropped snapshots again and again).
     const entry = this.docsByRoom.get(env.room)?.get(env.doc);
     if (!entry) return false;
-    return env.k === "u" ? env.clock <= this.markOf(entry, env.author) : env.seq <= (entry.dropped[env.author] ?? 0);
+    return env.k === "u" ? env.clock <= this.markOf(entry, env.author) || inRanges(entry.gone[env.author], env.clock) : env.seq <= (entry.dropped[env.author] ?? 0);
   }
 
   /** Keys of the newest snapshot of each author dropped here (see compact): named as held when rooms are compared. */

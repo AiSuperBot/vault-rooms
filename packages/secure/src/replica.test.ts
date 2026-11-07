@@ -465,6 +465,42 @@ describe("room replica", () => {
     expect(back.vv(s.roomId, fileId)[s.ana.id]).toBe(2);
   });
 
+  it("compacts on a computer that joined after the note's first snapshot, and refuses what it dropped, after a restart too", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    const fileId = addNote(a.replica, "Long.md", "");
+    const text = a.replica.noteDoc(fileId).getText("content");
+    for (let i = 0; i < 50; i++) text.insert(text.length, `line ${i}\n`);
+    expect(a.replica.snapshot(fileId)).not.toBeNull();
+    // Cy comes now: Ana's first 50 updates are in her snapshot only, anywhere.
+    const c = s.member(s.cy);
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    for (let i = 50; i < 110; i++) {
+      text.insert(text.length, `line ${i}\n`);
+      s.net.pump();
+    }
+    const resent = a.node.store.envelopesOf(s.roomId, fileId).updates[10]!;
+    expect(a.replica.snapshot(fileId)).not.toBeNull();
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe(text.toString());
+    expect(c.node.store.envelopesOf(s.roomId, fileId).updates).toHaveLength(0);
+    expect(c.node.store.digest(s.roomId)).toBe(a.node.store.digest(s.roomId));
+    // A copy of one it dropped, sent again by a peer that hadn't compacted yet: refused before any check.
+    expect(c.node.store.holds(resent)).toBe(true);
+    expect(c.node.publish(resent)).toBe(false);
+    expect(c.node.store.maxClock(s.roomId, fileId, s.ana.id)).toBeGreaterThanOrEqual(resent.clock);
+    // Read back as after a restart.
+    const { marks, claimed, dropped, gone } = c.node.store.marksOf(s.roomId, fileId);
+    const back = new EnvelopeStore();
+    back.restoreMarks(s.roomId, fileId, marks, claimed, dropped, gone);
+    expect(back.add(resent)).toBe("duplicate");
+  });
+
   it("a snapshot that builds on what no one has takes nothing away from members", () => {
     const s = setup();
     const a = s.member(s.ana);
