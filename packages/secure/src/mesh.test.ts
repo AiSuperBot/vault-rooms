@@ -1063,6 +1063,22 @@ describe("mesh", () => {
     }
   });
 
+  it("doesn't send its record to a peer 64 or more versions ahead, which holds all of it, and catches up from it", () => {
+    const { chain, ana, cy } = setup();
+    const base = chain.length;
+    for (let i = 0; i < 70; i++) step(chain, ana, (state) => void (state.users[ana.userId]!.name = `Ana ${i}`));
+    const c = new MeshNode(WorkspaceChain.load(chain.all().slice(0, base)), cy.id);
+    const a = nodeFor(chain, ana);
+    const offered: number[] = [];
+    const offer = a.offerVersions.bind(a);
+    a.offerVersions = (versions, from, appendOnly) => (from && offered.push(versions.length), offer(versions, from, appendOnly));
+    const net = new Network();
+    net.link(a, c);
+    net.pump();
+    expect(offered).toEqual([]);
+    expect(c.chain.length).toBe(chain.length);
+  });
+
   it("sends the record as the previous release does, 500 versions a message, cutting only what wouldn't fit a frame", () => {
     const { chain, ana, cy } = setup();
     const base = chain.length;
