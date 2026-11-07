@@ -68,6 +68,15 @@ describe("frames", () => {
     await closing;
   });
 
+  it("gives a member it doesn't know yet the longer wait to be let in once, however often it shows the record", () => {
+    class Socket extends EventEmitter { writableLength = 0; write() { return true; } destroy() {} }
+    const wire = new Wire(new Socket() as unknown as tls.TLSSocket);
+    let widened = 0;
+    const link = wire.link(randomId("d"), "in", true, undefined, undefined, () => widened++);
+    for (let i = 0; i < 3; i++) link.channel.widen!();
+    expect(widened).toBe(1);
+  });
+
   it("connects two manually configured peers at one IP on different ports without discovery", async () => {
     const w = await world();
     const tlsB = await createTlsIdentity();

@@ -174,6 +174,8 @@ export class Wire {
     if (!joining) this.promote();
     this.handlers = [];
     this.early = [];
+    // The longer wait for a member not known yet is given once: a hello sent again doesn't extend it.
+    let widened = false;
     return {
       remoteDevice,
       remoteAddress: this.socket.remoteAddress ?? "",
@@ -185,7 +187,8 @@ export class Wire {
         drained: () => this.drained(),
         close: (reason: string) => this.close(reason),
         widen: () => {
-          if (this.promoted) return;
+          if (this.promoted || widened) return;
+          widened = true;
           this.reader.setLimit(PROVEN_MAX_FRAME);
           onWiden?.();
         },
