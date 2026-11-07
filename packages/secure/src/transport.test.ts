@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
+import * as net from "node:net";
 import * as tls from "node:tls";
 import { b64u, concatBytes, fromUtf8, utf8 } from "./bytes.js";
 import { WorkspaceChain } from "./chain.js";
@@ -325,6 +326,28 @@ describe("TLS transport", () => {
     cleanups.push(() => joined.link.channel.close("done"));
     expect(joined.chain.workspaceId).toBe(w.ws);
     await until(() => closed, 2000);
+  });
+
+  it("tries every address of the link at once, so one that never answers doesn't hold the join up", async () => {
+    const w = await world();
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
+    step(w.chain, w.ana, (state) => (state.invites[fresh.inviteId] = fresh.record));
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    // An address that takes connections and never answers (a virtual network's, say), and one nobody listens on.
+    const sockets: net.Socket[] = [];
+    const silent = net.createServer((socket) => sockets.push(socket));
+    await new Promise<void>((resolve) => silent.listen(0, "127.0.0.1", resolve));
+    cleanups.push(() => {
+      for (const socket of sockets) socket.destroy();
+      return new Promise((resolve) => silent.close(resolve));
+    });
+    const peers = ["127.0.0.1:1", `127.0.0.1:${(silent.address() as { port: number }).port}`, `127.0.0.1:${a.port}`];
+    const link = parseInviteLink(formatInviteLink({ workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers }));
+    const started = Date.now();
+    const joined = await joinWorkspace({ invite: link, userName: "Dee", deviceName: "Dee PC", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") });
+    cleanups.push(() => joined.link.channel.close("done"));
+    expect(joined.chain.workspaceId).toBe(w.ws);
+    expect(Date.now() - started).toBeLessThan(5_000);
   });
 
   it("won't join through a peer that isn't part of the workspace the link names", async () => {

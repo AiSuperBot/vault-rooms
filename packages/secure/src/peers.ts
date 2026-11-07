@@ -284,30 +284,48 @@ export async function joinWorkspace(input: {
   // A computer of the workspace that answered and then let us go (the connection closed from its side) refused the
   // invite: expired, used, withdrawn, or not known there yet. A check failing here, or no answer, isn't that.
   let refused = false;
-  for (const address of addresses) {
+  // Every address at once: a computer has addresses no one else can reach (a VPN's, a virtual network's), and each
+  // would cost the whole auth timeout. The first whose record checks out is kept; every other connection is closed.
+  let won = null as { chain: WorkspaceChain; link: PeerLink } | null;
+  let first!: () => void;
+  const settled = new Promise<void>((resolve) => (first = resolve));
+  const open = new Set<PeerLink>();
+  const attempts = addresses.map(async (address) => {
     let link: PeerLink | null = null;
     let dialed = false;
     try {
-      const open = (link = await dial(config, address.host, address.port));
+      const opened = (link = await dial(config, address.host, address.port));
       dialed = true;
+      if (won) return;
+      open.add(opened);
       const chain = await new Promise<WorkspaceChain>((resolve, reject) => {
-        const handshake = new JoinHandshake(open.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
-        open.onMessage((message) => handshake.receive(message));
-        open.onClose((reason) => reject(new Error(reason)));
+        const handshake = new JoinHandshake(opened.channel, invite.workspaceId, join, resolve, (reason) => reject(new Error(reason)));
+        opened.onMessage((message) => handshake.receive(message));
+        opened.onClose((reason) => reject(new Error(reason)));
         handshake.start();
       });
       // Now that the record is known, check that whoever answered is the device it claimed, with its pinned certificate.
       const membership = applyJoins(chain.state, chain.workspaceId, [{ join, firstSeen: Date.now() }]).state;
-      if (!open.unverifiedAcceptor || !verifyAcceptor(membership, chain.workspaceId, join.body.device.id, open.unverifiedAcceptor)) throw new Error("unverified_peer");
+      if (!opened.unverifiedAcceptor || !verifyAcceptor(membership, chain.workspaceId, join.body.device.id, opened.unverifiedAcceptor)) throw new Error("unverified_peer");
+      if (won) return;
+      won = { chain, link: opened };
       link = null;
-      return { chain, join, link: open };
+      first();
     } catch (error) {
       if (dialed && (error as Error).message === "socket_closed") refused = true;
       errors.push(`${address.host}:${address.port} ${(error as Error).message}`);
     } finally {
-      // Only the connection that worked is kept (for the first session); every other is closed.
-      link?.channel.close("join_failed");
+      // Only the connection that worked is kept (for the first session).
+      if (link) {
+        open.delete(link);
+        link.channel.close("join_failed");
+      }
     }
+  });
+  await Promise.race([settled, Promise.allSettled(attempts)]);
+  if (won) {
+    for (const other of open) if (other !== won.link) other.channel.close("join_failed");
+    return { chain: won.chain, join, link: won.link };
   }
   fail(refused ? "join_refused" : "join_unreachable", `could not join: ${errors.join("; ") || "no peer addresses"}`);
 }
