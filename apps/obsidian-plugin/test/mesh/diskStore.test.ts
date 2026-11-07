@@ -196,8 +196,17 @@ describe("disk store", () => {
     await disk.flush();
     const written = lines(await files.read(docFile("m", w.roomId, doc))).map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(written.map((entry) => entry.k ?? "marks")).toEqual(["marks", "s", "u"]);
-    const reloaded = await new DiskStore(files, "m").open();
+    const second = new DiskStore(files, "m");
+    const reloaded = await second.open();
     expect(reloaded.vv(w.roomId, doc)).toEqual({ [w.deviceId]: 5 });
+    // Updates dropped past a gap are written with the marks, as ranges, and refused again once read back.
+    const later = sealUpdate(w.ctx, doc, 7, utf8("u7"));
+    reloaded.add(later);
+    reloaded.compact(w.roomId, doc, [later], {});
+    await second.flush();
+    const again = await new DiskStore(files, "m").open();
+    expect(again.marksOf(w.roomId, doc).gone).toEqual({ [w.deviceId]: [[7, 7]] });
+    expect(again.add(later)).toBe("duplicate");
   });
 
   it("keeps a document whose journal can't be read incomplete, never writes over that journal, and takes it in once it can", async () => {

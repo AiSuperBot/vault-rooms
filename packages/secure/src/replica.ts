@@ -918,14 +918,16 @@ export class RoomReplica {
           return false;
         }
       };
+      // Past what is held without a gap too: the store remembers those by range (see EnvelopeStore.compact).
       for (const update of updates) {
-        if (remove.has(update) || update.clock > (snapshot.covers[update.author] ?? 0) || update.clock > (held[update.author] ?? 0)) continue;
+        if (remove.has(update) || update.clock > (snapshot.covers[update.author] ?? 0)) continue;
         if (contains(update)) remove.add(update);
       }
       for (const other of snapshots) if (other !== snapshot && !remove.has(other) && vvDominates(snapshot.covers, other.covers) && contains(other)) remove.add(other);
     }
     // A mark says every update up to it is in a snapshot (a later one is refused as a duplicate, and never asked for
-    // again). So per author it only covers the updates taken out up to the first one kept, and only those go.
+    // again). So per author it only covers the updates taken out up to the first one kept, and of the run held without a
+    // gap only those go; past that run, what goes is remembered by range (see EnvelopeStore.compact).
     const marks: VersionVector = {};
     const kept = new Set<string>();
     for (const update of updates) {
