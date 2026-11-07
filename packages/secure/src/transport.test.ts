@@ -93,6 +93,29 @@ describe("frames", () => {
     expect(a.manager.connected().sort()).toEqual([ben.id, w.cy.id].sort());
   }, 15_000);
 
+  it("doesn't dial again a computer it lists by address while connected to it, whichever side dialled", async () => {
+    const w = await world();
+    const toCy: Array<{ host: string; port: number }> = [];
+    const a = await peer(w.chain, w.ana, w.tlsA, toCy);
+    const c = await peer(w.chain, w.cy, w.tlsC, [{ host: "127.0.0.1", port: a.port }]);
+    toCy.push({ host: "127.0.0.1", port: c.port });
+    for (const p of [a, c]) p.manager.ownAddresses = () => [];
+    let accepted = 0;
+    const accept = c.manager.accept.bind(c.manager);
+    c.manager.accept = (link) => {
+      accepted++;
+      accept(link);
+    };
+    // Cy's computer dials first; then Ana's, which lists Cy's address too, ticks a few times.
+    c.manager.start();
+    await until(() => a.manager.connected().includes(w.cy.id) && c.manager.connected().includes(w.ana.id));
+    a.manager.start();
+    await new Promise((resolve) => setTimeout(resolve, 7_000));
+    expect(accepted).toBeLessThanOrEqual(1);
+    expect(a.manager.connected()).toEqual([w.cy.id]);
+    expect(c.manager.connected()).toEqual([w.ana.id]);
+  }, 20_000);
+
   it("reassemble messages split anywhere and refuse oversized ones", () => {
     const bytes = Buffer.concat([encodeFrame({ a: 1 }), encodeFrame({ b: "two" })]);
     const reader = new FrameReader();
