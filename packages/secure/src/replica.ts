@@ -4,7 +4,8 @@ import { fail, SecureError } from "./errors.js";
 import { Clashes, type FileSave, type Line } from "./clashes.js";
 import { isHash, isId } from "./ids.js";
 import { keyCommitment, unwrapRoomKey, type KeyWrap } from "./keys.js";
-import type { KeyPair } from "./crypto.js";
+import { hashTagged, type KeyPair } from "./crypto.js";
+import { b64u, utf8 } from "./bytes.js";
 import type { MeshNode } from "./mesh.js";
 import { safeRoomPath } from "./paths.js";
 import { vvDominates, type BlobMeta, type VersionVector } from "./store.js";
@@ -389,7 +390,9 @@ export class RoomReplica {
     const state = this.docs.get(docId);
     if (!state || state.pending.size > 0 || state.undecryptable.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId) || this.clashes.pending(docId)) return undefined;
     if (state.base + state.received !== this.node.store.addsOf(this.roomId, docId)) return undefined;
-    return this.contentKey(docId);
+    const key = this.contentKey(docId);
+    // Envelopes held but not opened (see DocState.unopened) aren't in the text: the key changes once one is.
+    return state.unopened.size === 0 ? key : `${key}-${b64u(hashTagged("unopened", utf8([...state.unopened.keys()].sort().join("\n")))).slice(0, 11)}`;
   }
 
   /**
