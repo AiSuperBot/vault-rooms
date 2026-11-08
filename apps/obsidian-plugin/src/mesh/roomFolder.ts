@@ -1259,7 +1259,8 @@ export class RoomFolder {
         this.writeLater(id, wait);
         continue;
       }
-      const owner = owners.get(pathKey(entry.path));
+      // The file at its name may be another's: known there, or waiting for the room key there (see stayPut).
+      const owner = owners.get(pathKey(entry.path)) ?? this.queuedPaths.get(entry.path);
       // One that failed (a file in use, say), or must wait for another, is tried again by the next retry.
       if ((owner !== undefined && owner !== id) || !(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
         this.retryIds.add(id);
@@ -1447,6 +1448,16 @@ export class RoomFolder {
       if (this.deletions.size > 0 || this.askingAboutDeletions) {
         this.waitingForDeletions.add(id);
         return;
+      }
+      // Its file stands where the user left it while its entry waited for the room key (see stayPut): moved to its
+      // shared name rather than written anew beside it, and looked at there.
+      const at = this.queuedEntries.get(id);
+      if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at))) {
+        await this.move(at, entry.path);
+        this.dropQueued(id);
+        this.queuedEntries.set(id, entry.path);
+        this.queuedPaths.set(entry.path, id);
+        return this.remoteChanged(id);
       }
       const variant = this.untrackedCaseVariant(entry.path);
       if (variant) await this.moveAside(variant);
