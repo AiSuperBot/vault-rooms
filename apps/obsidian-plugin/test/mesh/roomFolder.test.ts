@@ -647,6 +647,211 @@ describe("reported file regressions", () => {
     expect(a.notices.some((message) => message.includes("deleted by someone else while you were working on it"))).toBe(true);
   });
 
+  it("shares a file written and renamed under a deleted file's name as its own, and deletes the deleted one", async () => {
+    const { s, a, c } = await pair({ "A.md": "text of X\n", "Busy.md": "busy\n" });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // X renamed into another kind of file (to be put back), deleted there, a new file written under that name and
+    // renamed on: the deletion is X's, the new file is its own.
+    await a.vault.rename("Team/A.md", "Team/B.txt");
+    await a.vault.trash("Team/B.txt");
+    await a.vault.writeText("Team/B.txt", "brand new\n");
+    await a.vault.rename("Team/B.txt", "Team/C.txt");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/C.txt"]);
+    expect(c.vault.text("Team/C.txt")).toBe("brand new\n");
+  });
+
+  it("puts back a file renamed onto a deleted name and on again, once, when the room's file list isn't read", async () => {
+    const { s, a, c } = await pair({ "A.md": "tag X\n", "B.md": "tag Y\n", "Busy.md": "busy\n" });
+    a.node.store.setUnreadable(s.roomId, INDEX_DOC, true);
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // Y deleted, X renamed onto its name, then on to C. The deletion pending at B is Y's, taken by the first rename:
+    // the second is still of X, which goes back to A.
+    await a.vault.trash("Team/B.md");
+    await a.vault.rename("Team/A.md", "Team/B.md");
+    await a.vault.rename("Team/B.md", "Team/C.md");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    a.node.store.setUnreadable(s.roomId, INDEX_DOC, false);
+    a.folder.remoteChanged(INDEX_DOC);
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.keys()].sort()).toEqual(["Team/A.md", "Team/Busy.md"]);
+    expect(c.vault.text("Team/A.md")).toBe("tag X\n");
+  });
+
+  it("doesn't take a file a pass moved onto a deleted name for one renamed there by the user", async () => {
+    const { s, a, c, link } = await pair({ "X.md": "tag X\n", "Y.md": "tag Y\n" });
+    link.cut();
+    // Apart: Cy deletes Y and renames X to its name; Ana deletes Y too. They meet while Ana's deletion still waits: the
+    // pass moves X to Y's name here, and the deletion then finds X there.
+    await c.vault.trash("Team/Y.md");
+    await c.vault.rename("Team/X.md", "Team/Y.md");
+    await c.folder.settled();
+    await a.vault.trash("Team/Y.md");
+    s.net.link(a.node, c.node);
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.keys()]).toEqual(["Team/Y.md"]);
+    expect(a.vault.text("Team/Y.md")).toBe("tag X\n");
+  });
+
+  it("doesn't move a new file written under a deleted file's name when putting that file's rename back", async () => {
+    const { s, a, c } = await pair({ "A.md": "text of X\n", "Busy.md": "busy\n" });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await a.vault.rename("Team/A.md", "Team/B.txt");
+    await a.vault.trash("Team/B.txt");
+    await a.vault.writeText("Team/B.txt", "brand new\n");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    // The new file is shared as its own; X, deleted and written again under one name, stays (a save, as designed).
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/A.md", "Team/B.txt", "Team/Busy.md"]);
+      expect(pc.vault.text("Team/B.txt")).toBe("brand new\n");
+      expect(pc.vault.text("Team/A.md")).toBe("text of X\n");
+    }
+  });
+
+  for (const refused of [false, true]) {
+    it(`reads a save handled late at a name a later rename vacated from the file it was about${refused ? ", the renames put back" : ""}`, async () => {
+      const { s, a, c } = await pair({ "A.md": "tag X\n", "D.md": "tag W\n", "Busy.md": "busy\n" });
+      const x = [...a.replica.files()].find(([, entry]) => entry.path === "A.md")![0];
+      const seen: string[] = [];
+      const text = a.replica.noteDoc(x).getText("content");
+      text.observe(() => seen.push(text.toString()));
+      if (refused) a.node.store.setUnreadable(s.roomId, INDEX_DOC, true);
+      let release!: () => void;
+      const slow = new Promise<void>((resolve) => (release = resolve));
+      a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+      await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+      // X renamed to B and saved there, then renamed on to C; W renamed onto B. The save's event names B, which holds W
+      // by the time the folder gets to it.
+      await a.vault.rename("Team/A.md", "Team/B.md");
+      await a.vault.writeText("Team/B.md", "tag X\nmore\n");
+      await a.vault.rename("Team/B.md", "Team/C.md");
+      await a.vault.rename("Team/D.md", "Team/B.md");
+      release();
+      a.vault.gate = undefined;
+      await s.settle();
+      if (refused) {
+        a.node.store.setUnreadable(s.roomId, INDEX_DOC, false);
+        a.folder.remoteChanged(INDEX_DOC);
+        await s.settle();
+      }
+      const [xPath, wPath] = refused ? ["Team/A.md", "Team/D.md"] : ["Team/C.md", "Team/B.md"];
+      for (const pc of [a, c]) {
+        expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", xPath, wPath].sort());
+        expect(pc.vault.text(xPath)).toBe("tag X\nmore\n");
+        expect(pc.vault.text(wPath)).toBe("tag W\n");
+      }
+      // W's text never went out as X's, not even for a moment.
+      expect(seen.filter((t) => t.includes("tag W"))).toEqual([]);
+    });
+  }
+
+  it("applies a deletion whose wait ended while the folder was busy, before a rename onto its name is handled", async () => {
+    const { s, a, c } = await pair({ "B.md": "tag X\n", "D.md": "tag W\n", "Busy.md": "busy\n" });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await a.vault.trash("Team/B.md");
+    // The deletion wait ends while the folder is still busy: its flush is queued before the rename below is handled.
+    const folder = a.folder as unknown as { run(task: () => Promise<void>): Promise<void>; flushDeletions(): Promise<void> };
+    void folder.run(() => folder.flushDeletions());
+    await a.vault.rename("Team/D.md", "Team/B.md");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.keys()].sort()).toEqual(["Team/B.md", "Team/Busy.md"]);
+    expect(c.vault.text("Team/B.md")).toBe("tag W\n");
+  });
+
+  it("writes back a file whose put-back failed when its deletion is put back unapplied with many others", async () => {
+    const files: Record<string, string> = { "A.md": "text of X\n", "Busy.md": "busy\n" };
+    for (let i = 0; i < 20; i++) files[`n${i}.md`] = `note ${i}\n`;
+    const { s, a, c } = await pair(files);
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // X renamed into another kind of file (to be put back) and deleted there before the folder gets to it, with twenty
+    // notes deleted at once: the user is asked, and says to put them back.
+    a.deleteAnswer = false;
+    await a.vault.rename("Team/A.md", "Team/B.txt");
+    await a.vault.trash("Team/B.txt");
+    for (let i = 0; i < 20; i++) await a.vault.trash(`Team/n${i}.md`);
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    expect(a.asked).toEqual([20]);
+    expect([...a.vault.files.keys()].sort()).toEqual(Object.keys(files).map((path) => `Team/${path}`).sort());
+    expect(a.vault.text("Team/A.md")).toBe("text of X\n");
+    expect([...c.vault.files.keys()].sort()).toEqual([...a.vault.files.keys()].sort());
+  });
+
+  it("gives the notes taken in before a stop their entries, rather than leaving them in the room without any", async () => {
+    const s = setup();
+    const vault = new MemoryVault();
+    for (let i = 0; i < 30; i++) await vault.writeText(`Team/Note ${i}.md`, `note ${i}\n`);
+    const a = s.make(s.ana, "Team", vault);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    // Obsidian closes while the 26th note (in the order the folder takes them) is being read.
+    const gated = [...vault.files.keys()].sort()[25]!;
+    let reached!: () => void;
+    const reading = new Promise<void>((resolve) => (reached = resolve));
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    vault.gate = (path) => {
+      if (path !== gated) return undefined;
+      reached();
+      return slow;
+    };
+    const starting = a.folder.start();
+    await reading;
+    const stopping = a.folder.stop();
+    release();
+    await Promise.all([starting, stopping]);
+    const entries = a.replica.files().size;
+    expect(entries).toBeGreaterThanOrEqual(25);
+    // Every note whose text went out has its entry: as many documents as entries, plus the file list's own.
+    expect(a.node.store.docs(s.roomId).length).toBe(entries + 1);
+  });
+
+  it("goes on with the start when a batch of entries can't be made at all, and shares the notes at the next try", async () => {
+    const s = setup();
+    const vault = new MemoryVault();
+    for (let i = 0; i < 5; i++) await vault.writeText(`Team/Note ${i}.md`, `note ${i}\n`);
+    const a = s.make(s.ana, "Team", vault);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    // This user was made a reader at that very moment, say: the change of the file list throws rather than refuses.
+    const editIndex = a.replica.editIndex.bind(a.replica);
+    let thrown = false;
+    vi.spyOn(a.replica, "editIndex").mockImplementation((change) => {
+      if (thrown) return editIndex(change);
+      thrown = true;
+      throw new Error("read_only");
+    });
+    await a.folder.start();
+    await s.settle();
+    expect(a.replica.files().size).toBe(5);
+    expect(a.folder.health().failing).toEqual([]);
+  });
+
   it("keeps tracking a file renamed twice while the folder was busy, the first rename to be put back, when someone else deleted it", async () => {
     const { s, a, c, link } = await pair({ "X.md": "tag X\n", "Busy.md": "busy\n" });
     link.cut();

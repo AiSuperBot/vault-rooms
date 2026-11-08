@@ -289,6 +289,8 @@ export class RoomFolder {
   private deletions = new Map<string, number>();
   /** The same by path key (see pathKey): asked for every file a pass goes over while deletions are pending. */
   private deletedKeys = new Map<string, number>();
+  /** Of those, how many a rename onto the name reported after them, and not handled yet, takes (see onLocalRename). */
+  private claimedDeletions = new Map<string, number>();
   /**
    * Entries of files being taken in, to be added to the room's file list together (see adoptLocalFiles): one change,
    * sealed and signed once, for many files. Null when each file's entry goes alone (a file saved while running).
@@ -1180,7 +1182,10 @@ export class RoomFolder {
       const deletions = [...this.unreadDeletions];
       this.unreadDeletions.clear();
       for (const [id, relative] of deletions) this.shareDeletion(id, relative);
-      this.retryNow();
+      // This pass goes over everything (it reads the flags below): files turned away and clash renames refused meanwhile.
+      this.everything = true;
+      this.renamesTried = "";
+      if (this.rejected.size) this.needsAdopt = true;
     }
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
@@ -1579,10 +1584,13 @@ export class RoomFolder {
           done = false;
         }
         if (this.known.size + adding.length > before) track(relative);
-        if (adding.length >= ADD_AT_ONCE) this.flushAdding();
+        if (adding.length >= ADD_AT_ONCE && !(await this.safely("files", async () => this.flushAdding()))) done = false;
       }
-      if (!this.stopped) this.flushAdding();
     } finally {
+      // Stopped meanwhile too (the replica outlives the folder): what was taken in gets its entries, or its notes would
+      // stay in the room without any. Guarded as each file is: a refusal here (this user made a reader meanwhile) is
+      // tried again, not the end of the start.
+      if (!this.o.replica.isDestroyed && !(await this.safely("files", async () => this.flushAdding()))) done = false;
       this.adding = null;
     }
     this.left = 0;
@@ -1751,9 +1759,18 @@ export class RoomFolder {
       if (this.unsafeInside(vaultPath)) this.notShared(vaultPath.slice(this.prefix.length), "name");
       return;
     }
+    // A rename touching this name isn't handled yet: the file here now may be another one, and the one this save was
+    // about is placed by that rename. It is looked at again then, wherever it is.
+    if (this.renaming.has(vaultPath)) {
+      const moving = this.movedOn.get(vaultPath) ?? this.idAt(relative) ?? this.queuedPaths.get(relative);
+      if (moving !== undefined) this.remoteChanged(moving);
+      return;
+    }
     if (!this.o.vault.stat(vaultPath)) return;
-    // A file there now is another one (see movedOn).
-    this.movedOn.delete(vaultPath);
+    // A file there now is another one (see movedOn): the one that was here is looked at again, to be written back where
+    // it belongs if nothing else places it.
+    const moved = this.movedOnFrom(vaultPath);
+    if (moved !== undefined) this.remoteChanged(moved);
     const id = this.idAt(relative) ?? this.queuedPaths.get(relative);
     const indexed = id ? this.o.replica.entry(id) : undefined;
     const entry = indexed?.deleted ? undefined : indexed;
@@ -1851,7 +1868,8 @@ export class RoomFolder {
     }
     const paths = [...this.deletions.keys()];
     this.clearDeletions();
-    for (const vaultPath of paths) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
+    // A rename onto the name not handled yet: what stands there is that file, not the deleted one come back.
+    for (const vaultPath of paths) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath, this.renaming.has(vaultPath)));
     this.resumeWrites();
   }
 
@@ -1890,7 +1908,7 @@ export class RoomFolder {
       }
       if (share) {
         for (const path of asked) this.countDeletion(path, -(this.deletions.get(path) ?? 0));
-        for (const vaultPath of asked) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
+        for (const vaultPath of asked) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath, this.renaming.has(vaultPath)));
         // Deleted meanwhile: settled on their own (asked about again if they are many).
         if (this.deletions.size > 0) this.waitForDeletions(DELETE_QUIET_MS);
       } else {
@@ -1945,7 +1963,12 @@ export class RoomFolder {
    */
   private inFlight(id: string, vaultPath: string): boolean {
     if (this.renaming.has(vaultPath)) return true;
-    for (const moved of this.movedOn.values()) if (moved === id) return true;
+    for (const [at, moved] of this.movedOn) {
+      // A link outlives its event when that never comes (deletions put back unapplied, say): dropped, or the file
+      // would wait for ever.
+      if (!this.renaming.has(at) && !this.deletions.has(at)) this.movedOn.delete(at);
+      else if (moved === id) return true;
+    }
     return false;
   }
 
@@ -2027,20 +2050,33 @@ export class RoomFolder {
     // while the folder was busy, is of the renamed file itself.
     const key = newVaultPath.startsWith(this.prefix) ? pathKey(newVaultPath.slice(this.prefix.length)) : null;
     const replacing = key === null ? undefined : [...this.deletions.keys()].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === key);
+    if (replacing !== undefined) this.claimedDeletions.set(replacing, (this.claimedDeletions.get(replacing) ?? 0) + 1);
+    // A deletion of the old name pending that no rename onto it takes: the file renamed now came there after it, so it
+    // isn't the one an earlier put-back of that name left a link for (see movedOn). That deletion takes the link.
+    const deletedBefore = (this.deletions.get(oldVaultPath) ?? 0) > (this.claimedDeletions.get(oldVaultPath) ?? 0);
     // Counted until handled: a pass meanwhile leaves both paths alone (see applyContent, adoptLocalFiles), and another
-    // file renamed onto this one's new name by a later event is seen by this one (see back).
-    for (const touched of [oldVaultPath, newVaultPath]) this.renaming.set(touched, (this.renaming.get(touched) ?? 0) + 1);
+    // file renamed onto this one's new name by a later event is seen by this one (see back). Not the folder's own moves
+    // (see moving): they place a file the folder knows, nothing is pending about them.
+    const own = this.moving.has(movingMark(oldVaultPath, newVaultPath));
+    if (!own) for (const touched of [oldVaultPath, newVaultPath]) this.renaming.set(touched, (this.renaming.get(touched) ?? 0) + 1);
     const handle = async () => {
-      for (const touched of [oldVaultPath, newVaultPath]) {
-        const later = (this.renaming.get(touched) ?? 1) - 1;
-        if (later > 0) this.renaming.set(touched, later);
-        else this.renaming.delete(touched);
+      if (!own) {
+        for (const touched of [oldVaultPath, newVaultPath]) {
+          const later = (this.renaming.get(touched) ?? 1) - 1;
+          if (later > 0) this.renaming.set(touched, later);
+          else this.renaming.delete(touched);
+        }
+      }
+      if (replacing !== undefined) {
+        const claims = (this.claimedDeletions.get(replacing) ?? 1) - 1;
+        if (claims > 0) this.claimedDeletions.set(replacing, claims);
+        else this.claimedDeletions.delete(replacing);
       }
       if (!this.started) return; // taken in by start
       if (this.moving.delete(movingMark(oldVaultPath, newVaultPath))) return;
       const from = this.relative(oldVaultPath);
       const to = this.relative(newVaultPath);
-      const movedOn = this.movedOnFrom(oldVaultPath);
+      const movedOn = deletedBefore ? undefined : this.movedOnFrom(oldVaultPath);
       // A file deleted here moments ago (in any case), its name now taken by a tracked file or a copy kept here only:
       // that deletion first, not taken for the file come back. An untracked file renamed onto it (a program saving
       // through a temporary file) is that file's new content: the deletion is left to settle as such.
@@ -2065,9 +2101,10 @@ export class RoomFolder {
         const back = async () => {
           // Renamed back to that name meanwhile: nothing to put back.
           if (home === newVaultPath) return;
-          // Another file renamed onto its name meanwhile (so it left first; events still to come): what is there now is
-          // that file, not this one. The next event from this name is taken for this file.
-          if (this.renaming.has(newVaultPath)) return void this.movedOn.set(newVaultPath, id);
+          // Another file renamed onto its name meanwhile (so it left first), or deleted there and a new file written in
+          // its place (events still to come): what is there now is that file, not this one. The next event from this
+          // name is taken for this file.
+          if (this.renaming.has(newVaultPath) || (to !== null && this.deletionPendingAt(to) && this.o.vault.stat(newVaultPath))) return void this.movedOn.set(newVaultPath, id);
           this.moving.add(movingMark(newVaultPath, home));
           try {
             await this.o.vault.rename(newVaultPath, home);
