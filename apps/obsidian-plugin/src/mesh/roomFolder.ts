@@ -212,8 +212,10 @@ export class RoomFolder {
   private knownPaths = new Map<string, string>();
   /** Tracked ids by pathKey (see idAt). */
   private knownKeys = new Map<string, string>();
-  /** Which files use each attachment version, for the index version it was built from (see blobArrived). */
+  /** Which files use each attachment version, for the index version it was built from (see blobUsers). */
   private blobFiles: { version: number; users: Map<string, string[]> } | null = null;
+  /** Attachment versions that arrived since the last pass (see blobArrived). */
+  private blobsArrived = new Set<string>();
   /** The last desired() and the index version it was built from (see materializeNow). */
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
   /** The clash renames desired() last asked for. */
@@ -650,17 +652,30 @@ export class RoomFolder {
   }
 
   /**
-   * An attachment version arrived (or was stored): the files that use it are written. Should none use it yet (it came
-   * before the index entry naming it), the entry's arrival brings a whole pass.
+   * An attachment version arrived (or was stored): the files that use it are written, by the next pass (which looks
+   * them up once for every version that came meanwhile). Should none use it yet (it came before the index entry naming
+   * it), the entry's arrival brings a whole pass.
    */
   blobArrived(blob: string): void {
+    this.blobsArrived.add(blob);
+    this.passSoon();
+  }
+
+  /** Which files use each attachment version, built again only once the index changed. */
+  private blobUsers(): Map<string, string[]> {
     const version = this.o.replica.docVersion(INDEX_DOC);
     if (this.blobFiles?.version !== version) {
       const users = new Map<string, string[]>();
-      for (const [id, entry] of this.o.replica.files()) if (entry.blob) users.set(`${entry.blob.by}/${entry.blob.id}`, [...(users.get(`${entry.blob.by}/${entry.blob.id}`) ?? []), id]);
+      for (const [id, entry] of this.o.replica.files()) {
+        if (!entry.blob) continue;
+        const key = `${entry.blob.by}/${entry.blob.id}`;
+        const list = users.get(key);
+        if (list) list.push(id);
+        else users.set(key, [id]);
+      }
       this.blobFiles = { version, users };
     }
-    for (const id of this.blobFiles.users.get(blob) ?? []) this.remoteChanged(id);
+    return this.blobFiles.users;
   }
 
   /** Call when the room index or a note (`docId`: only that one) changed remotely, or a key arrived. */
@@ -668,6 +683,11 @@ export class RoomFolder {
     if (docId === INDEX_DOC) this.indexChanged = true;
     else if (docId !== undefined) this.dirty.add(docId);
     else this.everything = true;
+    this.passSoon();
+  }
+
+  /** A pass in a moment: one for a burst of changes. */
+  private passSoon(): void {
     if (this.stopped || this.materializeTimer) return;
     this.materializeTimer = setTimeout(() => {
       this.materializeTimer = null;
@@ -1115,6 +1135,11 @@ export class RoomFolder {
     this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
     this.dirty = new Set();
+    if (this.blobsArrived.size > 0) {
+      const users = this.blobUsers();
+      for (const blob of this.blobsArrived) for (const id of users.get(blob) ?? []) dirty.add(id);
+      this.blobsArrived.clear();
+    }
     if (everything) this.localNames = null;
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     let done = await this.keepClashCopies();
@@ -1497,7 +1522,8 @@ export class RoomFolder {
       if (added === "refused") return this.rejectLocal(relative, "The room's storage is full or the change was refused. Try again after space is available.");
       const entryKey = replica.ownUpdateKey(INDEX_DOC);
       // Remembered only once actually shared (a missing key leaves it to the next pass).
-      if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true);
+      // With what the shared note holds now: the pass after it needn't read the note again.
+      if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true, replica.syncedKey(id));
       else { this.queuedEntries.set(id, relative); this.queuedPaths.set(relative, id); }
       return;
     }

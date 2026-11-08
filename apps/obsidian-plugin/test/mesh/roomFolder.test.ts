@@ -447,10 +447,28 @@ describe("reported file regressions", () => {
     expect(c.vault.files.has("Team/Image.png")).toBe(false);
     read.mockRestore();
     const text = vi.spyOn(c.replica, "noteText");
-    c.folder.blobArrived(`${entry!.blob!.by}/${entry!.blob!.id}`);
+    // Versions arriving between changes of the index (a catch-up) are looked up by the pass, not one by one.
+    const files = vi.spyOn(c.replica, "files");
+    for (let i = 0; i < 10; i++) {
+      c.replica.editIndex((all) => all.set(randomId("f"), { path: `x${i}.png`, kind: "bin" }));
+      c.folder.blobArrived(`${entry!.blob!.by}/${entry!.blob!.id}`);
+    }
+    expect(files).not.toHaveBeenCalled();
     await s.settle();
     expect(c.vault.text("Team/Image.png")).toBe("image bytes");
     expect(text).not.toHaveBeenCalled();
+  });
+
+  it("doesn't read again the notes it has just shared from a folder, on the pass after", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    for (let i = 0; i < 5; i++) await a.vault.writeText(`Team/n${i}.md`, `note ${i}`);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    const read = vi.spyOn(a.replica, "noteText");
+    await a.folder.start();
+    expect(a.replica.files().size).toBe(5);
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("handles repeated save events with direct lookups and no full index or known-path scans", async () => {
