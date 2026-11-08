@@ -1110,10 +1110,10 @@ export class PeerSession {
       blobs.push(key);
     }
     for (const doc of store.docs(room).slice(0, 100_000)) {
-      // Snapshots dropped here count as held: a peer that keeps one (a relay) doesn't send it at every comparison.
-      const summary = { vv: store.vv(room, doc), snaps: [...store.snapshotKeys(room, doc), ...store.droppedSnapshotKeys(room, doc)].slice(0, 100) };
-      if (!fits({ [doc]: summary })) break;
-      docs[doc] = summary;
+      const { part, bytes } = store.summaryOf(room, doc);
+      if (bytes > remaining) break;
+      remaining -= bytes;
+      docs[doc] = part;
     }
     const message: PeerMessage = { t: "room", room, docs, blobs };
     // The same for every peer: built once per change of the room, for the few rooms compared last.
