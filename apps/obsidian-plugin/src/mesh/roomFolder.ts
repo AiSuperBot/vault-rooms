@@ -975,6 +975,8 @@ export class RoomFolder {
     // The version last synced here (the folder's own write of a note typed past the limit, say): the room's, not a change.
     const known = id === undefined ? undefined : this.known.get(id);
     if (known?.path === relative && known.size === stat.size && known.mtime === stat.mtime) return true;
+    // Nor an editor's save of a note open in it: its text went out through the editor (see localWrite).
+    if (asNote && id !== undefined && this.o.isBound(id) && this.o.replica.canWrite()) return true;
     if (!id) this.notShared(relative, "size");
     else if (this.o.replica.canWrite()) this.holdBack(id, relative, `size:${stat.size}:${stat.mtime}`);
     else {
