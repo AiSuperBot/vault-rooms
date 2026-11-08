@@ -216,6 +216,8 @@ export class RoomFolder {
   private blobFiles: { version: number; users: Map<string, string[]> } | null = null;
   /** The last desired() and the index version it was built from (see materializeNow). */
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
+  /** The clash renames desired() last asked for. */
+  private renamesTried = "";
   /** `known` changed since it was last saved (see saveNow), or only files' sizes and times did (saved at stop). */
   private stateChanged = false;
   private statChanged = false;
@@ -311,7 +313,7 @@ export class RoomFolder {
     this.setLocalOnly(relative);
     await this.noteLocalOnlyContent(this.vaultPath(relative));
     await this.saveNow();
-    this.readOnlyNotice(staysHere(relative));
+    this.quietNotice(staysHere(relative));
   }
 
   /** A copy kept here only, edited: known by its content now if renamed while Obsidian is closed (see claimedLocalOnly). */
@@ -370,7 +372,7 @@ export class RoomFolder {
   private started = false;
   /** The first pass after starting is done: editors may be bound. */
   private ready = false;
-  private readOnlyNoticeAt = 0;
+  private quietNoticeAt = 0;
   private stopped = false;
   /** Clash copies to keep, by file id (see noteClashed): written by the next pass, before the note itself. */
   private toKeep = new Map<string, string[]>();
@@ -549,6 +551,7 @@ export class RoomFolder {
     this.retryTimer = null;
     this.retryIn = RETRY_FIRST_MS;
     this.retryIds.clear();
+    this.renamesTried = "";
     if (this.rejected.size) this.needsAdopt = true;
     this.retryAll = false;
     this.everything = true;
@@ -909,9 +912,9 @@ export class RoomFolder {
     this.o.notify(message);
   }
 
-  private readOnlyNotice(message: string): void {
-    if (Date.now() - this.readOnlyNoticeAt < 10_000) return;
-    this.readOnlyNoticeAt = Date.now();
+  private quietNotice(message: string): void {
+    if (Date.now() - this.quietNoticeAt < 10_000) return;
+    this.quietNoticeAt = Date.now();
     this.o.notify(message);
   }
 
@@ -1087,8 +1090,11 @@ export class RoomFolder {
         renames.push([id, entry, path]);
       });
     }
-    // Writers settle the clash for everyone, the same way on every device.
-    if (renames.length > 0 && this.o.replica.canWrite()) {
+    // Writers settle the clash for everyone, the same way on every device. The same renames aren't asked again (a
+    // refused edit rebuilds the whole index; one waiting for the key would be queued twice), until Try again.
+    const tried = JSON.stringify(renames.map(([id, , path]) => [id, path]));
+    if (renames.length > 0 && this.o.replica.canWrite() && tried !== this.renamesTried) {
+      this.renamesTried = tried;
       this.o.replica.editIndex((files) => {
         for (const [id, entry, path] of renames) files.set(id, { ...entry, path });
       });
@@ -1527,7 +1533,7 @@ export class RoomFolder {
         await this.writeCopy(this.vaultPath(copy), local);
         const wrote = await this.writeShared(entry.path, remote, remoteHash, localHash);
         if (!wrote) return; // changed again meanwhile: looked at again next time
-        this.readOnlyNotice(`You can only read this room, so "${entry.path}" was put back. Your version is kept as "${copy}" on this computer only.`);
+        this.quietNotice(`You can only read this room, so "${entry.path}" was put back. Your version is kept as "${copy}" on this computer only.`);
       }
       this.remember(id, entry.path, remoteHash, entry.blob);
       return;
@@ -1552,6 +1558,7 @@ export class RoomFolder {
     }
     const result = replica.editIndex((files) => files.set(id, { ...entry, blob, ...(entry.blob ? { base: entry.blob.id } : {}) }));
     if (result === "published") this.remember(id, entry.path, localHash, blob, [replica.ownUpdateKey(INDEX_DOC), replica.ownBlobKey(blob.id)]);
+    else if (result === "refused") this.holdBack(id, entry.path, localHash);
   }
 
   /** Whether the shared version of a file differs from what was last synced here (our own unsent edits aside). */
@@ -1770,12 +1777,24 @@ export class RoomFolder {
     this.forget(id);
     this.dropQueued(id);
     if (!this.o.replica.canWrite()) {
-      this.readOnlyNotice(`You can only read this room, so "${relative}" was put back.`);
+      this.quietNotice(`You can only read this room, so "${relative}" was put back.`);
       this.dirty.add(id);
       return this.materializeNow();
     }
+    return this.shareDeletion(id, relative);
+  }
+
+  /**
+   * A file deleted here, or moved out of the room: deleted for everyone. Refused (the room's storage full, say), the
+   * shared version is written back and the user told, rather than the file coming back unannounced at a later pass.
+   */
+  private shareDeletion(id: string, relative: string): Promise<void> | void {
     const entry = this.o.replica.entry(id);
-    if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true }));
+    if (entry && !entry.deleted && this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true })) === "refused") {
+      this.quietNotice(`"${relative}" couldn't be taken out of the room for everyone (its storage may be full), so it was put back.`);
+      this.dirty.add(id);
+      return this.materializeNow();
+    }
     this.saveSoon();
   }
 
@@ -1822,11 +1841,14 @@ export class RoomFolder {
           return back();
         }
         if (!this.o.replica.canWrite()) {
-          this.readOnlyNotice("You can only read this room, so the file keeps its old name.");
+          this.quietNotice("You can only read this room, so the file keeps its old name.");
           return back();
         }
         const entry = this.o.replica.entry(id);
-        if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, path: to! }));
+        if (entry && !entry.deleted && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: to! })) === "refused") {
+          this.quietNotice(`"${from}" couldn't be renamed for everyone (the room's storage may be full), so it keeps its old name.`);
+          return back();
+        }
         if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to! });
         else {
           // Its entry still waits for the room key: it goes out under the new name.
@@ -1845,9 +1867,7 @@ export class RoomFolder {
           this.dirty.add(id);
           return this.materializeNow();
         }
-        const entry = this.o.replica.entry(id);
-        if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true }));
-        this.saveSoon();
+        return this.shareDeletion(id, from!);
       }
       if (to !== null && !this.idAt(to)) {
         if (!this.o.replica.canWrite()) return this.keepHere(to);
