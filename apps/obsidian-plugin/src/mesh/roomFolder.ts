@@ -1360,9 +1360,9 @@ export class RoomFolder {
     return this.localNames;
   }
 
-  /** A file here whose name differs from `relative` only in case (the same file on Windows and macOS), if untracked. */
+  /** A file here whose name differs from `relative` only in case (the same file on Windows and macOS), if untracked (nor waiting for the room key there). */
   private untrackedCaseVariant(relative: string): string | null {
-    for (const other of this.localNamesNow().get(pathKey(relative)) ?? []) if (other !== relative && !this.idAt(other) && this.o.vault.stat(this.vaultPath(other))) return other;
+    for (const other of this.localNamesNow().get(pathKey(relative)) ?? []) if (other !== relative && !this.idAt(other) && !this.queuedPaths.has(other) && this.o.vault.stat(this.vaultPath(other))) return other;
     return null;
   }
 
@@ -1454,16 +1454,16 @@ export class RoomFolder {
       }
       const variant = this.untrackedCaseVariant(entry.path);
       if (variant) await this.moveAside(variant);
-      // Its file stands where the user left it while its entry waited for the room key (see stayPut), still holding
-      // its text: moved to its shared name rather than written anew beside it, and looked at there. (A file of
-      // another's there by now is left alone.)
+      // Its file stands where the user left it while its entry waited for the room key (see stayPut): moved to its
+      // shared name rather than written anew beside it, and read there as the user's version of this note (an edit made
+      // to it meanwhile is taken in, not kept as a clash copy).
       const at = this.queuedEntries.get(id);
-      if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at)) && sha(await this.readAs(this.vaultPath(at), entry.kind === "md")) === remoteHash) {
+      if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at))) {
         await this.move(at, entry.path);
         this.dropQueued(id);
         this.queuedEntries.set(id, entry.path);
         this.queuedPaths.set(entry.path, id);
-        return this.remoteChanged(id);
+        return this.localWrite(path);
       }
       return this.write(id, entry, remote, remoteHash, undefined, content);
     }
@@ -1845,7 +1845,14 @@ export class RoomFolder {
     if (this.doubtful(id)) return;
     const known = this.known.get(id);
     // A new note whose entry still waits for the room key: the edit waits with it.
-    if (!known) return this.localChanged(id, entry, content, hash);
+    if (!known) {
+      // Its entry waits for the room key, the file where a refused rename left it (see stayPut): remembered there,
+      // and a pass moves it to its shared name.
+      const where = relative === entry.path ? entry : { ...entry, path: relative };
+      await this.localChanged(id, where, content, hash);
+      if (where !== entry) this.remoteChanged(INDEX_DOC);
+      return;
+    }
     // Changed again after it was held back: looked at afresh.
     const held = this.heldBack.get(id);
     if (held !== undefined && held !== hash && this.heldBack.delete(id)) this.o.heldBackChanged?.();

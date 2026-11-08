@@ -1626,6 +1626,108 @@ describe("reported file regressions", () => {
     }
   });
 
+  it("brings a key-waiting note's file back from a name differing only in case, where a refused rename left it, without taking it for another's", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // Cy may only read from now on: his rename is refused, and the disk refuses to put the file back.
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.cy.userId] = "read"))]);
+    await s.settle();
+    c.vault.failMoves = (from) => from === "Team/new.md";
+    await c.vault.rename("Team/New.md", "Team/new.md");
+    await s.settle();
+    expect(c.vault.text("Team/new.md")).toBe("the note\n");
+    c.vault.failMoves = undefined;
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    expect(c.notices.filter((message) => message.includes("changed here and by someone else"))).toEqual([]);
+    expect([...c.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
+    expect(c.vault.text("Team/New.md")).toBe("the note\n");
+  });
+
+  it("remembers a key-waiting note where its file stands when the user edits it there, and moves it to its name", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    c.vault.failMoves = (from) => from === "Team/New.txt";
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    // The key arrives; the move back keeps failing. Then the disk lets go, and the user edits the file where it stands.
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.txt")).toBe("the note\n");
+    c.vault.failMoves = undefined;
+    await c.vault.writeText("Team/New.txt", "the note\nedited\n");
+    await s.settle();
+    await s.settle();
+    expect(c.replica.noteText(x)).toBe("the note\nedited\n");
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
+      expect(pc.vault.text("Team/New.md")).toBe("the note\nedited\n");
+    }
+  });
+
+  it("takes in an edit of a key-waiting note's file made just before the pass moves it to its name", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    let release!: () => void;
+    let slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    c.vault.failMoves = (from) => from === "Team/New.txt";
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    // The disk lets go; a pass is queued behind busy work, then the user saves the file: the pass runs first.
+    c.vault.failMoves = undefined;
+    slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\nstill\n");
+    c.folder.retryNow();
+    await c.vault.writeText("Team/New.txt", "the note\nedited\n");
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    expect(c.replica.noteText(x)).toBe("the note\nedited\n");
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
+      expect(pc.vault.text("Team/New.md")).toBe("the note\nedited\n");
+    }
+  });
+
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
     const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
     await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
