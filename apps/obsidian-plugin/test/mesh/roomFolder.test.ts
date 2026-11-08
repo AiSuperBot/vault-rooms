@@ -760,8 +760,9 @@ describe("reported file regressions", () => {
     }
   });
 
-  it("drops its own-move mark when keeping a note aside fails on the disk", async () => {
-    const { s, a } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+  it("tracks a note where it stands when neither its put-back nor keeping it aside can be made, the new file under its old name its own", async () => {
+    const { s, a, c } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    const x = [...a.replica.files()].find(([, entry]) => entry.path === "A.md")![0];
     let release!: () => void;
     const slow = new Promise<void>((resolve) => (release = resolve));
     a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
@@ -773,10 +774,62 @@ describe("reported file regressions", () => {
     a.vault.gate = undefined;
     await s.settle();
     await s.settle();
-    // Neither the put-back nor the move aside could be made: the file stays where the user put it, and no mark of a
-    // move of the folder's own is left to swallow a later rename of the user's from that name.
+    // Neither the put-back nor the move aside could be made: the file stays where the user put it, tracked there, so
+    // the new file is shared as its own and not read as the note's edit; no mark of a move of the folder's own is left
+    // to swallow a later rename of the user's from that name.
     expect(a.vault.text("Team/B.txt")).toBe("tag X\n");
+    expect(a.replica.noteText(x)).toBe("tag X\n");
+    expect([...c.vault.files.keys()].filter((path) => path !== "Team/Busy.md").map((path) => c.vault.text(path)).sort()).toEqual(["tag NEW\n", "tag X\n"]);
     expect((a.folder as unknown as { moving: Set<string> }).moving.size).toBe(0);
+  });
+
+  it("keeps a note aside when a new file took its old name spelled in another case, on a disk that doesn't tell them apart", async () => {
+    const { s, a, c } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    a.vault.windows = true;
+    const x = [...a.replica.files()].find(([, entry]) => entry.path === "A.md")![0];
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // Renamed to a name no room can have (so it can't be tracked there), and "a.md" written: to this disk, "A.md".
+    await a.vault.rename("Team/A.md", "Team/bad?.md");
+    await a.vault.writeText("Team/a.md", "tag NEW\n");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    expect(a.replica.noteText(x)).toBe("tag X\n");
+    for (const pc of [a, c]) {
+      const texts = [...pc.vault.files.keys()].filter((path) => path !== "Team/Busy.md").map((path) => pc.vault.text(path)).sort();
+      expect(texts).toEqual(["tag NEW\n", "tag X\n"]);
+    }
+  });
+
+  it("shares a new file written under a note's old name while that note moved on again, without taking it for the note", async () => {
+    const { s, a, c } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    const x = [...a.replica.files()].find(([, entry]) => entry.path === "A.md")![0];
+    const seen: string[] = [];
+    const text = a.replica.noteDoc(x).getText("content");
+    text.observe(() => seen.push(text.toString()));
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // X renamed into another kind of file (to be put back), a new note written under its old name, X renamed on again.
+    await a.vault.rename("Team/A.md", "Team/B.txt");
+    await a.vault.writeText("Team/A.md", "tag NEW\n");
+    await a.vault.rename("Team/B.txt", "Team/C.md");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/A.md", "Team/Busy.md", "Team/C.md"]);
+      expect(pc.vault.text("Team/A.md")).toBe("tag NEW\n");
+      expect(pc.vault.text("Team/C.md")).toBe("tag X\n");
+    }
+    // The new note was never taken for X's text, not even for a moment.
+    expect(seen.filter((version) => version.includes("NEW"))).toEqual([]);
   });
 
   /** The deletions' quiet time ends now (as settled() ends it), the folder busy: the flush is queued behind its work. */
@@ -1223,6 +1276,34 @@ describe("reported file regressions", () => {
       expect(files[1]).toBe("Team/New.md");
       expect(pc.vault.text("Team/New.md")).toBe("another note\n");
     }
+  });
+
+  it("keeps aside a note whose entry waits for the room key when its writer was made a reader meanwhile", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // Cy may only read from now on; the note's entry still waits for the key.
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void (state.rooms[s.roomId]!.members[s.cy.userId] = "read"))]);
+    await s.settle();
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    await c.vault.writeText("Team/New.md", "another note\n");
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    // Kept aside without trying to rename the entry for everyone (a reader can't), the new note left as it is.
+    expect(c.notices.some((message) => message.includes("A new file took the name"))).toBe(true);
+    expect(c.vault.text("Team/New.md")).toBe("another note\n");
+    const kept = [...c.vault.files.keys()].find((path) => path.includes("(kept "));
+    expect(kept && c.vault.text(kept)).toBe("the note\n");
   });
 
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {

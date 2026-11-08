@@ -1202,8 +1202,11 @@ export class RoomFolder {
     // Clash copies first: a note waiting for its copy is written once it is kept (and what gave way is gone).
     let done = await this.keepClashCopies();
     for (const path of [...this.retryWrites]) {
-      if (await this.safely(path.slice(this.prefix.length), () => this.localWrite(path))) this.retryWrites.delete(path);
-      else done = false;
+      this.retryWrites.delete(path);
+      if (!(await this.safely(path.slice(this.prefix.length), () => this.localWrite(path)))) {
+        this.retryWrites.add(path);
+        done = false;
+      }
     }
     const replica = this.o.replica;
     // Built anew by a whole pass, and whenever the index changed: a pass for one note doesn't go over every file.
@@ -1753,8 +1756,9 @@ export class RoomFolder {
   }
 
   private async tryLocalWrite(vaultPath: string, gone?: () => boolean): Promise<void> {
-    if (await this.safely(vaultPath.slice(this.prefix.length), () => this.localWrite(vaultPath, gone))) this.retryWrites.delete(vaultPath);
-    else { this.retryWrites.add(vaultPath); this.retrySoon(); }
+    // Taken off the retries first: one that can't be handled yet puts itself back (see localWrite).
+    this.retryWrites.delete(vaultPath);
+    if (!(await this.safely(vaultPath.slice(this.prefix.length), () => this.localWrite(vaultPath, gone)))) { this.retryWrites.add(vaultPath); this.retrySoon(); }
   }
 
   private async localWrite(vaultPath: string, gone?: () => boolean): Promise<void> {
@@ -1779,6 +1783,12 @@ export class RoomFolder {
     const moved = this.movedOnFrom(vaultPath);
     if (moved !== undefined) this.remoteChanged(moved);
     const id = this.idAt(relative) ?? this.queuedPaths.get(relative);
+    // Its own file is on the move (a rename of it still to be handled, see inFlight): what stands at its name here is
+    // another file. Looked at again once that rename has placed it.
+    if (id !== undefined && this.inFlight(id, vaultPath)) {
+      this.retryWrites.add(vaultPath);
+      return this.retrySoon();
+    }
     const indexed = id ? this.o.replica.entry(id) : undefined;
     const entry = indexed?.deleted ? undefined : indexed;
     // A new file here, nothing of ours: taken in, which checks its size before reading it (it may be huge). One that
@@ -2133,23 +2143,33 @@ export class RoomFolder {
             this.moving.delete(movingMark(newVaultPath, home));
             // Moved on meanwhile (renamed again, or deleted): that event comes next, and is taken for this file.
             if (!this.o.vault.stat(newVaultPath)) return void this.movedOn.set(newVaultPath, id);
-            // Its old name taken meanwhile (a new file made there): kept next to it under a name of its own, the shared
-            // file it was, so neither is taken for the other. Anything else in the way (the disk) is tried again.
-            if (!this.o.vault.stat(home)) throw error;
-            const aside = this.copyName(this.relative(home) ?? from!, "kept");
+            // Anything else in the way (the disk): the file is tracked where it stands, so a new file at its old name is
+            // one of its own, and the next pass moves it back. (At a name no room can have it isn't tracked: as before.)
+            const stayPut = (failure: unknown): never => {
+              if (to !== null && this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to });
+              throw failure;
+            };
+            // Its old name taken meanwhile (a new file made there, as the disk sees names: a Windows or macOS disk doesn't
+            // tell "a.md" from "A.md"): kept next to it under a name of its own, the shared file it was, so neither is
+            // taken for the other. The folder is listed for that: the new file's own event may not have come yet.
+            const homeRelative = this.relative(home) ?? from!;
+            const key = pathKey(homeRelative);
+            const taken = this.o.vault.stat(home) !== null || [...this.o.vault.listFiles(this.o.folder)].some((path) => path !== newVaultPath && pathKey(this.relative(path) ?? path) === key);
+            if (!taken) stayPut(error);
+            const aside = this.copyName(homeRelative, "kept");
             const mark = movingMark(newVaultPath, this.vaultPath(aside));
             this.moving.add(mark);
             try {
               await this.o.vault.rename(newVaultPath, this.vaultPath(aside));
             } catch (asideError) {
               this.moving.delete(mark);
-              throw asideError;
+              stayPut(asideError);
             }
             if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: aside });
             else if (this.queuedEntries.has(id)) {
               // Its entry waits for the room key: it goes out under the kept name (as a rename of one does, see below).
               const entry = this.o.replica.entry(id);
-              if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside }));
+              if (entry && !entry.deleted && this.o.replica.canWrite() && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside })) === "refused") this.quietNotice(`"${aside}" couldn't be renamed for everyone (the room's storage may be full), so it is shared under its old name.`);
               this.dropQueued(id);
               this.queuedEntries.set(id, aside);
               this.queuedPaths.set(aside, id);
