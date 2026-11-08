@@ -468,12 +468,19 @@ describe("reported file regressions", () => {
     expect(c.vault.text("Team/Busy.md")).toBe("busy\nmore\n");
   });
 
-  it("waits with a deletion and a new file while the room's file list here isn't read, and shares them once it is", async () => {
+  for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
     const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
     await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
     await s.settle();
-    // Another program held the index's journal when Obsidian started: nothing of the index can go out meanwhile.
-    a.node.store.setUnreadable(s.roomId, INDEX_DOC, true);
+    // Another program held the index's journal when Obsidian started: nothing of the index can go out meanwhile, and
+    // (as at a start) what this computer knows of the index may be missing too.
+    const store = a.node.store;
+    const journal = store.envelopesOf(s.roomId, INDEX_DOC).updates;
+    if (empty) {
+      store.compact(s.roomId, INDEX_DOC, journal, {});
+      a.replica.reload(INDEX_DOC);
+    }
+    store.setUnreadable(s.roomId, INDEX_DOC, true);
     await a.vault.trash("Team/gone.md");
     await a.vault.writeText("Team/new.md", "three\n");
     await a.vault.rename("Team/named.md", "Team/renamed.md");
@@ -485,13 +492,17 @@ describe("reported file regressions", () => {
     // The deletion waits (it isn't undone), the new file waits to be shared, the rename is undone: each says why.
     expect(a.vault.files.has("Team/gone.md")).toBe(false);
     expect(a.vault.text("Team/named.md")).toBe("two\n");
-    expect(a.folder.health().rejected).toEqual([{ path: "new.md", reason: expect.stringContaining("hasn't read the room's file list") }]);
+    expect(a.vault.files.has("Team/renamed.md")).toBe(false);
+    const waiting = (empty ? ["new.md", "pic.png"] : ["new.md"]).map((path) => ({ path, reason: expect.stringContaining("hasn't read the room's file list") }));
+    expect(a.folder.health().rejected?.sort((x, y) => (x.path < y.path ? -1 : 1))).toEqual(waiting);
     expect(a.notices.some((message) => message.includes("storage"))).toBe(false);
     expect(a.notices.filter((message) => message.includes("read the room's file list"))).not.toEqual([]);
     expect([...c.vault.files.keys()].sort()).toEqual(["Team/gone.md", "Team/named.md", "Team/pic.png"]);
     expect([...c.vault.files.get("Team/pic.png")!]).toEqual([1, 2, 3]);
     // Read now (see MeshService, disk.onLateRead): what waited goes ahead.
-    a.node.store.setUnreadable(s.roomId, INDEX_DOC, false);
+    if (empty) for (const env of journal) store.add(env);
+    store.setUnreadable(s.roomId, INDEX_DOC, false);
+    if (empty) for (const env of journal) a.replica.receive(env);
     a.folder.remoteChanged(INDEX_DOC);
     await s.settle();
     for (const pc of [a, c]) expect([...pc.vault.files.keys()].sort()).toEqual(["Team/named.md", "Team/new.md", "Team/pic.png"]);

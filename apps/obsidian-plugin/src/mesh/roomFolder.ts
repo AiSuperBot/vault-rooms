@@ -1958,7 +1958,8 @@ export class RoomFolder {
           return back();
         }
         const entry = this.o.replica.entry(id);
-        if (entry && !entry.deleted && this.indexUnread()) {
+        // Not read yet, its entry may be missing too (the whole list unread, say).
+        if (!entry?.deleted && this.indexUnread()) {
           this.quietNotice(`"${from}" can't be renamed for everyone until this computer has read the room's file list (another program has it open), so it keeps its old name for now.`);
           return back();
         }
