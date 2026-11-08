@@ -736,6 +736,47 @@ describe("reported file regressions", () => {
       const texts = [...pc.vault.files.keys()].filter((path) => path !== "Team/Busy.md").map((path) => pc.vault.text(path)).sort();
       expect(texts).toEqual(["tag NEW\n", "tag X\n"]);
     }
+    // Told in full, though the refused rename was told of a moment before.
+    expect(a.notices.some((message) => message.includes("A new file took the name"))).toBe(true);
+  });
+
+  it("keeps a note aside too when its rename to an unusable name is put back and a new file took its old name", async () => {
+    const { s, a, c } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    const x = [...a.replica.files()].find(([, entry]) => entry.path === "A.md")![0];
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await a.vault.rename("Team/A.md", "Team/bad?.md");
+    await a.vault.writeText("Team/A.md", "tag NEW\n");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    expect(a.replica.noteText(x)).toBe("tag X\n");
+    for (const pc of [a, c]) {
+      const texts = [...pc.vault.files.keys()].filter((path) => path !== "Team/Busy.md").map((path) => pc.vault.text(path)).sort();
+      expect(texts).toEqual(["tag NEW\n", "tag X\n"]);
+    }
+  });
+
+  it("drops its own-move mark when keeping a note aside fails on the disk", async () => {
+    const { s, a } = await pair({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await a.vault.rename("Team/A.md", "Team/B.txt");
+    await a.vault.writeText("Team/A.md", "tag NEW\n");
+    a.vault.failMoves = (from) => from === "Team/B.txt";
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    // Neither the put-back nor the move aside could be made: the file stays where the user put it, and no mark of a
+    // move of the folder's own is left to swallow a later rename of the user's from that name.
+    expect(a.vault.text("Team/B.txt")).toBe("tag X\n");
+    expect((a.folder as unknown as { moving: Set<string> }).moving.size).toBe(0);
   });
 
   /** The deletions' quiet time ends now (as settled() ends it), the folder busy: the flush is queued behind its work. */
@@ -4499,6 +4540,27 @@ describe("room folder, round 55", () => {
       }
     });
   }
+
+  it("brings a reader's note back to its name once a new file that took the name has one of its own", async () => {
+    const { s, a, r } = await reader({ "A.md": "tag X\n", "Busy.md": "busy\n" });
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    r.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await r.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // Rae's rename is refused (a reader), and a new file of hers took the old name before it was put back: X is kept
+    // aside, then a pass settles the two without waiting for a change elsewhere.
+    await r.vault.rename("Team/A.md", "Team/B.md");
+    await r.vault.writeText("Team/A.md", "tag NEW\n");
+    release();
+    r.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, r]) expect(pc.vault.text("Team/A.md")).toBe("tag X\n");
+    expect([...a.vault.files.keys()].sort()).toEqual(["Team/A.md", "Team/Busy.md", "Team/Rules.md"]);
+    // Rae's new note is kept as a copy of her own, next to the copy of her edit of Busy.md (put back, as a reader's).
+    const own = [...r.vault.files.keys()].filter((path) => !["Team/A.md", "Team/Busy.md", "Team/Rules.md"].includes(path));
+    expect(own.map((path) => r.vault.text(path)).sort()).toEqual(["busy\nmore\n", "tag NEW\n"]);
+  });
 
   it("keeps a file a reader added on their computer, as told, also once they may write and restart", async () => {
     const { s, a, r, promote } = await reader();
