@@ -499,8 +499,11 @@ export interface ClashHost {
   text(docId: DocId): Y.Text | undefined;
   /** The updates held for a note, decrypted (those that can be). */
   heldUpdates(docId: DocId): Iterable<[UpdateEnvelope, Uint8Array]>;
-  /** Whether notes can be changed here now (this device may write, and the replica is still running). */
-  mayEdit(): boolean;
+  /**
+   * Whether a note can be changed here now: this device may write, the replica is still running, and all of the note's
+   * history here could be read (with part of it unread, an edit's counter could be one used before).
+   */
+  mayEdit(docId: DocId): boolean;
   /** Change a note as a local edit, in one transaction (see RoomReplica.edit). */
   edit(docId: DocId, change: () => void): EditResult;
   /** See ReplicaEvents.clash. */
@@ -853,7 +856,7 @@ export class Clashes {
     }
     // Copies the owner keeps now go; it tells of the others when they are kept (see copyKept), and the rest waits.
     const waiting = versions.filter((version) => this.host.clash(docId, version) === false);
-    if (waiting.length > 0 || !this.host.mayEdit()) {
+    if (waiting.length > 0 || !this.host.mayEdit(docId)) {
       addPending(this.waitingTakeOuts, docId, { ...pending, lines, copy: false, versions: waiting, kept, extra });
       return;
     }

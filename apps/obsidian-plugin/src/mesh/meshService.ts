@@ -209,7 +209,10 @@ export class MeshService {
     // History read from disk late (in use by another program when the workspace opened): taken in like news, and the
     // note looked at again (complete now), even if all of it came from peers meanwhile.
     disk.onLateRead = (room, doc, envelopes) => {
-      for (const env of envelopes) this.replicas.get(room)?.receive(env);
+      const replica = this.replicas.get(room);
+      for (const env of envelopes) replica?.receive(env);
+      // A clash of the note that waited for its history to be read goes ahead now.
+      replica?.retryTakeOuts();
       this.roomActivity(room, doc);
     };
     events.presence = (env) => {

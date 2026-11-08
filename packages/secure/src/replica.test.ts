@@ -659,6 +659,24 @@ describe("room replica", () => {
     expect(copies).toEqual([]);
   });
 
+  it("settles no clash of a note whose history here can't be read yet, edits it not at all, and settles it once it can", async () => {
+    const { s, a, c, fileId, loser, keep, dues } = await clashing();
+    expect(dues(a)).toHaveLength(2);
+    // The loser's journal of the note was held by another program when the workspace opened, say.
+    loser.node.store.setUnreadable(s.roomId, fileId, true);
+    keep.now = true;
+    for (const m of [a, c]) m.replica.retryTakeOuts();
+    await quiet(s);
+    expect(dues(loser)).toHaveLength(2);
+    // No edit of it goes out meanwhile: its counter could be one used before.
+    expect(loser.replica.edit(fileId, (doc) => doc.getText("content").insert(0, "x"))).toBe("refused");
+    loser.node.store.setUnreadable(s.roomId, fileId, false);
+    loser.replica.retryTakeOuts();
+    await quiet(s);
+    expect(dues(a)).toHaveLength(1);
+    expect(c.replica.noteText(fileId)).toBe(a.replica.noteText(fileId));
+  });
+
   it("takes out of a losing line that waited for its copy what was typed meanwhile in front of what went into it", async () => {
     // Each types into its own line before they meet: "x" after its first character.
     const { s, a, c, fileId, winner, loser, keep } = await clashing((a, c, fileId) => {
