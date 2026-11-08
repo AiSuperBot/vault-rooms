@@ -1197,6 +1197,39 @@ describe("room replica", () => {
     expect(c.replica.noteText(fileId)).toBe("xxxxxStart by Cy");
   });
 
+  it("takes in an edit sealed under the winning key that arrived before the record backing it", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    c.replica.refreshKeys();
+    const link = s.net.link(a.node, c.node);
+    s.net.pump();
+    const fileId = addNote(a.replica, "Plan.md", "Start");
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe("Start");
+    link.cut();
+    // Apart, both start epoch 2 with their own key.
+    const kc = newRoomKey();
+    const ka = newRoomKey();
+    c.node.offerVersions([nextVersion(s.ws, c.node.chain.head, s.cy.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, kc) }))]);
+    c.replica.addOwnKey(2, kc);
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, ka) }))]);
+    a.replica.addOwnKey(2, ka);
+    // They meet and Ana types at once: her edit, sealed under her key, reaches Cy before the record that backs that key.
+    s.net.link(a.node, c.node);
+    a.replica.noteDoc(fileId).getText("content").insert(5, " now");
+    s.net.pump();
+    c.replica.refreshKeys();
+    s.wrapFor(s.cy, 2, ka);
+    s.net.pump();
+    a.replica.noteDoc(fileId).getText("content").insert(9, " and later");
+    s.net.pump();
+    expect(c.replica.noteText(fileId)).toBe("Start now and later");
+  });
+
   it("lets go of a snapshot sealed under a key that lost a race: nothing waits for it, and a later one holding more drops it", () => {
     const s = setup();
     const a = s.member(s.ana);
