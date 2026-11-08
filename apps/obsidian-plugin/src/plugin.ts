@@ -143,7 +143,8 @@ export default class VaultRoomsPlugin extends Plugin {
     // A damaged scope doesn't drop the workspace: opening it then fails visibly and Leave cleans up.
     const mesh: MeshSettings = { scope: isScope(raw.mesh?.scope) ? raw.mesh!.scope : randomScope(), workspace: raw.mesh?.workspace ?? null };
     this.settings = { mesh, mountRoot: typeof raw.mountRoot === "string" && raw.mountRoot ? raw.mountRoot : "Rooms" };
-    await this.saveSettings();
+    // Written only when that changed them (the first start, say): not at every start of Obsidian.
+    if (JSON.stringify(this.settings) !== JSON.stringify(data)) await this.saveSettings();
   }
 
   /** Save the settings again soon, and again less often until it works (never once unloaded, or while unreadable). */
