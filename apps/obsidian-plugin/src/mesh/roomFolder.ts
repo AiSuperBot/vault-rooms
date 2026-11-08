@@ -285,6 +285,8 @@ export class RoomFolder {
    * the rename that followed it (see onLocalRename), or by the flush.
    */
   private deletions = new Map<string, number>();
+  /** The same by path key (see pathKey): asked for every file a pass goes over while deletions are pending. */
+  private deletedKeys = new Map<string, number>();
   /** The user is being asked whether many deletions go out (see askAboutDeletions). */
   private askingAboutDeletions = false;
   /**
@@ -1774,7 +1776,7 @@ export class RoomFolder {
       this.expected.delete(vaultPath);
       return Promise.resolve();
     }
-    this.deletions.set(vaultPath, (this.deletions.get(vaultPath) ?? 0) + 1);
+    this.countDeletion(vaultPath, 1);
     // Counted from the last one: a deletion still coming keeps the others waiting.
     this.waitForDeletions(DELETE_QUIET_MS);
     return Promise.resolve();
@@ -1792,7 +1794,7 @@ export class RoomFolder {
   private async flushDeletions(final = false): Promise<void> {
     if (!this.started) return;
     if (!this.movedAway && !this.o.vault.folderExists(this.o.folder)) {
-      this.deletions.clear();
+      this.clearDeletions();
       this.o.folderGone?.();
       return;
     }
@@ -1801,12 +1803,12 @@ export class RoomFolder {
     // Many at once, the folder still there: maybe a move or deletion of the whole folder, under way (Explorer pauses
     // for a dialog, or a file in use). Never shared on a guess: the user is asked; stopping puts them back.
     if (this.sharedAmong(this.deletions.keys()) >= MASS_DELETE && this.o.replica.canWrite()) {
-      if (final) this.deletions.clear();
+      if (final) this.clearDeletions();
       else this.askAboutDeletions();
       return this.resumeWrites();
     }
     const paths = [...this.deletions.keys()];
-    this.deletions.clear();
+    this.clearDeletions();
     for (const vaultPath of paths) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
     this.resumeWrites();
   }
@@ -1840,12 +1842,12 @@ export class RoomFolder {
         return;
       }
       if (!this.movedAway && !this.o.vault.folderExists(this.o.folder)) {
-        this.deletions.clear();
+        this.clearDeletions();
         this.o.folderGone?.();
         return;
       }
       if (share) {
-        for (const path of asked) this.deletions.delete(path);
+        for (const path of asked) this.countDeletion(path, -(this.deletions.get(path) ?? 0));
         for (const vaultPath of asked) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
         // Deleted meanwhile: settled on their own (asked about again if they are many).
         if (this.deletions.size > 0) this.waitForDeletions(DELETE_QUIET_MS);
@@ -1853,7 +1855,7 @@ export class RoomFolder {
         // Not shared, nor those deleted meanwhile (the same move, most likely): written back from the shared state.
         // Those not shared are gone for good (a copy kept here only): their marks go with them.
         for (const path of this.deletions.keys()) if (!this.o.vault.stat(path)) this.dropMarks(path);
-        this.deletions.clear();
+        this.clearDeletions();
         this.remoteChanged();
       }
       this.resumeWrites();
@@ -1875,10 +1877,24 @@ export class RoomFolder {
 
   /** Whether a deletion of the file at this room path is still pending (see onLocalDelete): what is there is in flux. */
   private deletionPendingAt(relative: string): boolean {
-    if (this.deletions.size === 0) return false;
-    const key = pathKey(relative);
-    for (const gone of this.deletions.keys()) if (gone.startsWith(this.prefix) && pathKey(gone.slice(this.prefix.length)) === key) return true;
-    return false;
+    return this.deletedKeys.size > 0 && this.deletedKeys.has(pathKey(relative));
+  }
+
+  /** Count `by` deletions of a path in (or out, negative): see deletions. */
+  private countDeletion(vaultPath: string, by: number): void {
+    const count = (this.deletions.get(vaultPath) ?? 0) + by;
+    if (count > 0) this.deletions.set(vaultPath, count);
+    else this.deletions.delete(vaultPath);
+    if (!vaultPath.startsWith(this.prefix)) return;
+    const key = pathKey(vaultPath.slice(this.prefix.length));
+    const keyed = (this.deletedKeys.get(key) ?? 0) + by;
+    if (keyed > 0) this.deletedKeys.set(key, keyed);
+    else this.deletedKeys.delete(key);
+  }
+
+  private clearDeletions(): void {
+    this.deletions.clear();
+    this.deletedKeys.clear();
   }
 
   /**
@@ -1893,10 +1909,8 @@ export class RoomFolder {
 
   /** Take one pending deletion of this path (see deletions): whether there was one. */
   private takeDeletion(vaultPath: string): boolean {
-    const count = this.deletions.get(vaultPath);
-    if (count === undefined) return false;
-    if (count > 1) this.deletions.set(vaultPath, count - 1);
-    else this.deletions.delete(vaultPath);
+    if (!this.deletions.has(vaultPath)) return false;
+    this.countDeletion(vaultPath, -1);
     return true;
   }
 

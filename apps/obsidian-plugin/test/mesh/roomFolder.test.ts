@@ -3241,6 +3241,34 @@ describe("room folder, renames waiting", () => {
 describe("room folder, everyday load", () => {
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  it("goes over many files while many deletions are pending without comparing every file with every deletion", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    // A room of 3,000 notes.
+    a.replica.editIndex((files) => {
+      for (let i = 0; i < 3000; i++) files.set(randomId("f"), { path: `Note ${i}.md`, kind: "md" });
+    });
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(a.vault.files.size).toBe(3000);
+    const pass = async () => {
+      const started = performance.now();
+      a.folder.retryNow();
+      await (a.folder as unknown as { queue: Promise<void> }).queue;
+      return performance.now() - started;
+    };
+    const quiet = await pass();
+    // Half of them deleted at once (Explorer, say): their deletions wait, and a pass meanwhile looks at every file.
+    for (let i = 0; i < 1500; i++) await a.vault.trash(`Team/Note ${i}.md`);
+    const pending = await pass();
+    const timing = `a pass with 1,500 deletions pending took ${pending.toFixed(0)} ms, one without ${quiet.toFixed(0)} ms`;
+    if (process.env.FOLDER_LOG) console.log(timing);
+    expect(pending, timing).toBeLessThan(3 * quiet + 200);
+  }, 30_000);
+
   it("writes a note someone else is typing in at most every 1.5 s here, and the last text always", async () => {
     const { s, a, c } = await pair({ "Live.md": "start\n" });
     const id = [...a.replica.files()].find(([, entry]) => entry.path === "Live.md")![0];
