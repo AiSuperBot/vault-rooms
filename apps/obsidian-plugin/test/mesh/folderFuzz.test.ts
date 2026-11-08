@@ -53,17 +53,28 @@ async function start() {
       if (env.k === "b") pc.folder.blobArrived(`${env.author}/${env.id}`);
       else pc.folder.remoteChanged(env.doc);
     };
+    const trace = (what: string, env: { k: string; doc?: string; author: string; clock?: number; seq?: number }) =>
+      process.env.FUZZ_TRACE && console.log(`[${name}] ${what} ${env.k} ${env.doc?.slice(1, 5) ?? env.doc} by ${env.author === ana.id ? "Ana" : "Cy"} ${env.clock ?? env.seq ?? ""}`);
     const node = new MeshNode(WorkspaceChain.load(chain.all()), device.id, {
       envelope: (env) => {
+        trace("recv", env as { k: string; doc?: string; author: string });
         pc.replica.receive(env);
         changed(env);
       },
-      stored: changed,
+      stored: (env) => {
+        trace("stored", env as { k: string; doc?: string; author: string });
+        changed(env);
+      },
       wraps: () => {
         if (pc.replica.refreshKeys()) pc.folder.remoteChanged();
       }
     });
-    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, { clash: (docId, version) => pc.folder.noteClashed(docId, version) });
+    const replica = new RoomReplica(node, roomId, { sign: device.sign, agree: device.agree }, {
+      clash: (docId, version) => {
+        if (process.env.FUZZ_TRACE) console.log(`[${name}] clash ${docId.slice(1, 5)} ${version}`);
+        return pc.folder.noteClashed(docId, version);
+      }
+    });
     const vault = new MemoryVault();
     const saved: { state: RoomFolderState | null; saves: unknown } = { state: null, saves: null };
     const folder = new RoomFolder({
@@ -76,7 +87,7 @@ async function start() {
       saveState: async (state) => void (saved.state = structuredClone(state)),
       loadSaves: async () => saved.saves,
       saveSaves: async (saves) => void (saved.saves = structuredClone(saves)),
-      notify: () => {},
+      notify: (message) => process.env.FUZZ_TRACE && console.log(`[${name}] notice: ${message}`),
       confirmDeletions: async () => true,
       log: (message) => process.env.FUZZ_TRACE && console.log(`[${name}] ${message}`),
       now: () => new Date("2026-10-26T12:30:00Z")
@@ -251,7 +262,7 @@ async function run(seed: number): Promise<void> {
   const kept = pcs.flatMap((pc) => files(pc).map((path) => pc.vault.text(`Team/${path}`)!));
   for (const tag of names.keys()) {
     if (dropped.has(tag)) continue;
-    expect(kept.some((text) => text.startsWith(`${tag}\n`)), `${context()}: "${tag}" was lost`).toBe(true);
+    expect(kept.some((text) => text.startsWith(`${tag}\n`)), `${context()}: "${tag}" was lost (Ana: ${dump(a)} | Cy: ${dump(c)})`).toBe(true);
   }
 }
 
