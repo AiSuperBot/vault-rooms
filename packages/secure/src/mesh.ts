@@ -935,9 +935,11 @@ export class PeerSession {
       case "versions": {
         // Only after such a hello, and only versions that extend our record, each message as it comes (a branch that
         // would replace part of it comes from members alone); anything else ends the session.
-        if (!this.earlyHello) return this.close("not_a_member");
-        if (!Array.isArray(message.versions) || message.versions.some((version) => parseSignedVersion(version).body.v === 0)) return this.close("not_a_member");
-        const result = this.offer(message, true);
+        if (!this.earlyHello || !Array.isArray(message.versions)) return this.close("not_a_member");
+        // Parsed once (a message can be 16 MiB); a first version of all among them (parseVersions leaves it out) ends it.
+        const versions = this.parseVersions(message.versions);
+        if (versions.length !== message.versions.length) return this.close("not_a_member");
+        const result = this.offer(message, true, versions);
         if (this.branch) return;
         if (!result || (result.status !== "appended" && result.status !== "duplicate")) return this.close("not_a_member");
         break;
@@ -1020,8 +1022,7 @@ export class PeerSession {
     return raw.map(parseSignedVersion).filter((version) => version.body.v > 0);
   }
 
-  private offer(message: Record<string, unknown>, appendOnly = false): OfferResult | undefined {
-    const versions = this.parseVersions(message.versions);
+  private offer(message: Record<string, unknown>, appendOnly = false, versions = this.parseVersions(message.versions)): OfferResult | undefined {
     if (versions.length === 0) return;
     let complete = versions;
     if (message.end !== undefined || message.hash !== undefined) {
