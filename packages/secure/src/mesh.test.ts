@@ -1063,6 +1063,20 @@ describe("mesh", () => {
     }
   });
 
+  it("keeps a join whose inviter stopped being an admin waiting, so it counts again once they are one again", () => {
+    const { chain, ana, ben } = setup();
+    step(chain, ana, (state) => void (state.users[ben.userId]!.admin = true));
+    const { join, joiner } = invite(chain, ben, { userName: "Joy", fold: false });
+    const node = nodeFor(chain, ana);
+    node.addJoin(join);
+    expect(activeDevice(node.effective(), joiner.id)).not.toBeNull();
+    const admin = (yes: boolean) => node.offerVersions([nextVersion(chain.workspaceId, node.chain.head, ana.sign, (state) => void (state.users[ben.userId]!.admin = yes))]);
+    admin(false);
+    expect(activeDevice(node.effective(), joiner.id)).toBeNull();
+    admin(true);
+    expect(activeDevice(node.effective(), joiner.id)).not.toBeNull();
+  });
+
   it("doesn't send its record to a peer 64 or more versions ahead, which holds all of it, and catches up from it", () => {
     const { chain, ana, cy } = setup();
     const base = chain.length;

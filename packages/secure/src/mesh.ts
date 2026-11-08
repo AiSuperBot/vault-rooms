@@ -308,7 +308,8 @@ export class MeshNode {
         verifyJoinRecord(this.chain.state, this.workspaceId, entry.join, entry.firstSeen);
         this.keepJoin(hash, entry);
       } catch (error) {
-        if (error instanceof SecureError && error.code === "join_no_invite") this.pendingJoins.set(hash, entry);
+        // Kept for later too when the invite's creator lost standing: the invite works again if they get it back.
+        if (error instanceof SecureError && (error.code === "join_no_invite" || error.code === "join_creator")) this.pendingJoins.set(hash, entry);
       }
     }
     this.effectiveCache = null;
