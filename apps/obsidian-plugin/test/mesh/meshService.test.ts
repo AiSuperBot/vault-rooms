@@ -37,6 +37,49 @@ async function started(service: MeshService): Promise<MeshService> {
   return service;
 }
 
+describe("mesh service, clean-up", () => {
+  it("drops an attachment version no file uses after a week only, never one in use, and fetches one needed again", async () => {
+    const svc = await MeshService.create(deps("Blobs"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
+    services.push(svc);
+    const roomId = await svc.createRoom("Files");
+    const replica = svc.replica(roomId)!;
+    const used = replica.putBlob(new TextEncoder().encode("in use"));
+    const old = replica.putBlob(new TextEncoder().encode("an older version"));
+    replica.editIndex((files) => files.set(secure.randomId("f"), { path: "a.png", kind: "bin", blob: used }));
+    const store = svc.node.store;
+    const collect = () => (svc as unknown as { collectBlobs(): void }).collectBlobs();
+    collect();
+    expect(store.blobKeys(roomId)).toHaveLength(2);
+    const real = Date.now();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(real + 8 * 86_400_000);
+    try {
+      collect();
+      expect(store.blobKeys(roomId)).toEqual([`${used.by}/${used.id}`]);
+      // A file names the dropped version again: it is asked for again.
+      const resync = vi.spyOn(svc.node, "resync");
+      replica.editIndex((files) => files.set(secure.randomId("f"), { path: "b.png", kind: "bin", blob: old }));
+      collect();
+      expect(store.gone(roomId).map(([key]) => key)).not.toContain(`${old.by}/${old.id}`);
+      expect(resync).toHaveBeenCalled();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("withdraws an invite expired by the record's clock, and no other", async () => {
+    const svc = await MeshService.create(deps("Expiry"), { workspaceName: "Team", userName: "Ana", deviceName: "PC" });
+    services.push(svc);
+    await svc.createInvite({}, 1);
+    const expired = secure.newInvite({ user: svc.me.userId, device: svc.me.deviceId }, {}, Date.now() - secure.JOIN_EXPIRY_SLACK_MS - 60_000);
+    await (svc as unknown as { commit(change: (state: WorkspaceState) => void): Promise<unknown> }).commit((state) => void (state.invites[expired.inviteId] = expired.record));
+    expect(Object.keys(svc.node.chain.state.invites)).toHaveLength(2);
+    await (svc as unknown as { withdrawExpiredInvites(): Promise<void> }).withdrawExpiredInvites();
+    const left = Object.keys(svc.node.chain.state.invites);
+    expect(left).toHaveLength(1);
+    expect(left).not.toContain(expired.inviteId);
+  });
+});
+
 describe("mesh service", () => {
   it.each(["userName", "deviceName"] as const)("does not persist an invalid %s, and accepts the corrected join", async (field) => {
     const host = await started(await MeshService.create(deps("NameHost"), { workspaceName: "Team", userName: "Host", deviceName: "PC" }));
