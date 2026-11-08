@@ -1043,6 +1043,10 @@ describe("room replica", () => {
     const going = a.replica.passOnOldWork(true, writes);
     // Nothing yet: it goes on in turns of its own.
     expect(passed()).toBe(0);
+    // Meanwhile idle notes are let go as ever, not all held until the last one is passed on (only the index stays).
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    a.replica.releaseIdle(0, () => false);
+    expect((a.replica as unknown as { docs: Map<string, unknown> }).docs.size).toBe(1);
     await going;
     expect(passed()).toBe(25);
     expect(most).toBe(1);

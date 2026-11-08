@@ -391,7 +391,6 @@ export class RoomReplica {
    * memory: updates waiting for what they build on or for a key, edits waiting to be sent, a clash being worked out.
    */
   releaseIdle(idleMs: number, keep: (docId: DocId) => boolean): void {
-    if (this.passingOn) return;
     const now = Date.now();
     // Many loaded at once (a catch-up loads a whole room: hundreds of MB): let go of them sooner, though not at once (a
     // note others type in would be read again whole for each of their keystrokes).
