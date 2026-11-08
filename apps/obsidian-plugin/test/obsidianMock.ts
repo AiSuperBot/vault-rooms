@@ -19,3 +19,18 @@ export class TFile {
 export class TFolder {
   constructor(readonly path: string) {}
 }
+
+/** Obsidian's searchable list: what it offers, each item's text, and what is chosen. */
+export class FuzzySuggestModal<T> {
+  constructor(readonly app?: unknown) {}
+  setPlaceholder(_text: string): void {}
+  open(): void {}
+  close(): void {}
+  getItems(): T[] {
+    return [];
+  }
+  getItemText(_item: T): string {
+    return "";
+  }
+  onChooseItem(_item: T): void {}
+}

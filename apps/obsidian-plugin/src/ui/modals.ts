@@ -1,4 +1,4 @@
-import { App, Modal, Notice, Setting, TFolder } from "obsidian";
+import { App, FuzzySuggestModal, Modal, Notice, Setting, TFolder } from "obsidian";
 import { cleanName, parseInviteLink, ROLES, roleIn, type Role } from "@vault-rooms/secure";
 import type VaultRoomsPlugin from "../plugin.js";
 import { personLabel } from "./labels.js";
@@ -203,6 +203,30 @@ export class InviteModal extends Modal {
   }
 }
 
+/** The folders that can be shared, searched by what is typed. */
+class FolderPicker extends FuzzySuggestModal<string> {
+  constructor(
+    app: App,
+    private readonly folders: string[],
+    private readonly chosen: (folder: string) => void
+  ) {
+    super(app);
+    this.setPlaceholder("Type part of the folder's name");
+  }
+
+  getItems(): string[] {
+    return this.folders;
+  }
+
+  getItemText(folder: string): string {
+    return folder;
+  }
+
+  onChooseItem(folder: string): void {
+    this.chosen(folder);
+  }
+}
+
 export class NewRoomModal extends Modal {
   constructor(private readonly plugin: VaultRoomsPlugin) {
     super(plugin.app);
@@ -224,14 +248,18 @@ export class NewRoomModal extends Modal {
     const values = { folder: folders[0] ?? "", name: folders[0]?.split("/").pop() ?? "" };
     this.contentEl.createEl("p", { text: "Everything in the folder is shared, end-to-end encrypted, with the people you add. You manage the room; add people under Members afterwards." });
     let nameField: { setValue(value: string): unknown } | null = null;
-    new Setting(this.contentEl).setName("Folder").addDropdown((dropdown) => {
-      for (const path of folders) dropdown.addOption(path, path);
-      dropdown.setValue(values.folder).onChange((value) => {
-        values.folder = value;
-        values.name = value.split("/").pop() ?? value;
-        nameField?.setValue(values.name);
-      });
-    });
+    // Found by typing part of its name: a vault can hold thousands of folders, too many for a list to scroll.
+    const folder = new Setting(this.contentEl).setName("Folder").setDesc(values.folder);
+    folder.addButton((button) =>
+      button.setButtonText("Choose…").onClick(() =>
+        new FolderPicker(this.app, folders, (path) => {
+          values.folder = path;
+          values.name = path.split("/").pop() ?? path;
+          folder.setDesc(path);
+          nameField?.setValue(values.name);
+        }).open()
+      )
+    );
     new Setting(this.contentEl).setName("Room name").addText((text) => {
       nameField = text;
       text.setValue(values.name).onChange((value) => (values.name = cleanName(value)));

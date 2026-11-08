@@ -12,7 +12,8 @@ vi.mock("obsidian", async (original) => {
   };
 });
 
-import { LinkModal, MembersModal } from "../../src/ui/modals.js";
+import { FuzzySuggestModal, TFolder } from "obsidian";
+import { LinkModal, MembersModal, NewRoomModal } from "../../src/ui/modals.js";
 import { RoomsView } from "../../src/ui/roomsView.js";
 import { errorText, pendingAction } from "../../src/ui/actions.js";
 import { refusalText } from "../../src/mesh/meshService.js";
@@ -139,6 +140,22 @@ describe("reported UI and folder-lifecycle regressions", () => {
     expect(action).toHaveBeenCalledTimes(1);
     resolve(); await pending;
     expect(component.setDisabled).toHaveBeenLastCalledWith(false);
+  });
+
+  it("finds the folder to share by searching, and names the room after it", async () => {
+    let picker: any;
+    vi.spyOn(FuzzySuggestModal.prototype, "open").mockImplementation(function (this: unknown) { picker = this; });
+    const Folder = TFolder as unknown as new (path: string) => TFolder;
+    const folders = ["Notes", "Projects/Alpha", ".hidden"].map((path) => new Folder(path));
+    const plugin: any = { app: { vault: { getAllLoadedFiles: () => folders } }, folderProblem: (path: string) => (path.startsWith(".") ? "no" : null), createRoom: vi.fn(async () => "r1") };
+    const modal = new NewRoomModal(plugin);
+    modal.open();
+    const button = (text: string) => (modal.contentEl as unknown as UiElement).querySelectorAll("button").find((element) => element.textContent === text)!;
+    await button("Choose…").click();
+    expect(picker.getItems()).toEqual(["Notes", "Projects/Alpha"]);
+    picker.onChooseItem("Projects/Alpha");
+    await button("Share folder").click();
+    expect(plugin.createRoom).toHaveBeenCalledWith("Projects/Alpha", "Alpha");
   });
 
   it("keeps the folder of a room this computer lost access to from being shared into another room", () => {
