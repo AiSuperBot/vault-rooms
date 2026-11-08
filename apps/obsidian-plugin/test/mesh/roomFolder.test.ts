@@ -389,6 +389,25 @@ describe("reported file regressions", () => {
     expect(a.folder.health().heldBack).toEqual([]);
   });
 
+  it("puts back, and says so, a deletion or a rename the room refuses, and holds back an attachment it refuses", async () => {
+    const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
+    await s.settle();
+    // The room's storage is full: every change of its index is refused.
+    const edit = vi.spyOn(a.replica, "editIndex").mockReturnValue("refused");
+    await a.vault.trash("Team/gone.md");
+    await a.vault.rename("Team/named.md", "Team/renamed.md");
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([4, 5, 6]));
+    await s.settle();
+    edit.mockRestore();
+    expect(a.vault.text("Team/gone.md")).toBe("one\n");
+    expect(a.vault.text("Team/named.md")).toBe("two\n");
+    expect(a.vault.files.has("Team/renamed.md")).toBe(false);
+    expect(a.folder.health().heldBack).toEqual(["pic.png"]);
+    expect(a.notices.some((message) => message.includes("storage may be full"))).toBe(true);
+    expect([...c.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["gone.md", "named.md", "pic.png"]);
+  });
+
   it("keeps passes small: one note's pass skips the file list, unchanged notes aren't hashed, unchanged state isn't saved", async () => {
     const files = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`n${i}.md`, `note ${i}`]));
     const { s, a, c } = await pair(files);
