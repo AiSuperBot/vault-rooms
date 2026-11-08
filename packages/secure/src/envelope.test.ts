@@ -188,6 +188,7 @@ describe("envelope store", () => {
       () => store.add(snapshot),
       () => store.compact(roomId, doc, [update], { [writer.id]: 1 }),
       () => store.restoreMarks(roomId, randomId("f"), { [writer.id]: 3 }, {}),
+      () => store.restoreMarks(roomId, doc, { [admin.id]: 4 }, {}),
       () => store.dropBlobs(roomId, [`${writer.id}/${blob.id}`]),
       () => store.undrop(roomId, `${writer.id}/${blob.id}`),
       // Refused for room (the room full): its document is listed all the same.
@@ -206,11 +207,17 @@ describe("envelope store", () => {
       });
       return b64u(hashTagged("room-digest", utf8(canonicalJson({ docs, blobs: store.blobKeys(roomId) }))));
     };
+    const held = () => [...((store as unknown as { docsByRoom: Map<string, Map<string, unknown>> }).docsByRoom.get(roomId)?.keys() ?? [])].sort();
     for (const step of steps) {
       store.digest(roomId);
+      store.summaryOf(roomId, doc);
+      store.docs(roomId);
       step();
       expect(store.digest(roomId)).toBe(fresh());
       expect(store.digest(roomId)).toBe(original());
+      // The document list and the document's part of the room summary are kept only while they hold.
+      expect(store.docs(roomId)).toEqual(held());
+      expect(store.summaryOf(roomId, doc).part).toEqual({ vv: store.vv(roomId, doc), snaps: [...store.snapshotKeys(roomId, doc), ...store.droppedSnapshotKeys(roomId, doc)] });
     }
   });
 });

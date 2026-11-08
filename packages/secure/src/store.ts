@@ -46,6 +46,8 @@ interface DocEntry {
   fingerprint?: string;
   /** Its part of the room's digest, its encoding kept (see computeDigest): cleared with the fingerprint. */
   digestPart?: readonly unknown[];
+  /** Its part of the room summary, and that part's size (see summaryOf): cleared whenever its vector or snapshots may change. */
+  summary?: { part: { vv: VersionVector; snaps: string[] }; bytes: number };
   /** Envelopes added to it so far (see addsOf). */
   adds: number;
 }
@@ -155,6 +157,7 @@ export class EnvelopeStore {
     let entry = docs.get(doc);
     if (!entry) {
       docs.set(doc, (entry = { updates: new Map(), snapshots: new Map(), marks: {}, claimed: {}, dropped: {}, gone: {}, adds: 0 }));
+      this.docLists.delete(room);
       this.touch(room);
     }
     return entry;
@@ -192,7 +195,7 @@ export class EnvelopeStore {
     }
     this.docBytes.set(env.room, bytes + env.ct.length);
     this.signatures.set(key, env.sig);
-    entry.fingerprint = entry.digestPart = undefined;
+    entry.fingerprint = entry.digestPart = entry.summary = undefined;
     entry.adds++;
     this.touch(env.room);
     this.listener.added?.(env);
@@ -216,6 +219,7 @@ export class EnvelopeStore {
     }
     for (const kept of entry.snapshots.values()) if (kept !== snapshot && kept.author === author && vvDominates(snapshot.covers, kept.covers)) remove.push(kept);
     if (!raised && remove.length === 0) return;
+    entry.summary = undefined;
     this.touch(room);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
@@ -241,6 +245,7 @@ export class EnvelopeStore {
       list.push([env.clock, env.clock]);
     }
     for (const [author, list] of above) entry.gone[author] = mergeRanges(list, entry.marks[author] ?? 0);
+    entry.summary = undefined;
     this.touch(room);
     this.removeFrom(room, entry, remove);
     this.listener.docChanged?.(room, doc);
@@ -250,7 +255,7 @@ export class EnvelopeStore {
     for (const env of envs) {
       const key = envelopeKey(env);
       if (env.k === "b" || this.signatures.get(key) !== env.sig) continue;
-      entry.fingerprint = entry.digestPart = undefined;
+      entry.fingerprint = entry.digestPart = entry.summary = undefined;
       if (env.k === "u") {
         const byClock = entry.updates.get(env.author);
         byClock?.delete(env.clock);
@@ -268,6 +273,7 @@ export class EnvelopeStore {
     for (const [doc, entry] of this.docsByRoom.get(room) ?? []) {
       if (Object.keys(entry.claimed).length === 0) continue;
       entry.claimed = {};
+      entry.summary = undefined;
       this.touch(room);
       this.listener.docChanged?.(room, doc);
     }
@@ -295,6 +301,7 @@ export class EnvelopeStore {
   /** Put saved marks back (loading from disk). */
   restoreMarks(room: string, doc: DocId, marks: VersionVector, claimed: VersionVector, dropped: VersionVector = {}, gone: Record<string, Array<[number, number]>> = {}): void {
     const entry = this.entry(room, doc);
+    entry.summary = undefined;
     this.touch(room);
     for (const [author, clock] of Object.entries(marks)) entry.marks[author] = Math.max(entry.marks[author] ?? 0, clock);
     for (const [author, clock] of Object.entries(claimed)) entry.claimed[author] = Math.max(entry.claimed[author] ?? 0, clock);
@@ -302,8 +309,27 @@ export class EnvelopeStore {
     for (const [author, ranges] of Object.entries(gone)) entry.gone[author] = mergeRanges([...(entry.gone[author] ?? []), ...ranges], entry.marks[author] ?? 0);
   }
 
-  docs(room: string): DocId[] {
-    return [...(this.docsByRoom.get(room)?.keys() ?? [])].sort();
+  /** A room's document ids, sorted: kept until a document is added (comparisons and passes ask for it often). */
+  docs(room: string): readonly DocId[] {
+    let list = this.docLists.get(room);
+    if (!list) this.docLists.set(room, (list = Object.freeze([...(this.docsByRoom.get(room)?.keys() ?? [])].sort())));
+    return list;
+  }
+
+  private docLists = new Map<string, readonly DocId[]>();
+
+  /**
+   * A document's part of the room summary peers compare against (see PeerSession.sendRoom), and its size there: built
+   * again only once the document changed, not for every comparison of a room someone types in.
+   */
+  summaryOf(room: string, doc: DocId): { part: { vv: VersionVector; snaps: string[] }; bytes: number } {
+    const entry = this.docsByRoom.get(room)?.get(doc);
+    if (entry?.summary) return entry.summary;
+    // Snapshots dropped here count as held: a peer that keeps one (a relay) doesn't send it at every comparison.
+    const part = { vv: this.vv(room, doc), snaps: [...this.snapshotKeys(room, doc), ...this.droppedSnapshotKeys(room, doc)].slice(0, 100) };
+    const summary = { part, bytes: Buffer.byteLength(JSON.stringify({ [doc]: part }), "utf8") + 1 };
+    if (entry) entry.summary = summary;
+    return summary;
   }
 
   private vvOf(entry: DocEntry): VersionVector {
@@ -357,9 +383,17 @@ export class EnvelopeStore {
     return { snapshots: [...entry.snapshots.values()], updates };
   }
 
-  /** Updates a peer that holds `theirs` lacks (snapshots go by key, see the room summary). */
+  /** Updates a peer that holds `theirs` lacks, in clock order per author (snapshots go by key, see the room summary). */
   missingFor(room: string, doc: DocId, theirs: VersionVector): UpdateEnvelope[] {
-    return this.envelopesOf(room, doc).updates.filter((u) => u.clock > (theirs[u.author] ?? 0));
+    const out: UpdateEnvelope[] = [];
+    // Only what is missing is copied and sorted: usually nothing of a document of many.
+    for (const [author, byClock] of this.docsByRoom.get(room)?.get(doc)?.updates ?? []) {
+      const from = theirs[author] ?? 0;
+      const missing: UpdateEnvelope[] = [];
+      for (const update of byClock.values()) if (update.clock > from) missing.push(update);
+      for (const update of missing.sort((a, b) => a.clock - b.clock)) out.push(update);
+    }
+    return out;
   }
 
   snapshotKeys(room: string, doc: DocId): string[] {
