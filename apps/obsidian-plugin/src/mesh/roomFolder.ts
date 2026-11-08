@@ -1203,10 +1203,9 @@ export class RoomFolder {
     let done = await this.keepClashCopies();
     for (const path of [...this.retryWrites]) {
       this.retryWrites.delete(path);
-      if (!(await this.safely(path.slice(this.prefix.length), () => this.localWrite(path)))) {
-        this.retryWrites.add(path);
-        done = false;
-      }
+      if (!(await this.safely(path.slice(this.prefix.length), () => this.localWrite(path)))) this.retryWrites.add(path);
+      // Failed, or put back to wait (see localWrite): not done, so the retries keep backing off.
+      if (this.retryWrites.has(path)) done = false;
     }
     const replica = this.o.replica;
     // Built anew by a whole pass, and whenever the index changed: a pass for one note doesn't go over every file.
@@ -1394,6 +1393,12 @@ export class RoomFolder {
     // Not under its new name here yet (another file in the way couldn't be moved or trashed): what is at the new name
     // isn't this file, and is never taken for it. The renames are tried again.
     if (known && known.path !== entry.path && this.o.vault.stat(this.vaultPath(known.path))) return;
+    // Its own file is on the move (a rename of it still to be handled, see inFlight): what stands at its name, if
+    // anything, is another file. Waits with the work held for pending deletions, resumed once that rename placed it.
+    if (this.inFlight(id, path)) {
+      this.waitingForDeletions.add(id);
+      return;
+    }
     // The same file spelled otherwise here (see idAt): given the shared spelling first, so it is read and written as
     // itself, not kept aside as someone else's or written again next to itself.
     if (!this.o.vault.stat(path)) {
@@ -1438,9 +1443,8 @@ export class RoomFolder {
     if (stat && !(await this.fitsBeforeRead(entry.path, entry.kind === "md", id))) return;
     if (!stat) {
       // Deletions are pending here (Explorer moving the folder away, file by file, say): nothing is put back into it
-      // meanwhile, so the folder can go; looked at again once they are settled (see resumeWrites). Nor is a file
-      // renamed away by a rename not handled yet: that puts it under its new name, or back.
-      if (this.deletions.size > 0 || this.askingAboutDeletions || this.inFlight(id, path)) {
+      // meanwhile, so the folder can go; looked at again once they are settled (see resumeWrites).
+      if (this.deletions.size > 0 || this.askingAboutDeletions) {
         this.waitingForDeletions.add(id);
         return;
       }
@@ -2144,9 +2148,18 @@ export class RoomFolder {
             // Moved on meanwhile (renamed again, or deleted): that event comes next, and is taken for this file.
             if (!this.o.vault.stat(newVaultPath)) return void this.movedOn.set(newVaultPath, id);
             // Anything else in the way (the disk): the file is tracked where it stands, so a new file at its old name is
-            // one of its own, and the next pass moves it back. (At a name no room can have it isn't tracked: as before.)
+            // one of its own, and a pass moves it back (tried again while the disk refuses, shown failing meanwhile).
+            // At a name no room can have it isn't tracked: as before.
             const stayPut = (failure: unknown): never => {
-              if (to !== null && this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to });
+              if (to !== null) {
+                if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to });
+                else if (this.queuedEntries.has(id)) {
+                  this.dropQueued(id);
+                  this.queuedEntries.set(id, to);
+                  this.queuedPaths.set(to, id);
+                }
+                this.remoteChanged(INDEX_DOC);
+              }
               throw failure;
             };
             // Its old name taken meanwhile (a new file made there, as the disk sees names: a Windows or macOS disk doesn't
@@ -2165,11 +2178,12 @@ export class RoomFolder {
               this.moving.delete(mark);
               stayPut(asideError);
             }
+            let refused = false;
             if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: aside });
             else if (this.queuedEntries.has(id)) {
               // Its entry waits for the room key: it goes out under the kept name (as a rename of one does, see below).
               const entry = this.o.replica.entry(id);
-              if (entry && !entry.deleted && this.o.replica.canWrite() && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside })) === "refused") this.quietNotice(`"${aside}" couldn't be renamed for everyone (the room's storage may be full), so it is shared under its old name.`);
+              refused = entry !== undefined && !entry.deleted && this.o.replica.canWrite() && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside })) === "refused";
               this.dropQueued(id);
               this.queuedEntries.set(id, aside);
               this.queuedPaths.set(aside, id);
@@ -2179,7 +2193,7 @@ export class RoomFolder {
             // (nothing lost, but a notice of a clash that wasn't); handle if users meet it.
             this.remoteChanged(INDEX_DOC);
             // Told in full (the one before it, on the refused rename, would silence a quiet one): the user must find it.
-            this.o.notify(`A new file took the name of "${from}" meanwhile: the shared file is kept here as "${aside}".`);
+            this.o.notify(`A new file took the name of "${from}" meanwhile: the shared file is kept here as "${aside}"${refused ? " (it couldn't be renamed for everyone: the room's storage may be full)" : ""}.`);
           }
         };
         if (unusable) {
