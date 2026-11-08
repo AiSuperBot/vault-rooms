@@ -359,6 +359,35 @@ describe("TLS transport", () => {
     await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_unreachable", message: expect.stringMatching(/could not join/) });
   });
 
+  it("doesn't take one computer closing a second connection to it for a refusal", async () => {
+    const w = await world();
+    const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);
+    // Two addresses of one computer (a network's and a VPN's, say): it closes the second connection, and the one it
+    // kept turns out not to be of this workspace. Nothing refused the invite.
+    const sockets: tls.TLSSocket[] = [];
+    const servers = [300, 600].map((ms) =>
+      tls.createServer({ key: w.tlsC.keyPem, cert: w.tlsC.certPem, minVersion: "TLSv1.3" }, (socket) => {
+        sockets.push(socket);
+        socket.once("data", () => {
+          socket.write(encodeFrame({ t: "auth_ok", device: w.cy.id, sig: b64u(new Uint8Array(64)) }));
+          setTimeout(() => (ms === 300 ? socket.end() : socket.write(encodeFrame({ t: "hello", ws: `w${"x".repeat(43)}`, head: 0 }))), ms);
+        });
+      })
+    );
+    for (const server of servers) await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    cleanups.push(async () => {
+      for (const socket of sockets) socket.destroy();
+      for (const server of servers) await new Promise((resolve) => server.close(resolve));
+    });
+    const peers = servers.map((server) => `127.0.0.1:${(server.address() as { port: number }).port}`);
+    const link = { workspaceId: w.ws, inviteId: fresh.inviteId, secret: fresh.secret, peers };
+    await expect(joinWorkspace({ invite: link, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_unreachable" });
+    // A computer of the workspace that turns the link away on both connections refuses it all the same.
+    const a = await peer(w.chain, w.ana, w.tlsA);
+    const twice = { ...link, peers: [`127.0.0.1:${a.port}`, `127.0.0.1:${a.port}`] };
+    await expect(joinWorkspace({ invite: twice, userName: "Eve", deviceName: "Eve", deviceKey: newSigningKeyPair(), agreementKey: w.cy.agree, tls: await createTlsIdentity(), newUserId: randomId("u") })).rejects.toMatchObject({ code: "join_refused" });
+  });
+
   it("tells a link no computer answered for from one that was refused", async () => {
     const w = await world();
     const fresh = newInvite({ user: w.ana.userId, device: w.ana.id }, {}, Date.now() + 3_600_000);

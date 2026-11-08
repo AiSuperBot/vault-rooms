@@ -312,7 +312,11 @@ export async function joinWorkspace(input: {
       link = null;
       first();
     } catch (error) {
-      if (dialed && (error as Error).message === "socket_closed") refused = true;
+      // A computer we have another connection to (at another of its addresses) closing this one keeps the other: no
+      // refusal, unless the other is closed too.
+      const closedBy = link?.remoteDevice;
+      const another = [...open].some((other) => other !== link && other.remoteDevice === closedBy);
+      if (dialed && !another && (error as Error).message === "socket_closed") refused = true;
       errors.push(`${address.host}:${address.port} ${(error as Error).message}`);
     } finally {
       // Only the connection that worked is kept (for the first session).
