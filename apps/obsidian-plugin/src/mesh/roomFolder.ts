@@ -1817,8 +1817,7 @@ export class RoomFolder {
     this.dropQueued(id);
     if (!this.o.replica.canWrite()) {
       this.quietNotice(`You can only read this room, so "${relative}" was put back.`);
-      this.dirty.add(id);
-      return this.materializeNow();
+      return this.remoteChanged(id);
     }
     return this.shareDeletion(id, relative);
   }
@@ -1826,13 +1825,13 @@ export class RoomFolder {
   /**
    * A file deleted here, or moved out of the room: deleted for everyone. Refused (the room's storage full, say), the
    * shared version is written back and the user told, rather than the file coming back unannounced at a later pass.
+   * Written back by a pass queued after this, not run now: a rename onto its name may be half done (see onLocalRename).
    */
-  private shareDeletion(id: string, relative: string): Promise<void> | void {
+  private shareDeletion(id: string, relative: string): void {
     const entry = this.o.replica.entry(id);
     if (entry && !entry.deleted && this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true })) === "refused") {
       this.quietNotice(`"${relative}" couldn't be taken out of the room for everyone (its storage may be full), so it was put back.`);
-      this.dirty.add(id);
-      return this.materializeNow();
+      return this.remoteChanged(id);
     }
     this.saveSoon();
   }
@@ -1902,10 +1901,7 @@ export class RoomFolder {
       if (id) {
         this.forget(id);
         this.dropQueued(id);
-        if (!this.o.replica.canWrite()) {
-          this.dirty.add(id);
-          return this.materializeNow();
-        }
+        if (!this.o.replica.canWrite()) return this.remoteChanged(id);
         return this.shareDeletion(id, from!);
       }
       if (to !== null && !this.idAt(to)) {
