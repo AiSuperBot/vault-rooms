@@ -1502,8 +1502,11 @@ export class RoomFolder {
     // the user's version of it, unless the shared text moved on since the note was queued (someone's edit came in):
     // then, as for any file changed on both sides, theirs wins and the user's version is kept aside.
     if (!known && this.queuedEntries.get(id) === entry.path) {
+      // Judged against the baseline only once this computer's own text is out: reloaded before that (its first
+      // publish refused, say), the note is empty, and the file is all there is of it.
       const base = this.queuedHashes.get(id);
-      if (base === undefined || remoteHash === base) return this.localChanged(id, entry, local, localHash);
+      const out = replica.ownUpdateKey(id) !== null;
+      if (base === undefined || !out || remoteHash === base) return this.localChanged(id, entry, local, localHash);
       if (localHash !== base) await this.keepAside(entry.path, local);
       return this.write(id, entry, remote, remoteHash, localHash, content);
     }
@@ -1859,6 +1862,9 @@ export class RoomFolder {
     // In doubt whether the others ever had what was made here last time: a pass settles it with the shared copy.
     if (this.doubtful(id)) return;
     const known = this.known.get(id);
+    // Changed again after it was held back: looked at afresh.
+    const held = this.heldBack.get(id);
+    if (held !== undefined && held !== hash && this.heldBack.delete(id)) this.o.heldBackChanged?.();
     // A new note whose entry still waits for the room key: the edit waits with it.
     if (!known) {
       // Its entry waits for the room key, the file where a refused rename left it (see stayPut): remembered there,
@@ -1872,9 +1878,6 @@ export class RoomFolder {
       if (where !== entry) this.remoteChanged(INDEX_DOC);
       return;
     }
-    // Changed again after it was held back: looked at afresh.
-    const held = this.heldBack.get(id);
-    if (held !== undefined && held !== hash && this.heldBack.delete(id)) this.o.heldBackChanged?.();
     if (hash === known.hash) return this.remember(id, relative, hash, known.blob ? { id: known.blob, by: known.mine ? this.o.replica.deviceId : "" } : undefined);
     // An editor owns the note while bound (its edits already went into the shared text): remember what is on disk. Not
     // while its edits wait for the room's newest key (held in memory only, and maybe refused then): they still count as

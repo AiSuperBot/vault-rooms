@@ -1894,6 +1894,59 @@ describe("reported file regressions", () => {
     }
   });
 
+  it("doesn't empty a key-waiting note's file when its text was dropped from the note before it went out and the user tries again", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    // What the plugin does when the note's publish is refused (the room full): held back, and its note reloaded from
+    // the store, which holds nothing of it yet.
+    c.folder.holdBackNote(x);
+    c.replica.reload(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    // "Try again now": the file is all there is of the note, so it is shared, not written over with the empty note.
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.md")).toBe("the note\n");
+    expect(c.replica.noteText(x)).toBe("the note\n");
+    expect(a.vault.text("Team/New.md")).toBe("the note\n");
+  });
+
+  it("lets a key-waiting note held back for its size go again once saved small, so edits flow both ways afterwards", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // Saved over the size a note may have (held back), then small again.
+    await c.vault.writeText("Team/New.md", "x".repeat((6 << 20) + 1));
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\nmore\n");
+    await s.settle();
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    expect(a.vault.text("Team/New.md")).toBe("the note\nmore\n");
+    // The hold is gone with the small save: Ana's edit reaches Cy's file, and Cy's next edit reaches Ana.
+    await a.vault.writeText("Team/New.md", "the note\nmore\nAna\n");
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.md")).toBe("the note\nmore\nAna\n");
+    await c.vault.writeText("Team/New.md", "the note\nmore\nAna\nCy\n");
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\nmore\nAna\nCy\n");
+  });
+
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
     const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
     await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
