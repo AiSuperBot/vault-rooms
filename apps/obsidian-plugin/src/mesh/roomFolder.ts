@@ -399,6 +399,8 @@ export class RoomFolder {
   /** Notes whose new entry had to wait for the room key, by file id: their path. Remembered (when shared) as entries made here. */
   private queuedEntries = new Map<string, string>();
   private queuedPaths = new Map<string, string>();
+  /** The text a note waiting for the room key last had here (by hash): once it is out, what the shared text and the file are judged against. */
+  private queuedHashes = new Map<string, string>();
   private needsAdopt = false;
   /** What was last synced is loaded: decisions can be made. */
   private started = false;
@@ -497,6 +499,7 @@ export class RoomFolder {
     this.unindex(id);
     this.incomplete.delete(id);
     this.noteWrites.delete(id);
+    this.queuedHashes.delete(id);
     if (this.known.delete(id)) {
       this.stateChanged = true;
       this.changedIds.add(id);
@@ -925,6 +928,7 @@ export class RoomFolder {
     const queuedPath = this.queuedEntries.get(id);
     if (this.queuedEntries.delete(id)) {
       if (queuedPath !== undefined) this.queuedPaths.delete(queuedPath);
+      this.queuedHashes.delete(id);
       pending.index = pending.created = true;
     }
     const unstored = this.unstored(pending);
@@ -1457,15 +1461,15 @@ export class RoomFolder {
       const variant = this.untrackedCaseVariant(entry.path);
       if (variant) await this.moveAside(variant);
       // Its file stands where the user left it while its entry waited for the room key (see stayPut): moved to its
-      // shared name rather than written anew beside it, and read there as the user's version of this note (an edit made
-      // to it meanwhile is taken in, not kept as a clash copy).
+      // shared name rather than written anew beside it, and looked at there by the next pass (below: a differing file
+      // is the user's version, unless the shared text moved on).
       const at = this.queuedEntries.get(id);
       if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at))) {
         await this.move(at, entry.path);
         this.dropQueued(id);
         this.queuedEntries.set(id, entry.path);
         this.queuedPaths.set(entry.path, id);
-        return this.localWrite(path);
+        return this.remoteChanged(id);
       }
       return this.write(id, entry, remote, remoteHash, undefined, content);
     }
@@ -1494,9 +1498,15 @@ export class RoomFolder {
     if (entry.kind === "md" && sha(normalizeNote(replica.noteText(id))) !== remoteHash) return this.remoteChanged(id);
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
-    // A differing file at a key-waiting note's own name is the user's version of it (moved there from where a refused
-    // rename left it, see above), not a stranger's.
-    if (!known && this.queuedEntries.get(id) === entry.path) return this.localChanged(id, entry, local, localHash);
+    // A differing file at a key-waiting note's own name (moved there from where a refused rename left it, see above) is
+    // the user's version of it, unless the shared text moved on since the note was queued (someone's edit came in):
+    // then, as for any file changed on both sides, theirs wins and the user's version is kept aside.
+    if (!known && this.queuedEntries.get(id) === entry.path) {
+      const base = this.queuedHashes.get(id);
+      if (base === undefined || remoteHash === base) return this.localChanged(id, entry, local, localHash);
+      if (localHash !== base) await this.keepAside(entry.path, local);
+      return this.write(id, entry, remote, remoteHash, localHash, content);
+    }
     if (!known || (localHash === known.hash && !doubtful)) {
       // Nothing changed here since the last sync (or a file we never tracked sits at this path): the shared copy wins,
       // but an untracked file with content is kept aside first.
@@ -1658,7 +1668,7 @@ export class RoomFolder {
         // Remembered only once actually shared (a missing key leaves it to the next pass).
         // With what the shared note holds now: the pass after it needn't read the note again.
         if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true, replica.syncedKey(id));
-        else { this.queuedEntries.set(id, relative); this.queuedPaths.set(relative, id); }
+        else { this.queuedEntries.set(id, relative); this.queuedPaths.set(relative, id); this.queuedHashes.set(id, sha(text)); }
       });
       return;
     }
@@ -1727,7 +1737,7 @@ export class RoomFolder {
       if (Buffer.byteLength(local, "utf8") > MAX_NOTE_BYTES) return this.holdBack(id, entry.path, localHash);
       const result = replica.edit(id, (doc) => reconcileYTextByLines(doc.getText("content"), local, "disk"), true);
       if (result === "refused") return this.holdBack(id, entry.path, localHash);
-      if (result === "queued") return;
+      if (result === "queued") return void this.queuedHashes.set(id, localHash);
       this.remember(id, entry.path, localHash);
       return;
     }
@@ -1854,6 +1864,10 @@ export class RoomFolder {
       // Its entry waits for the room key, the file where a refused rename left it (see stayPut): remembered there,
       // and a pass moves it to its shared name.
       const where = relative === entry.path ? entry : { ...entry, path: relative };
+      // The shared text moved on since the note was queued here (someone's edit came in): a pass decides on both.
+      const base = this.queuedHashes.get(id);
+      const replica = this.o.replica;
+      if (base !== undefined && !replica.hasUnsent(id) && (!replica.isComplete(id) || sha(normalizeNote(replica.noteText(id))) !== base)) return this.remoteChanged(id);
       await this.localChanged(id, where, content, hash);
       if (where !== entry) this.remoteChanged(INDEX_DOC);
       return;
