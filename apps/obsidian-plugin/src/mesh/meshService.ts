@@ -1078,13 +1078,13 @@ export class MeshService {
    */
   private async rotateWhereNeeded(): Promise<void> {
     const state = this.state;
+    // The keys held by a device that lost access, looked up once for every room (there can be thousands of wraps).
+    const stale = new Set(this.node.savedWraps().filter(({ body }) => !this.entitled(state, body.room, body.to)).map(({ body }) => `${body.room}/${body.n}/${body.commit}`));
     for (const [roomId, replica] of this.replicas) {
       const room = state.rooms[roomId];
       if (!room || room.deleted || !roleAtLeast(roleIn(state, roomId, this.settings.userId), "write")) continue;
       const n = room.epochs.length;
-      const commit = room.epochs[n - 1]!.commit;
-      const stale = this.node.savedWraps().some((w) => w.body.room === roomId && w.body.n === n && w.body.commit === commit && !this.entitled(state, roomId, w.body.to));
-      if (!stale || !replica.keyFor(n)) continue;
+      if (!stale.has(`${roomId}/${n}/${room.epochs[n - 1]!.commit}`) || !replica.keyFor(n)) continue;
       if (!this.leads(replica)) continue;
       const key = newRoomKey();
       await this.commit(
