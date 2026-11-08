@@ -621,9 +621,10 @@ export class RoomReplica {
       bytes = openEnvelope(env, key);
     } catch {
       // Sealed under a key the record doesn't back (a rotation that lost a race): no one can read it under this record,
-      // and its author sealed what it held again under the right key (see rescue). It holds nothing to wait for.
-      if (env.k === "u" && this.backed(env.n, key)) {
-        this.markApplied(state, env.author, env.clock);
+      // and its author sealed what it held again under the right key (see rescue). It holds nothing to wait for, an
+      // update or a snapshot alike.
+      if (this.backed(env.n, key)) {
+        if (env.k === "u") this.markApplied(state, env.author, env.clock);
         return false;
       }
       // Not with the key held now: tried again when keys change (ours may have lost a race, see checkKeys).
@@ -920,8 +921,8 @@ export class RoomReplica {
       const contains = (env: StoredEnvelope): boolean => {
         const bytes = open(env);
         if (bytes === undefined) return false;
-        // An update the record's key can't open holds nothing (see applyEnvelope): it never blocks compaction.
-        if (bytes === null) return env.k === "u" && this.backed(env.n, this.keys.get(env.n)!);
+        // What the record's key can't open holds nothing (see applyEnvelope): it never blocks compaction, and goes.
+        if (bytes === null) return this.backed(env.n, this.keys.get(env.n)!);
         try {
           return Y.snapshotContainsUpdate(contents, bytes);
         } catch {

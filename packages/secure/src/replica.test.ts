@@ -1195,6 +1195,43 @@ describe("room replica", () => {
     expect(c.replica.noteText(fileId)).toBe("xxxxxStart by Cy");
   });
 
+  it("lets go of a snapshot sealed under a key that lost a race: nothing waits for it, and a later one holding more drops it", () => {
+    const s = setup();
+    const a = s.member(s.ana);
+    const c = s.member(s.cy);
+    s.wrapFor(s.ana);
+    s.wrapFor(s.cy);
+    a.replica.refreshKeys();
+    c.replica.refreshKeys();
+    const link = s.net.link(a.node, c.node);
+    s.net.pump();
+    const fileId = addNote(a.replica, "Plan.md", "Start");
+    s.net.pump();
+    link.cut();
+    // Apart, both start epoch 2 with their own key; Cy writes, and snapshots the note, under hers.
+    const kc = newRoomKey();
+    const ka = newRoomKey();
+    c.node.offerVersions([nextVersion(s.ws, c.node.chain.head, s.cy.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, kc) }))]);
+    c.replica.addOwnKey(2, kc);
+    c.replica.noteDoc(fileId).getText("content").insert(5, " by Cy");
+    const lost = c.replica.snapshot(fileId, true)!;
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, ka) }))]);
+    a.replica.addOwnKey(2, ka);
+    s.net.link(a.node, c.node);
+    s.net.pump();
+    c.replica.refreshKeys();
+    s.wrapFor(s.cy, 2, ka);
+    s.net.pump();
+    expect(a.replica.noteText(fileId)).toBe("Start by Cy");
+    // Nobody can read the lost snapshot under this record: the note doesn't wait for a key for it.
+    expect(a.replica.waitsForKey(fileId)).toBe(false);
+    // Cy's next snapshot holds all the lost one did: it goes, everywhere.
+    expect(c.replica.snapshot(fileId, true)).not.toBeNull();
+    s.net.pump();
+    for (const m of [a, c]) expect(m.node.store.envelopesOf(s.roomId, fileId).snapshots.map(envelopeKey)).not.toContain(envelopeKey(lost));
+    expect(c.replica.noteText(fileId)).toBe("Start by Cy");
+  });
+
   it("refuses an edit it can't share and rebuilds the document without it", () => {
     const s = setup();
     const a = s.member(s.ana);
