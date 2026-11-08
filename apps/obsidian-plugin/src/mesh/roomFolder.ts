@@ -239,6 +239,11 @@ export class RoomFolder {
   private expected = new Map<string, string>();
   /** Moves this folder makes (see move and movingMark), each until its rename event comes. */
   private moving = new Set<string>();
+  /**
+   * Where a file stood (vault path -> id) when its rename was to be put back but it had moved on (renamed again, or
+   * deleted, before the folder got to it): the event for that, which comes next, is taken for the same file.
+   */
+  private movedOn = new Map<string, string>();
   private queue: Promise<void> = Promise.resolve();
   private materializeTimer: ReturnType<typeof setTimeout> | null = null;
   /** A pass is queued and hasn't started: it will see every change made until it does. */
@@ -272,6 +277,9 @@ export class RoomFolder {
   private localNames: Map<string, Set<string>> | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private deleteTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Deletions made here, waiting for DELETE_QUIET_MS (see onLocalDelete). */
+  // shortcut: one entry per name, so a name deleted twice before the folder gets to them (a shared file renamed onto
+  // it in between) is one deletion and the second is lost; keep each deletion event once folderFuzz's FUZZ_BUSY matters.
   private deletions = new Set<string>();
   /** The user is being asked whether many deletions go out (see askAboutDeletions). */
   private askingAboutDeletions = false;
@@ -1643,16 +1651,20 @@ export class RoomFolder {
 
   onLocalWrite(vaultPath: string): Promise<void> {
     this.noteLocal(vaultPath, true);
-    return this.run(() => this.tryLocalWrite(vaultPath));
+    // Deleted after this write, before the folder got to it (a deletion pending now, not then): the file written is
+    // gone, and one with its name now came by a later event (renamed onto it, say), which takes it in.
+    const gone = this.deletions.has(vaultPath) ? undefined : () => this.deletions.has(vaultPath);
+    return this.run(() => this.tryLocalWrite(vaultPath, gone));
   }
 
-  private async tryLocalWrite(vaultPath: string): Promise<void> {
-    if (await this.safely(vaultPath.slice(this.prefix.length), () => this.localWrite(vaultPath))) this.retryWrites.delete(vaultPath);
+  private async tryLocalWrite(vaultPath: string, gone?: () => boolean): Promise<void> {
+    if (await this.safely(vaultPath.slice(this.prefix.length), () => this.localWrite(vaultPath, gone))) this.retryWrites.delete(vaultPath);
     else { this.retryWrites.add(vaultPath); this.retrySoon(); }
   }
 
-  private async localWrite(vaultPath: string): Promise<void> {
+  private async localWrite(vaultPath: string, gone?: () => boolean): Promise<void> {
     if (!this.started) return; // taken in by start
+    if (gone?.()) return;
     if (this.isLocalOnly(vaultPath)) return this.noteLocalOnlyContent(vaultPath);
     const relative = this.relative(vaultPath);
     if (relative === null) {
@@ -1660,6 +1672,8 @@ export class RoomFolder {
       return;
     }
     if (!this.o.vault.stat(vaultPath)) return;
+    // A file there now is another one (see movedOn).
+    this.movedOn.delete(vaultPath);
     const id = this.idAt(relative) ?? this.queuedPaths.get(relative);
     const indexed = id ? this.o.replica.entry(id) : undefined;
     const entry = indexed?.deleted ? undefined : indexed;
@@ -1828,7 +1842,8 @@ export class RoomFolder {
     const relative = this.relative(vaultPath);
     if (relative === null) return;
     this.retryWrites.delete(vaultPath);
-    const id = this.idAt(relative) ?? this.queuedPaths.get(relative);
+    const movedOn = this.movedOnFrom(vaultPath);
+    const id = this.idAt(relative) ?? this.queuedPaths.get(relative) ?? movedOn;
     if (!id) return;
     this.forget(id);
     this.dropQueued(id);
@@ -1872,20 +1887,31 @@ export class RoomFolder {
     return true;
   }
 
+  /** The file that stood at `vaultPath` when its rename was to be put back (see movedOn), taken once. */
+  private movedOnFrom(vaultPath: string): string | undefined {
+    const id = this.movedOn.get(vaultPath);
+    this.movedOn.delete(vaultPath);
+    return id;
+  }
+
   onLocalRename(oldVaultPath: string, newVaultPath: string): Promise<void> {
     this.noteLocal(oldVaultPath, false);
     this.noteLocal(newVaultPath, true);
+    // A deletion made before this rename, of a file at the name it takes (see below), looked for now: one made after it,
+    // while the folder was busy, is of the renamed file itself.
+    const key = newVaultPath.startsWith(this.prefix) ? pathKey(newVaultPath.slice(this.prefix.length)) : null;
+    const replacing = key === null ? undefined : [...this.deletions].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === key);
     return this.run(async () => {
       if (!this.started) return; // taken in by start
       if (this.moving.delete(movingMark(oldVaultPath, newVaultPath))) return;
       const from = this.relative(oldVaultPath);
       const to = this.relative(newVaultPath);
+      const movedOn = this.movedOnFrom(oldVaultPath);
       // A file deleted here moments ago (in any case), its name now taken by a tracked file or a copy kept here only:
       // that deletion first, not taken for the file come back. An untracked file renamed onto it (a program saving
       // through a temporary file) is that file's new content: the deletion is left to settle as such.
-      if (to !== null && from !== null && (this.isLocalOnly(oldVaultPath) || this.idAt(from) !== undefined || this.queuedPaths.has(from))) {
-        const pending = [...this.deletions].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === pathKey(to));
-        if (pending !== undefined && this.deletions.delete(pending)) await this.safely(pending, () => this.applyLocalDelete(pending, true));
+      if (to !== null && from !== null && (this.isLocalOnly(oldVaultPath) || this.idAt(from) !== undefined || this.queuedPaths.has(from) || movedOn !== undefined)) {
+        if (replacing !== undefined && this.deletions.delete(replacing)) await this.safely(replacing, () => this.applyLocalDelete(replacing, true));
       }
       // A copy on this computer only stays so under its new name (and leaves the list if it leaves the room).
       if (this.isLocalOnly(oldVaultPath)) {
@@ -1895,13 +1921,24 @@ export class RoomFolder {
         return;
       }
       if (oldVaultPath.startsWith(this.prefix) && this.rejected.delete(oldVaultPath.slice(this.prefix.length))) this.o.healthChanged?.();
-      const id = from === null ? undefined : (this.idAt(from) ?? this.queuedPaths.get(from));
+      const id = from === null ? undefined : (this.idAt(from) ?? this.queuedPaths.get(from) ?? movedOn);
       const unusable = (to === null && this.unsafeInside(newVaultPath)) || (to !== null && !isShareable(to));
       if (id && (to !== null || unusable)) {
-        // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name.
-        const back = () => {
-          this.moving.add(movingMark(newVaultPath, oldVaultPath));
-          return this.o.vault.rename(newVaultPath, oldVaultPath);
+        // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name: the one
+        // before this rename, or, renamed again before an earlier one was put back, the one before that.
+        const home = movedOn !== undefined && id === movedOn ? this.vaultPath(this.known.get(id)?.path ?? this.queuedEntries.get(id) ?? from!) : oldVaultPath;
+        const back = async () => {
+          // Renamed back to that name meanwhile: nothing to put back.
+          if (home === newVaultPath) return;
+          this.moving.add(movingMark(newVaultPath, home));
+          try {
+            await this.o.vault.rename(newVaultPath, home);
+          } catch (error) {
+            this.moving.delete(movingMark(newVaultPath, home));
+            // Moved on meanwhile (renamed again, or deleted): that event comes next, and is taken for this file.
+            if (this.o.vault.stat(newVaultPath)) throw error;
+            this.movedOn.set(newVaultPath, id);
+          }
         };
         if (unusable) {
           this.quietNotice(`"${newVaultPath.slice(this.prefix.length)}" can't be used in a shared room (too long, an unusual character, or a file type that isn't shared). The file keeps its old name.`);
