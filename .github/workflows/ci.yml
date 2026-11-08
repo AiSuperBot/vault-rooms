@@ -2,9 +2,9 @@ name: Check Vault Rooms
 
 on:
   push:
-    branches: [develop, main]
+    branches: [develop, main, secure-failover]
   pull_request:
-    branches: [develop, main]
+    branches: [develop, main, secure-failover]
   workflow_dispatch:
 
 permissions:
