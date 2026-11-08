@@ -897,21 +897,32 @@ export class RoomReplica {
     const remove = new Set<StoredEnvelope>();
     const reach = (s: SnapshotEnvelope) => Object.values(s.covers).reduce((sum, clock) => sum + clock, 0);
     const ordered = [...snapshots].sort((a, b) => reach(b) - reach(a) || (envelopeKey(a) < envelopeKey(b) ? -1 : 1));
+    // Each envelope opened once, whatever number of snapshots it is checked against: undefined, no key for it here;
+    // null, the key held for it can't open it.
+    const opened = new Map<StoredEnvelope, Uint8Array | null | undefined>();
+    const open = (env: StoredEnvelope): Uint8Array | null | undefined => {
+      if (!opened.has(env)) {
+        const key = this.keys.get(env.n);
+        let bytes: Uint8Array | null | undefined;
+        try {
+          bytes = key && openEnvelope(env, key);
+        } catch {
+          bytes = null;
+        }
+        opened.set(env, bytes);
+      }
+      return opened.get(env);
+    };
     for (const snapshot of ordered) {
       // One by someone who may no longer write never takes another's place: peers catching up would refuse it.
       if (remove.has(snapshot) || !this.writes(snapshot.author)) continue;
       const contents = this.contentsOf(snapshot);
       if (!contents) continue;
       const contains = (env: StoredEnvelope): boolean => {
-        const key = this.keys.get(env.n);
-        if (!key) return false;
-        let bytes: Uint8Array;
-        try {
-          bytes = openEnvelope(env, key);
-        } catch {
-          // An update the record's key can't open holds nothing (see applyEnvelope): it never blocks compaction.
-          return env.k === "u" && this.backed(env.n, key);
-        }
+        const bytes = open(env);
+        if (bytes === undefined) return false;
+        // An update the record's key can't open holds nothing (see applyEnvelope): it never blocks compaction.
+        if (bytes === null) return env.k === "u" && this.backed(env.n, this.keys.get(env.n)!);
         try {
           return Y.snapshotContainsUpdate(contents, bytes);
         } catch {
