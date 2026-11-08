@@ -20,7 +20,7 @@ Environment variables for the fuzz tests:
 - `FUZZ_SEEDS=500` runs more seeds (the default is a few dozen).
 - `FUZZ_SEED=n` runs only the seed a failure names. Ids are random, so a seed may need a few runs to fail again.
 - `FUZZ_TRACE=1` (room folder test) prints every step, what each computer holds after it, and the folders' logs.
-- `FUZZ_BUSY=1` (room folder test) lets steps follow each other while a folder is still busy. It shows one known limit: a name deleted twice within one deletion wait, with a shared file renamed onto it in between, counts as one deletion.
+- `FUZZ_BUSY=1` (room folder test) lets steps follow each other while a folder is still busy, as when a program moves files quickly. Run it too when changing how the folder handles renames and deletions: it found several races there that the normal run doesn't reach.
 
 When you fix a bug, add a test that fails without the fix. Check that by running the test on the old code (`git stash`, or `git show HEAD:<file>`), and restore the file after.
 

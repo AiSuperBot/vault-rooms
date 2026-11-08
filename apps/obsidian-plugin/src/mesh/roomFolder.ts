@@ -244,6 +244,8 @@ export class RoomFolder {
    * deleted, before the folder got to it): the event for that, which comes next, is taken for the same file.
    */
   private movedOn = new Map<string, string>();
+  /** Renames the vault reported and this folder hasn't handled yet, counted by the paths they touch (see onLocalRename). */
+  private renaming = new Map<string, number>();
   private queue: Promise<void> = Promise.resolve();
   private materializeTimer: ReturnType<typeof setTimeout> | null = null;
   /** A pass is queued and hasn't started: it will see every change made until it does. */
@@ -277,13 +279,18 @@ export class RoomFolder {
   private localNames: Map<string, Set<string>> | null = null;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private deleteTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Deletions made here, waiting for DELETE_QUIET_MS (see onLocalDelete). */
-  // shortcut: one entry per name, so a name deleted twice before the folder gets to them (a shared file renamed onto
-  // it in between) is one deletion and the second is lost; keep each deletion event once folderFuzz's FUZZ_BUSY matters.
-  private deletions = new Set<string>();
+  /**
+   * Deletions made here, waiting for DELETE_QUIET_MS (see onLocalDelete), counted by path: a name deleted twice before
+   * the folder gets to them (another file renamed onto it in between, then deleted too) is two deletions, each taken by
+   * the rename that followed it (see onLocalRename), or by the flush.
+   */
+  private deletions = new Map<string, number>();
   /** The user is being asked whether many deletions go out (see askAboutDeletions). */
   private askingAboutDeletions = false;
-  /** Files missing here not written back while deletions are pending: a folder being moved away isn't refilled. */
+  /**
+   * Files missing here not written back while deletions, or renames, are pending: a folder being moved away isn't
+   * refilled, a file renamed away isn't put back next to itself (see resumeWrites).
+   */
   private waitingForDeletions = new Set<string>();
   /** The folder was moved, and this folder is stopping (see movedAway). */
   private movedAway = false;
@@ -975,8 +982,8 @@ export class RoomFolder {
     // The version last synced here (the folder's own write of a note typed past the limit, say): the room's, not a change.
     const known = id === undefined ? undefined : this.known.get(id);
     if (known?.path === relative && known.size === stat.size && known.mtime === stat.mtime) return true;
-    // Nor an editor's save of a note open in it: its text went out through the editor (see localWrite).
-    if (asNote && id !== undefined && this.o.isBound(id) && this.o.replica.canWrite()) return true;
+    // Nor an editor's save of a note open in it: its text went out through the editor, or is the room's (a reader's).
+    if (asNote && id !== undefined && this.o.isBound(id)) return true;
     if (!id) this.notShared(relative, "size");
     else if (this.o.replica.canWrite()) this.holdBack(id, relative, `size:${stat.size}:${stat.mtime}`);
     else {
@@ -1357,6 +1364,12 @@ export class RoomFolder {
     if (entry.kind === "md" && this.o.isBound(id)) return;
     // A local version that couldn't be shared stays as it is, never written over (see holdBack).
     if (this.heldBack.has(id)) return;
+    // Deleted here moments ago, and something at its name again already (another file renamed onto it, or saved again
+    // by deleting and writing): what that is settles with the deletion (see onLocalRename, applyLocalDelete), not here.
+    if (this.o.vault.stat(path) && this.deletionPendingAt(entry.path)) {
+      this.waitingForDeletions.add(id);
+      return;
+    }
     // Not under its new name here yet (another file in the way couldn't be moved or trashed): what is at the new name
     // isn't this file, and is never taken for it. The renames are tried again.
     if (known && known.path !== entry.path && this.o.vault.stat(this.vaultPath(known.path))) return;
@@ -1404,8 +1417,9 @@ export class RoomFolder {
     if (stat && !(await this.fitsBeforeRead(entry.path, entry.kind === "md", id))) return;
     if (!stat) {
       // Deletions are pending here (Explorer moving the folder away, file by file, say): nothing is put back into it
-      // meanwhile, so the folder can go; looked at again once they are settled (see resumeWrites).
-      if (this.deletions.size > 0 || this.askingAboutDeletions) {
+      // meanwhile, so the folder can go; looked at again once they are settled (see resumeWrites). Nor is a file
+      // renamed away by a rename not handled yet: that puts it under its new name, or back.
+      if (this.deletions.size > 0 || this.askingAboutDeletions || this.inFlight(id, path)) {
         this.waitingForDeletions.add(id);
         return;
       }
@@ -1428,6 +1442,11 @@ export class RoomFolder {
       return this.write(id, entry, remote, remoteHash, known.hash, content);
     }
     const local = await this.readAs(path, entry.kind === "md");
+    // Deleted while being read (and something else there now, maybe): as above.
+    if (this.deletionPendingAt(entry.path)) {
+      this.waitingForDeletions.add(id);
+      return;
+    }
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     if (!known || (localHash === known.hash && !doubtful)) {
@@ -1477,9 +1496,20 @@ export class RoomFolder {
     // only received was theirs.
     const busy = (this.doubtful(id) && known.unstored !== "received") || (entry !== undefined && Date.now() - this.lastEdit(id, entry) < RECENT_EDIT_MS);
     // Forgotten only once the file is dealt with: one that can't be read or trashed now (in use, say) stays tracked, and
-    // is tried again, rather than being left behind untracked and shared again as a new file.
+    // is tried again, rather than being left behind untracked and shared again as a new file. Nor is one renamed away
+    // by a rename not handled yet forgotten: that tracks it under its new name, and the removal is looked at again.
+    if (!stat && this.inFlight(id, path)) {
+      this.waitingForDeletions.add(id);
+      return;
+    }
     if (!stat) return this.forget(id);
     const current = await this.readAs(path, entry ? entry.kind === "md" : isMarkdownPath(known.path));
+    // Deleted here moments ago (before or while being read), and something there now: what that is settles with the
+    // deletion (see applyContent); the removal is looked at again then.
+    if (this.deletionPendingAt(known.path)) {
+      this.waitingForDeletions.add(id);
+      return;
+    }
     const unchanged = !busy && sha(current) === known.hash;
     if (unchanged) {
       await this.trash(known.path);
@@ -1515,7 +1545,8 @@ export class RoomFolder {
       if (this.stopped) break;
       this.left--;
       this.reportProgress();
-      if (this.o.inOtherRoom?.(path) || this.isLocalOnly(path)) continue;
+      // One that came by a rename not handled yet is tracked by that (under its new name, or put back), not as new.
+      if (this.o.inOtherRoom?.(path) || this.isLocalOnly(path) || this.renaming.has(path)) continue;
       const relative = this.relative(path);
       if (relative === null) {
         if (this.unsafeInside(path)) this.notShared(path.slice(this.prefix.length), "name");
@@ -1542,7 +1573,8 @@ export class RoomFolder {
     return done;
   }
 
-  private async createEntry(relative: string): Promise<void> {
+  /** `gone`: whether the file was deleted since the event this came from (what is read may then be another file's). */
+  private async createEntry(relative: string, gone?: () => boolean): Promise<void> {
     if (!isShareable(relative)) return this.notShared(relative, "type");
     if (this.indexUnread()) return this.rejectLocal(relative, "This computer hasn't read the room's file list yet (another program has it open). It is shared once it has.");
     const replica = this.o.replica;
@@ -1553,6 +1585,7 @@ export class RoomFolder {
     const id = randomId("f");
     if (isMarkdownPath(relative)) {
       const text = await this.readNote(path);
+      if (gone?.()) return;
       if (Buffer.byteLength(text, "utf8") > MAX_NOTE_BYTES) return this.notShared(relative, "size");
       // No live file entry until its content is accepted: a full room may refuse the cleanup too.
       const filled = text ? replica.edit(id, (doc) => doc.getText("content").insert(0, text)) : "published";
@@ -1566,6 +1599,7 @@ export class RoomFolder {
       return;
     }
     const bytes = await this.o.vault.readBytes(path);
+    if (gone?.()) return;
     if (bytes.length + 16 > MAX_BYTES.b) return this.notShared(relative, "size");
     let blob;
     try {
@@ -1683,7 +1717,7 @@ export class RoomFolder {
     // can't be read yet (in use) is told of, and taken in by a retry.
     if (!id && !this.expected.has(vaultPath)) {
       if (!this.o.replica.canWrite()) return this.keepHere(relative);
-      await this.createEntry(relative);
+      await this.createEntry(relative, gone);
       return;
     }
     // Still under its old name here (its rename is blocked by a file in the way): the change waits for the rename,
@@ -1698,13 +1732,15 @@ export class RoomFolder {
     const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
     if (!(await this.fitsBeforeRead(relative, asNote, id))) return;
     const content = await this.readAs(vaultPath, asNote);
+    // Deleted while being read: what was read may be another file's, renamed onto its name since (see gone).
+    if (gone?.()) return;
     const hash = sha(content);
     if (this.isEcho(vaultPath, hash)) return;
     // Someone else deleted it, and it couldn't be trashed here yet: the removal, tried again, settles it (sharing it
     // again once, if it was changed here).
     if (id && indexed?.deleted) return this.remoteChanged();
     if (!id || !entry) {
-      if (this.o.replica.canWrite()) return this.createEntry(relative);
+      if (this.o.replica.canWrite()) return this.createEntry(relative, gone);
       return this.keepHere(relative);
     }
     // In doubt whether the others ever had what was made here last time: a pass settles it with the shared copy.
@@ -1738,7 +1774,7 @@ export class RoomFolder {
       this.expected.delete(vaultPath);
       return Promise.resolve();
     }
-    this.deletions.add(vaultPath);
+    this.deletions.set(vaultPath, (this.deletions.get(vaultPath) ?? 0) + 1);
     // Counted from the last one: a deletion still coming keeps the others waiting.
     this.waitForDeletions(DELETE_QUIET_MS);
     return Promise.resolve();
@@ -1764,12 +1800,12 @@ export class RoomFolder {
     if (this.askingAboutDeletions) return;
     // Many at once, the folder still there: maybe a move or deletion of the whole folder, under way (Explorer pauses
     // for a dialog, or a file in use). Never shared on a guess: the user is asked; stopping puts them back.
-    if (this.sharedAmong(this.deletions) >= MASS_DELETE && this.o.replica.canWrite()) {
+    if (this.sharedAmong(this.deletions.keys()) >= MASS_DELETE && this.o.replica.canWrite()) {
       if (final) this.deletions.clear();
       else this.askAboutDeletions();
       return this.resumeWrites();
     }
-    const paths = [...this.deletions];
+    const paths = [...this.deletions.keys()];
     this.deletions.clear();
     for (const vaultPath of paths) await this.safely(vaultPath, () => this.applyLocalDelete(vaultPath));
     this.resumeWrites();
@@ -1788,7 +1824,7 @@ export class RoomFolder {
   private askAboutDeletions(): void {
     this.askingAboutDeletions = true;
     // The answer is about these: any deleted after the question was shown are asked about on their own.
-    const asked = [...this.deletions];
+    const asked = [...this.deletions.keys()];
     const answer = this.o.confirmDeletions?.(this.sharedAmong(asked)) ?? Promise.resolve(false);
     void answer.then(
       (share) => this.settleDeletions(share, asked),
@@ -1816,7 +1852,7 @@ export class RoomFolder {
       } else {
         // Not shared, nor those deleted meanwhile (the same move, most likely): written back from the shared state.
         // Those not shared are gone for good (a copy kept here only): their marks go with them.
-        for (const path of this.deletions) if (!this.o.vault.stat(path)) this.dropMarks(path);
+        for (const path of this.deletions.keys()) if (!this.o.vault.stat(path)) this.dropMarks(path);
         this.deletions.clear();
         this.remoteChanged();
       }
@@ -1827,9 +1863,41 @@ export class RoomFolder {
   /** Notes and files missing here that waited while deletions were pending (see applyContent): looked at now. */
   private resumeWrites(): void {
     if (this.deletions.size > 0 || this.askingAboutDeletions || this.waitingForDeletions.size === 0) return;
-    for (const id of this.waitingForDeletions) this.dirty.add(id);
+    const entries = this.o.replica.entries();
+    for (const id of this.waitingForDeletions) {
+      this.dirty.add(id);
+      // A removal that waited is made by a pass over the file list (see materializeNow).
+      if (entries.get(id)?.deleted) this.indexChanged = true;
+    }
     this.waitingForDeletions.clear();
     this.queuePass();
+  }
+
+  /** Whether a deletion of the file at this room path is still pending (see onLocalDelete): what is there is in flux. */
+  private deletionPendingAt(relative: string): boolean {
+    if (this.deletions.size === 0) return false;
+    const key = pathKey(relative);
+    for (const gone of this.deletions.keys()) if (gone.startsWith(this.prefix) && pathKey(gone.slice(this.prefix.length)) === key) return true;
+    return false;
+  }
+
+  /**
+   * Whether a file missing at its tracked path is on the move: a rename the folder hasn't handled yet touches the path,
+   * or the file moved on before an earlier rename of it could be put back (see movedOn). Its next event places it.
+   */
+  private inFlight(id: string, vaultPath: string): boolean {
+    if (this.renaming.has(vaultPath)) return true;
+    for (const moved of this.movedOn.values()) if (moved === id) return true;
+    return false;
+  }
+
+  /** Take one pending deletion of this path (see deletions): whether there was one. */
+  private takeDeletion(vaultPath: string): boolean {
+    const count = this.deletions.get(vaultPath);
+    if (count === undefined) return false;
+    if (count > 1) this.deletions.set(vaultPath, count - 1);
+    else this.deletions.delete(vaultPath);
+    return true;
   }
 
   /** `replaced`: another file took its name since (a rename), so its being there isn't the file come back. */
@@ -1902,8 +1970,16 @@ export class RoomFolder {
     // A deletion made before this rename, of a file at the name it takes (see below), looked for now: one made after it,
     // while the folder was busy, is of the renamed file itself.
     const key = newVaultPath.startsWith(this.prefix) ? pathKey(newVaultPath.slice(this.prefix.length)) : null;
-    const replacing = key === null ? undefined : [...this.deletions].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === key);
-    return this.run(async () => {
+    const replacing = key === null ? undefined : [...this.deletions.keys()].find((path) => path.startsWith(this.prefix) && pathKey(path.slice(this.prefix.length)) === key);
+    // Counted until handled: a pass meanwhile leaves both paths alone (see applyContent, adoptLocalFiles), and another
+    // file renamed onto this one's new name by a later event is seen by this one (see back).
+    for (const touched of [oldVaultPath, newVaultPath]) this.renaming.set(touched, (this.renaming.get(touched) ?? 0) + 1);
+    const handle = async () => {
+      for (const touched of [oldVaultPath, newVaultPath]) {
+        const later = (this.renaming.get(touched) ?? 1) - 1;
+        if (later > 0) this.renaming.set(touched, later);
+        else this.renaming.delete(touched);
+      }
       if (!this.started) return; // taken in by start
       if (this.moving.delete(movingMark(oldVaultPath, newVaultPath))) return;
       const from = this.relative(oldVaultPath);
@@ -1913,7 +1989,7 @@ export class RoomFolder {
       // that deletion first, not taken for the file come back. An untracked file renamed onto it (a program saving
       // through a temporary file) is that file's new content: the deletion is left to settle as such.
       if (to !== null && from !== null && (this.isLocalOnly(oldVaultPath) || this.idAt(from) !== undefined || this.queuedPaths.has(from) || movedOn !== undefined)) {
-        if (replacing !== undefined && this.deletions.delete(replacing)) await this.safely(replacing, () => this.applyLocalDelete(replacing, true));
+        if (replacing !== undefined && this.takeDeletion(replacing)) await this.safely(replacing, () => this.applyLocalDelete(replacing, true));
       }
       // A copy on this computer only stays so under its new name (and leaves the list if it leaves the room).
       if (this.isLocalOnly(oldVaultPath)) {
@@ -1928,10 +2004,14 @@ export class RoomFolder {
       if (id && (to !== null || unusable)) {
         // Renamed within the room: to a name others can't have, or by a reader, it goes back to its old name: the one
         // before this rename, or, renamed again before an earlier one was put back, the one before that.
-        const home = movedOn !== undefined && id === movedOn ? this.vaultPath(this.known.get(id)?.path ?? this.queuedEntries.get(id) ?? from!) : oldVaultPath;
+        const own = this.known.get(id)?.path ?? this.queuedEntries.get(id) ?? from!;
+        const home = movedOn !== undefined && id === movedOn ? this.vaultPath(own) : oldVaultPath;
         const back = async () => {
           // Renamed back to that name meanwhile: nothing to put back.
           if (home === newVaultPath) return;
+          // Another file renamed onto its name meanwhile (so it left first; events still to come): what is there now is
+          // that file, not this one. The next event from this name is taken for this file.
+          if (this.renaming.has(newVaultPath)) return void this.movedOn.set(newVaultPath, id);
           this.moving.add(movingMark(newVaultPath, home));
           try {
             await this.o.vault.rename(newVaultPath, home);
@@ -1948,7 +2028,7 @@ export class RoomFolder {
         }
         // A note and other files are shared differently: one can't become the other by a new name. (Judged by what it is
         // shared as, so a note an earlier version renamed to Plan.txt may go back to Plan.md.)
-        const isNote = (this.o.replica.entry(id)?.kind ?? (isMarkdownPath(from!) ? "md" : "bin")) === "md";
+        const isNote = (this.o.replica.entry(id)?.kind ?? (isMarkdownPath(own) ? "md" : "bin")) === "md";
         if (isNote !== isMarkdownPath(to!)) {
           this.quietNotice(`"${from}" keeps its name: in a shared room a note can't be renamed into another type of file, nor another file into a note. Make a copy under the new name instead.`);
           return back();
@@ -1969,8 +2049,9 @@ export class RoomFolder {
         }
         if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to! });
         else {
-          // Its entry still waits for the room key: it goes out under the new name.
-          this.queuedPaths.delete(from!);
+          // Its entry still waits for the room key: it goes out under the new name (not the queued one, which may not be
+          // `from`: see movedOn).
+          this.dropQueued(id);
           this.queuedEntries.set(id, to!);
           this.queuedPaths.set(to!, id);
         }
@@ -1991,6 +2072,14 @@ export class RoomFolder {
         // An untracked file renamed onto a tracked one's name (a program saving through a temporary file): that file's
         // new content.
         await this.tryLocalWrite(newVaultPath);
+      }
+    };
+    return this.run(async () => {
+      try {
+        await handle();
+      } finally {
+        // A file missing here while this rename was pending (renamed away by it, say) is looked at again.
+        this.resumeWrites();
       }
     });
   }
