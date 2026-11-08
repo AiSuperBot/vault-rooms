@@ -26,8 +26,9 @@ interface Pc {
   stateLocked?: boolean;
   bound: Set<string>;
   gone: string[];
-  /** What the user answers when asked whether many deletions go out (asked: how many). */
+  /** What the user answers when asked whether many deletions go out (asked: how many), once confirmGate settles. */
   deleteAnswer?: boolean;
+  confirmGate?: Promise<void>;
   asked?: number[];
 }
 
@@ -65,6 +66,7 @@ function setup(raeRole: "read" | "write" = "read") {
       notify: (message) => pc.notices.push(message),
       confirmDeletions: async (count) => {
         (pc.asked ??= []).push(count);
+        await pc.confirmGate;
         return pc.deleteAnswer ?? true;
       },
       log: (message) => process.env.FOLDER_LOG && console.log(`[${pc.device.name}] ${message}`),
@@ -789,6 +791,37 @@ describe("reported file regressions", () => {
     await s.settle();
     await s.settle();
     for (const pc of [a, c]) expect([...pc.vault.files.keys()]).toEqual(["Team/Busy.md"]);
+  });
+
+  it("leaves a confirmed deletion of a name a rename touches to that rename, as the flush does", async () => {
+    const names = Array.from({ length: 20 }, (_, i) => `N${String(i + 1).padStart(2, "0")}.md`);
+    const { s, a, c } = await pair(Object.fromEntries([...names.map((name) => [name, `tag ${name}\n`]), ["Busy.md", "busy\n"]]));
+    const n01 = [...a.replica.files()].find(([, entry]) => entry.path === "N01.md")![0];
+    let answer!: () => void;
+    a.confirmGate = new Promise<void>((resolve) => (answer = resolve));
+    for (const name of names) await a.vault.trash(`Team/${name}`);
+    endDeletionWait(a);
+    await a.folder.settled();
+    expect(a.asked).toEqual([20]);
+    // While the question is open: N01 is saved again (a save, as designed) and renamed. The answer is applied before
+    // the rename is handled (the folder busy): N01's deletion is left to the rename, so the rename is N01's.
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    a.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await a.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    answer();
+    await new Promise((resolve) => setImmediate(resolve));
+    await a.vault.writeText("Team/N01.md", "tag N01\nsaved again\n");
+    await a.vault.rename("Team/N01.md", "Team/Other.md");
+    release();
+    a.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/Other.md"]);
+      expect(pc.vault.text("Team/Other.md")).toBe("tag N01\nsaved again\n");
+      expect([...pc.replica.files()].find(([, entry]) => entry.path === "Other.md")![0]).toBe(n01);
+    }
   });
 
   it("doesn't write a note anew at its shared name while the user is renaming it from its old name here", async () => {
