@@ -194,7 +194,7 @@ export class RoomReplica {
       deviceId: node.deviceId,
       text: (docId) => this.docs.get(docId)?.doc.getText("content"),
       heldUpdates: (docId) => this.heldUpdates(docId),
-      mayEdit: () => !this.destroyed && this.canWrite(),
+      mayEdit: (docId) => !this.destroyed && this.canWrite() && !this.node.store.isUnreadable(this.roomId, docId),
       edit: (docId, change) => this.edit(docId, change),
       clash: (docId, version) => this.events.clash?.(docId, version)
     });
@@ -956,6 +956,8 @@ export class RoomReplica {
   private publishLocal(docId: DocId, update: Uint8Array): void {
     if (this.destroyed) return;
     if (!this.canWrite()) fail("read_only");
+    // Part of its history here isn't read yet: the counters used before aren't all known, and one must never be reused.
+    if (this.node.store.isUnreadable(this.roomId, docId)) fail("incomplete");
     const ctx = this.sealContext();
     const clock = this.node.store.maxClock(this.roomId, docId, this.node.deviceId) + 1;
     const env = sealUpdate(ctx, docId, clock, update);
