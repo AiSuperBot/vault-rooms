@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import { INDEX_DOC, keyCommitment, MeshNode, newRoomKey, nextVersion, randomId, RoomReplica, safeRoomPath, sealUpdate, STORE_LIMITS, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
@@ -15,6 +15,7 @@ vi.mock("@vault-rooms/secure", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@vault-rooms/secure")>();
   return { ...actual, randomId: (kind: Parameters<typeof actual.randomId>[0]) => (kind === "f" && forcedFileIds.length ? forcedFileIds.shift()! : actual.randomId(kind)) };
 });
+afterEach(() => void (forcedFileIds.length = 0));
 
 interface Pc {
   device: TestDevice;
@@ -1491,6 +1492,138 @@ describe("reported file regressions", () => {
     expect(c.vault.text(`Team/${y.path}`)).toBe("another note\n");
     const notes = [...a.vault.files.keys()].filter((path) => path.endsWith(".md") && path !== "Team/Busy.md").map((path) => a.vault.text(path)).sort();
     expect(notes).toEqual(["another note\n", "the note\n"]);
+  });
+
+  it("waits with a rename onto a name where a key-waiting note's file stands, rather than moving either file onto the other", async () => {
+    const { s, a, c } = await pair({ "Old.md": "tag K\n", "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    // X's id sorts after K's: K keeps New.md in the clash, X gets a clash name.
+    forcedFileIds.push(`f${"z".repeat(22)}`);
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // K renamed onto that name elsewhere: Cy reads it once he has the key, and finds X's file where K is to go.
+    await a.vault.rename("Team/Old.md", "Team/New.md");
+    await s.settle();
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    expect(c.notices.filter((message) => message.includes("changed here and by someone else"))).toEqual([]);
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+      expect(pc.vault.text("Team/New.md")).toBe("tag K\n");
+      const notes = [...pc.vault.files.keys()].filter((path) => path.endsWith(".md") && path !== "Team/Busy.md").map((path) => pc.vault.text(path)).sort();
+      expect(notes).toEqual(["tag K\n", "the note\n"]);
+    }
+  });
+
+  it("waits with a note whose name differs only in case from where a key-waiting note's file stands", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    forcedFileIds.push(`f${"z".repeat(22)}`);
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    await a.vault.writeText("Team/new.md", "tag K\n");
+    await s.settle();
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    expect(c.notices.filter((message) => message.includes("changed here and by someone else"))).toEqual([]);
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
+      expect(pc.vault.text("Team/new.md")).toBe("tag K\n");
+      const notes = [...pc.vault.files.keys()].filter((path) => path.endsWith(".md") && path !== "Team/Busy.md").map((path) => pc.vault.text(path)).sort();
+      expect(notes).toEqual(["tag K\n", "the note\n"]);
+    }
+  });
+
+  it("sees a key-waiting note's file as on the move while the user renames it from where it stands", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    let release!: () => void;
+    let slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    c.vault.failMoves = (from) => from === "Team/New.txt";
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    // The key arrives: the note goes out, its file still where the user left it (the disk refusing to move it back).
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.txt")).toBe("the note\n");
+    // The disk lets go, but before the next try the user renames the file on; the try runs first, and must wait.
+    c.vault.failMoves = undefined;
+    slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\nstill\n");
+    c.folder.retryNow();
+    await c.vault.rename("Team/New.txt", "Team/Other.md");
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].filter((path) => path !== "Team/Busy.md")).toEqual(["Team/Other.md"]);
+      expect(pc.vault.text("Team/Other.md")).toBe("the note\n");
+    }
+    expect(c.replica.entry(x)?.path).toBe("Other.md");
+  });
+
+  it("doesn't take in again a key-waiting note's file standing where the user left it", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    c.vault.failMoves = (from) => from === "Team/New.txt";
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    await s.settle();
+    // A pass that takes in the folder's files (as after a refused attachment) must leave it alone.
+    (c.folder as unknown as { needsAdopt: boolean }).needsAdopt = true;
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    // The key arrives, the disk lets go: one note, back at its name.
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    c.vault.failMoves = undefined;
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
+      expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+    }
   });
 
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
