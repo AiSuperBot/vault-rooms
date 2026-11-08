@@ -604,6 +604,36 @@ describe("room folder", () => {
     expect(text(a.vault, "Team/Keep.md")).toBe("v1\nimportant\n");
   });
 
+  it("puts back a reader's change too large to share, keeping it on that computer as a copy, without reading it", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/photo.png", "small");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    // The reader's version is over the size anything is shared at (said by its size alone, as for a huge file).
+    const stat = r.vault.stat.bind(r.vault);
+    const huge = (path: string) => path === "Team/photo.png" && Buffer.from(r.vault.files.get(path) ?? []).toString() === "a huge photo";
+    vi.spyOn(r.vault, "stat").mockImplementation((path) => { const info = stat(path); return info && huge(path) ? { ...info, size: 1024 ** 3 } : info; });
+    const read = vi.spyOn(r.vault, "readBytes");
+    await r.vault.writeText("Team/photo.png", "a huge photo");
+    await s.settle();
+    expect(text(r.vault, "Team/photo.png")).toBe("small");
+    const copy = [...r.vault.files.keys()].find((path) => path.includes("(your copy"))!;
+    expect(text(r.vault, copy)).toBe("a huge photo");
+    expect(read.mock.calls.some(([path]) => path === copy)).toBe(false);
+    expect(r.notices.some((message) => message.includes("was put back"))).toBe(true);
+    expect(r.folder.health().heldBack).toEqual([]);
+    expect([...a.vault.files.keys()].some((path) => path.includes("(your copy"))).toBe(false);
+  });
+
   it("puts back a reader's local changes", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

@@ -957,11 +957,21 @@ export class RoomFolder {
   }
 
   /** CRLF can at most double a note's bytes; keep the post-read check for growth and normalization. */
-  private fitsBeforeRead(relative: string, asNote: boolean, id?: string): boolean {
+  private async fitsBeforeRead(relative: string, asNote: boolean, id?: string): Promise<boolean> {
     const stat = this.o.vault.stat(this.vaultPath(relative));
     if (!stat || (asNote ? stat.size <= 2 * MAX_NOTE_BYTES : stat.size + 16 <= MAX_BYTES.b)) return true;
-    if (id) this.holdBack(id, relative, `size:${stat.size}:${stat.mtime}`);
-    else this.notShared(relative, "size");
+    if (!id) this.notShared(relative, "size");
+    else if (this.o.replica.canWrite()) this.holdBack(id, relative, `size:${stat.size}:${stat.mtime}`);
+    else {
+      // A reader's version: kept next to it on this computer only (moved, not read: it may be huge), as any change a
+      // reader makes, and the room's version written back. Marked first, so it stays unshared after a restart too.
+      const copy = this.copyName(relative, "your copy");
+      this.setLocalOnly(copy, undefined, stat.size);
+      await this.saveNow();
+      await this.move(relative, copy);
+      this.remoteChanged(id);
+      this.quietNotice(`You can only read this room, so "${relative}" was put back. Your version is kept as "${copy}" on this computer only.`);
+    }
     return false;
   }
 
@@ -1364,7 +1374,7 @@ export class RoomFolder {
     }
     const remoteHash = sha(remote);
     const stat = this.o.vault.stat(path);
-    if (stat && !this.fitsBeforeRead(entry.path, entry.kind === "md", id)) return;
+    if (stat && !(await this.fitsBeforeRead(entry.path, entry.kind === "md", id))) return;
     if (!stat) {
       // Deletions are pending here (Explorer moving the folder away, file by file, say): nothing is put back into it
       // meanwhile, so the folder can go; looked at again once they are settled (see resumeWrites).
@@ -1510,7 +1520,7 @@ export class RoomFolder {
     const replica = this.o.replica;
     const path = this.vaultPath(relative);
     // Too large to share whatever it holds: not even read (it may be huge). A note's line endings can halve it at most.
-    if (!this.fitsBeforeRead(relative, isMarkdownPath(relative))) return;
+    if (!(await this.fitsBeforeRead(relative, isMarkdownPath(relative)))) return;
     if (await this.claimedLocalOnly(relative)) return;
     const id = randomId("f");
     if (isMarkdownPath(relative)) {
@@ -1650,7 +1660,7 @@ export class RoomFolder {
     // Read as what the shared file is (a note or another file), even under a name that says otherwise (renamed so by
     // an earlier version): a note's text never goes out as an attachment, nor the reverse.
     const asNote = entry ? entry.kind === "md" : isMarkdownPath(relative);
-    if (!this.fitsBeforeRead(relative, asNote, id)) return;
+    if (!(await this.fitsBeforeRead(relative, asNote, id))) return;
     const content = await this.readAs(vaultPath, asNote);
     const hash = sha(content);
     if (this.isEcho(vaultPath, hash)) return;
@@ -1856,14 +1866,14 @@ export class RoomFolder {
           return this.o.vault.rename(newVaultPath, oldVaultPath);
         };
         if (unusable) {
-          this.tellOnce(`rename:${newVaultPath}`, `"${newVaultPath.slice(this.prefix.length)}" can't be used in a shared room (too long, an unusual character, or a file type that isn't shared). The file keeps its old name.`);
+          this.quietNotice(`"${newVaultPath.slice(this.prefix.length)}" can't be used in a shared room (too long, an unusual character, or a file type that isn't shared). The file keeps its old name.`);
           return back();
         }
         // A note and other files are shared differently: one can't become the other by a new name. (Judged by what it is
         // shared as, so a note an earlier version renamed to Plan.txt may go back to Plan.md.)
         const isNote = (this.o.replica.entry(id)?.kind ?? (isMarkdownPath(from!) ? "md" : "bin")) === "md";
         if (isNote !== isMarkdownPath(to!)) {
-          this.tellOnce(`kind:${newVaultPath}`, `"${from}" keeps its name: in a shared room a note can't be renamed into another type of file, nor another file into a note. Make a copy under the new name instead.`);
+          this.quietNotice(`"${from}" keeps its name: in a shared room a note can't be renamed into another type of file, nor another file into a note. Make a copy under the new name instead.`);
           return back();
         }
         if (!this.o.replica.canWrite()) {
