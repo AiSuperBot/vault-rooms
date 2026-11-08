@@ -408,6 +408,38 @@ describe("reported file regressions", () => {
     expect([...c.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["gone.md", "named.md", "pic.png"]);
   });
 
+  it("waits with a deletion and a new file while the room's file list here isn't read, and shares them once it is", async () => {
+    const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
+    await s.settle();
+    // Another program held the index's journal when Obsidian started: nothing of the index can go out meanwhile.
+    a.node.store.setUnreadable(s.roomId, INDEX_DOC, true);
+    await a.vault.trash("Team/gone.md");
+    await a.vault.writeText("Team/new.md", "three\n");
+    await a.vault.rename("Team/named.md", "Team/renamed.md");
+    await a.vault.writeBytes("Team/pic.png", new Uint8Array([4, 5, 6]));
+    await s.settle();
+    // A whole pass meanwhile (a retry, say) writes nothing back.
+    a.folder.retryNow();
+    await s.settle();
+    // The deletion waits (it isn't undone), the new file waits to be shared, the rename is undone: each says why.
+    expect(a.vault.files.has("Team/gone.md")).toBe(false);
+    expect(a.vault.text("Team/named.md")).toBe("two\n");
+    expect(a.folder.health().rejected).toEqual([{ path: "new.md", reason: expect.stringContaining("hasn't read the room's file list") }]);
+    expect(a.notices.some((message) => message.includes("storage"))).toBe(false);
+    expect(a.notices.filter((message) => message.includes("read the room's file list"))).not.toEqual([]);
+    expect([...c.vault.files.keys()].sort()).toEqual(["Team/gone.md", "Team/named.md", "Team/pic.png"]);
+    expect([...c.vault.files.get("Team/pic.png")!]).toEqual([1, 2, 3]);
+    // Read now (see MeshService, disk.onLateRead): what waited goes ahead.
+    a.node.store.setUnreadable(s.roomId, INDEX_DOC, false);
+    a.folder.remoteChanged(INDEX_DOC);
+    await s.settle();
+    for (const pc of [a, c]) expect([...pc.vault.files.keys()].sort()).toEqual(["Team/named.md", "Team/new.md", "Team/pic.png"]);
+    expect(c.vault.text("Team/new.md")).toBe("three\n");
+    expect([...c.vault.files.get("Team/pic.png")!]).toEqual([4, 5, 6]);
+    expect(a.folder.health().rejected ?? []).toEqual([]);
+  });
+
   it("puts back a refused deletion after another file took the name, each file with its own text", async () => {
     const { s, a, c } = await pair({ "A.md": "text of A\n", "B.md": "text of B\n" });
     const edit = vi.spyOn(a.replica, "editIndex").mockReturnValue("refused");

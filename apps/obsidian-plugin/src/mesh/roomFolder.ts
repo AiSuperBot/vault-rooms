@@ -220,6 +220,10 @@ export class RoomFolder {
   private desiredCache: { version: number; desired: Map<string, FileEntry> } | null = null;
   /** The clash renames desired() last asked for. */
   private renamesTried = "";
+  /** A change made here waited for the room's file list to be read (see indexUnread): tried again once it is. */
+  private waitingForIndex = false;
+  /** Deletions made here meanwhile, id -> path: shared once it is read, and nothing of them written back before. */
+  private unreadDeletions = new Map<string, string>();
   /** `known` changed since it was last saved (see saveNow), or only files' sizes and times did (saved at stop). */
   private stateChanged = false;
   private statChanged = false;
@@ -1097,7 +1101,7 @@ export class RoomFolder {
   private desired(): Map<string, FileEntry> {
     const groups = new Map<string, Array<[string, FileEntry]>>();
     for (const [id, entry] of this.o.replica.files()) {
-      if (!this.writesHere(entry.path)) continue;
+      if (!this.writesHere(entry.path) || this.unreadDeletions.has(id)) continue;
       const key = pathKey(entry.path);
       groups.set(key, [...(groups.get(key) ?? []), [id, entry]]);
     }
@@ -1142,6 +1146,14 @@ export class RoomFolder {
 
   private async materializeNow(): Promise<void> {
     if (this.stopped || !this.started) return;
+    // The room's file list has been read since a change here waited for it: what waited goes ahead, in a whole pass.
+    if (this.waitingForIndex && !this.o.replica.historyUnread(INDEX_DOC)) {
+      this.waitingForIndex = false;
+      const deletions = [...this.unreadDeletions];
+      this.unreadDeletions.clear();
+      for (const [id, relative] of deletions) this.shareDeletion(id, relative);
+      this.retryNow();
+    }
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
     const writeNow = this.writeNow;
@@ -1520,6 +1532,7 @@ export class RoomFolder {
 
   private async createEntry(relative: string): Promise<void> {
     if (!isShareable(relative)) return this.notShared(relative, "type");
+    if (this.indexUnread()) return this.rejectLocal(relative, "This computer hasn't read the room's file list yet (another program has it open). It is shared once it has.");
     const replica = this.o.replica;
     const path = this.vaultPath(relative);
     // Too large to share whatever it holds: not even read (it may be huge). A note's line endings can halve it at most.
@@ -1587,6 +1600,8 @@ export class RoomFolder {
     }
     if (!(local instanceof Uint8Array)) return;
     if (local.length + 16 > MAX_BYTES.b) return this.holdBack(id, entry.path, localHash);
+    // Its new version needs a change of the file list: shared by the pass once that can go out (see indexUnread).
+    if (this.indexUnread()) return this.quietNotice(`Your change to "${entry.path}" is shared once this computer has read the room's file list (another program has it open).`);
     this.binEdits.set(id, Date.now());
     let blob;
     try {
@@ -1826,14 +1841,33 @@ export class RoomFolder {
    * A file deleted here, or moved out of the room: deleted for everyone. Refused (the room's storage full, say), the
    * shared version is written back and the user told, rather than the file coming back unannounced at a later pass.
    * Written back by a pass queued after this, not run now: a rename onto its name may be half done (see onLocalRename).
+   * While the room's file list isn't read here, it waits for it (see indexUnread).
    */
+  // shortcut: a deletion waiting for the file list is kept in memory only, so one pending as Obsidian stops comes back
+  // after a restart (as a refused one would); keep it with the folder's state if journals are often held at start.
   private shareDeletion(id: string, relative: string): void {
+    if (this.indexUnread()) {
+      this.unreadDeletions.set(id, relative);
+      this.desiredCache = null;
+      this.quietNotice(`"${relative}" is deleted for everyone once this computer has read the room's file list (another program has it open).`);
+      return;
+    }
     const entry = this.o.replica.entry(id);
     if (entry && !entry.deleted && this.o.replica.editIndex((files) => files.set(id, { ...entry, deleted: true })) === "refused") {
       this.quietNotice(`"${relative}" couldn't be taken out of the room for everyone (its storage may be full), so it was put back.`);
       return this.remoteChanged(id);
     }
     this.saveSoon();
+  }
+
+  /**
+   * Whether the room's file list isn't all read here yet (another program held its journal as Obsidian started): no
+   * change of it can go out until it is, and what waits for it is tried again then (see materializeNow).
+   */
+  private indexUnread(): boolean {
+    if (!this.o.replica.historyUnread(INDEX_DOC)) return false;
+    this.waitingForIndex = true;
+    return true;
   }
 
   onLocalRename(oldVaultPath: string, newVaultPath: string): Promise<void> {
@@ -1883,6 +1917,10 @@ export class RoomFolder {
           return back();
         }
         const entry = this.o.replica.entry(id);
+        if (entry && !entry.deleted && this.indexUnread()) {
+          this.quietNotice(`"${from}" can't be renamed for everyone until this computer has read the room's file list (another program has it open), so it keeps its old name for now.`);
+          return back();
+        }
         if (entry && !entry.deleted && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: to! })) === "refused") {
           this.quietNotice(`"${from}" couldn't be renamed for everyone (the room's storage may be full), so it keeps its old name.`);
           return back();

@@ -435,8 +435,13 @@ export class RoomReplica {
    * Nothing waits for a key or a disk read, and no update is half applied. Updates waiting for their Yjs dependencies
    * (see DocState.pending) are held whole, so what is applied is whole edits only: safe to write, bind and merge with.
    */
+  /** Whether part of a document's history here isn't read yet (see EnvelopeStore.isUnreadable): no edit of it goes out. */
+  historyUnread(docId: DocId): boolean {
+    return this.node.store.isUnreadable(this.roomId, docId);
+  }
+
   isComplete(docId: DocId): boolean {
-    if (this.node.store.isUnreadable(this.roomId, docId)) return false;
+    if (this.historyUnread(docId)) return false;
     if (waitsForDependencies(this.loadDoc(docId).doc)) return false;
     if (this.waitingDocs.has(docId)) return false;
     return true;
