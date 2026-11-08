@@ -6,9 +6,9 @@
 // aside). At the end, once nothing is refused or cut off: both computers hold the same files, and every file nobody
 // deleted or moved out is still there, as a copy at least. Ids are random, so a seed may need a few runs to fail again.
 // FUZZ_SEEDS=300 for a longer run; FUZZ_SEED=n runs the seed a failure names; FUZZ_TRACE=1 prints every step and the
-// folders' logs. FUZZ_BUSY=1 lets steps follow each other while a folder is still busy with earlier ones: a known
-// limit fails there (the same name deleted twice in one deletion wait, a file renamed onto it in between, is one
-// deletion: see RoomFolder.deletions).
+// folders' logs. FUZZ_BUSY=1 lets steps follow each other while a folder is still busy with earlier ones (its events
+// queue up behind its work, as when a program moves files quickly): it found the races in file events the folder gets
+// to late (see RoomFolder.renaming, movedOn, deletions).
 import { describe, expect, it, vi } from "vitest";
 import { INDEX_DOC, MeshNode, RoomReplica, WorkspaceChain, wrapRoomKey } from "@vault-rooms/secure";
 import { createRoom, founder, invite, Network, type TestDevice } from "@vault-rooms/secure/testkit";
@@ -127,6 +127,8 @@ async function run(seed: number): Promise<void> {
   // designed, for a program saving through a temporary file (the deleted file's new content), so it isn't moved so here.
   const waiting = (pc: Pc) => new Set((pc.folder.health().rejected ?? []).map((item) => item.path));
   const context = () => `seed ${seed} (FUZZ_SEED=${seed}): ${log.join("; ")}`;
+  /** What a computer holds (its files' first lines, and its file list's entries), for a failure's message. */
+  const dump = (pc: Pc) => `${files(pc).map((path) => `${path}=${JSON.stringify(pc.vault.text(`Team/${path}`)!.split("\n")[0])}`).join(", ")}; list: ${[...pc.replica.files()].map(([id, entry]) => `${id.slice(1, 5)}:${entry.path}`).join(", ")}`;
 
   /** Checked whenever things are quiet: no file stands at another's name, and none is in two places (copies aside). */
   const check = () => {
@@ -134,8 +136,8 @@ async function run(seed: number): Promise<void> {
       const seen = new Map<string, string>();
       for (const path of files(pc).filter((path) => !isCopy(path))) {
         const tag = tagOf(pc, path);
-        expect(given(path).some((name) => names.get(tag)?.has(name)), `${context()}: on ${pc.name}'s computer "${path}" holds "${tag}"`).toBe(true);
-        expect(seen.get(tag), `${context()}: on ${pc.name}'s computer "${tag}" is in "${seen.get(tag)}" and "${path}"`).toBeUndefined();
+        expect(given(path).some((name) => names.get(tag)?.has(name)), `${context()}: on ${pc.name}'s computer "${path}" holds "${tag}" (${dump(pc)})`).toBe(true);
+        expect(seen.get(tag), `${context()}: on ${pc.name}'s computer "${tag}" is in "${seen.get(tag)}" and "${path}" (${dump(pc)})`).toBeUndefined();
         seen.set(tag, path);
       }
     }
@@ -176,6 +178,14 @@ async function run(seed: number): Promise<void> {
         const gone = pick(rand, here.filter((path) => path !== moved));
         dropped.add(tagOf(pc, gone));
         names.get(tagOf(pc, moved))!.add(gone);
+        // A file not shared yet (its write still queued behind the folder's work) renamed onto a deleted file's name is,
+        // as designed, that file's new content (a program saving through a temporary file): from then on it may stand at
+        // any name the deleted file had, or gets.
+        if (![...pc.replica.files().values()].some((entry) => entry.path === moved)) {
+          const shared = names.get(tagOf(pc, gone))!;
+          for (const name of names.get(tagOf(pc, moved))!) shared.add(name);
+          names.set(tagOf(pc, moved), shared);
+        }
         log.push(`${pc.name} deletes ${gone} and renames ${moved} to its name`);
         await pc.vault.trash(`Team/${gone}`);
         await pc.vault.rename(`Team/${moved}`, `Team/${gone}`);
@@ -237,7 +247,7 @@ async function run(seed: number): Promise<void> {
   }
   check();
   const shared = (pc: Pc) => Object.fromEntries(files(pc).filter((path) => !isCopy(path)).map((path) => [path, pc.vault.text(`Team/${path}`)]));
-  expect(shared(c), `${context()}: the computers differ`).toEqual(shared(a));
+  expect(shared(c), `${context()}: the computers differ (Ana: ${dump(a)} | Cy: ${dump(c)})`).toEqual(shared(a));
   const kept = pcs.flatMap((pc) => files(pc).map((path) => pc.vault.text(`Team/${path}`)!));
   for (const tag of names.keys()) {
     if (dropped.has(tag)) continue;
