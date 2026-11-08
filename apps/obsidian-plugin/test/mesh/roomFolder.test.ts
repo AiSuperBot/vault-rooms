@@ -634,6 +634,37 @@ describe("room folder", () => {
     expect([...a.vault.files.keys()].some((path) => path.includes("(your copy"))).toBe(false);
   });
 
+  it("takes the folder's own write of a note grown past the size anything is shared at as the room's version", async () => {
+    const s = setup();
+    const a = s.make(s.ana, "Team");
+    await a.vault.writeText("Team/Big.md", "first\n");
+    const r = s.make(s.rae, "Team");
+    s.giveKey(a, s.ana);
+    s.giveKey(a, s.rae);
+    a.replica.refreshKeys();
+    await a.folder.start();
+    s.net.link(a.node, r.node);
+    await s.settle();
+    r.replica.refreshKeys();
+    await r.folder.start();
+    await s.settle();
+    // Typed text has no such limit: the note grows past it in Ana's editor, and is written as it is on both computers.
+    for (const pc of [a, r]) {
+      const stat = pc.vault.stat.bind(pc.vault);
+      vi.spyOn(pc.vault, "stat").mockImplementation((path) => { const info = stat(path); return info && path === "Team/Big.md" && pc.vault.text(path) === "first and more\n" ? { ...info, size: 13 << 20 } : info; });
+    }
+    const [id] = [...a.replica.files().keys()];
+    a.replica.edit(id!, (doc) => doc.getText("content").insert(5, " and more"));
+    a.folder.remoteChanged(id);
+    await s.settle();
+    for (const pc of [a, r]) {
+      expect(text(pc.vault, "Team/Big.md")).toBe("first and more\n");
+      expect([...pc.vault.files.keys()].filter((path) => path.includes("(your copy"))).toEqual([]);
+      expect(pc.folder.health().heldBack).toEqual([]);
+    }
+    expect(r.notices.some((message) => message.includes("was put back"))).toBe(false);
+  });
+
   it("puts back a reader's local changes", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

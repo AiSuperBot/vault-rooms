@@ -960,6 +960,9 @@ export class RoomFolder {
   private async fitsBeforeRead(relative: string, asNote: boolean, id?: string): Promise<boolean> {
     const stat = this.o.vault.stat(this.vaultPath(relative));
     if (!stat || (asNote ? stat.size <= 2 * MAX_NOTE_BYTES : stat.size + 16 <= MAX_BYTES.b)) return true;
+    // The version last synced here (the folder's own write of a note typed past the limit, say): the room's, not a change.
+    const known = id === undefined ? undefined : this.known.get(id);
+    if (known?.path === relative && known.size === stat.size && known.mtime === stat.mtime) return true;
     if (!id) this.notShared(relative, "size");
     else if (this.o.replica.canWrite()) this.holdBack(id, relative, `size:${stat.size}:${stat.mtime}`);
     else {
