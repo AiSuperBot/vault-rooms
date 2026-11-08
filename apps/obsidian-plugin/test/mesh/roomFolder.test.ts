@@ -758,18 +758,24 @@ describe("room folder", () => {
     // Typed text has no such limit: the note grows past it in Ana's editor, and is written as it is on both computers.
     for (const pc of [a, r]) {
       const stat = pc.vault.stat.bind(pc.vault);
-      vi.spyOn(pc.vault, "stat").mockImplementation((path) => { const info = stat(path); return info && path === "Team/Big.md" && pc.vault.text(path) === "first and more\n" ? { ...info, size: 13 << 20 } : info; });
+      vi.spyOn(pc.vault, "stat").mockImplementation((path) => { const info = stat(path); return info && path === "Team/Big.md" && pc.vault.text(path)!.startsWith("first and more") ? { ...info, size: 13 << 20 } : info; });
     }
     const [id] = [...a.replica.files().keys()];
     a.replica.edit(id!, (doc) => doc.getText("content").insert(5, " and more"));
     a.folder.remoteChanged(id);
     await s.settle();
+    // Typed on with the note open, and saved by the editor: its text went out through the editor, nothing is held back.
+    a.bound.add(id!);
+    a.replica.edit(id!, (doc) => doc.getText("content").insert(14, ", typed"));
+    await a.vault.writeText("Team/Big.md", "first and more, typed\n");
+    await s.settle();
     for (const pc of [a, r]) {
-      expect(text(pc.vault, "Team/Big.md")).toBe("first and more\n");
+      expect(text(pc.vault, "Team/Big.md")).toBe("first and more, typed\n");
       expect([...pc.vault.files.keys()].filter((path) => path.includes("(your copy"))).toEqual([]);
       expect(pc.folder.health().heldBack).toEqual([]);
     }
     expect(r.notices.some((message) => message.includes("was put back"))).toBe(false);
+    expect(a.notices.some((message) => message.includes("couldn't be shared"))).toBe(false);
   });
 
   it("puts back a reader's local changes", async () => {
