@@ -64,6 +64,12 @@ interface DocState {
    * tried again whenever keys arrive. While any is here the text may lack what they hold (see syncedKey).
    */
   undecryptable: Map<string, UpdateEnvelope | SnapshotEnvelope>;
+  /**
+   * Envelopes the key the record backs for their epoch doesn't open: sealed under a key that lost a race (they hold
+   * nothing, so nothing waits for them), or under the winner's key, pushed live ahead of the record that backs it. Tried
+   * again whenever keys arrive.
+   */
+  unopened: Map<string, UpdateEnvelope | SnapshotEnvelope>;
 }
 
 /** Notes loaded at once past which those idle for MANY_LOADED_IDLE_MS are let go (see releaseIdle). */
@@ -515,7 +521,7 @@ export class RoomReplica {
     const store = this.node.store;
     const doc = new Y.Doc({ gc: true });
     // Marks: updates folded into a snapshot this device checked (and applied, below).
-    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0, base: store.addsOf(this.roomId, docId), received: 0, undecryptable: new Map() };
+    state = { doc, pending: new Map(), applied: { ...store.marksOf(this.roomId, docId).marks }, extra: new Map(), sinceSnapshot: 0, snapshotBytes: 0, base: store.addsOf(this.roomId, docId), received: 0, undecryptable: new Map(), unopened: new Map() };
     this.docs.set(docId, state);
     const { snapshots, updates } = store.envelopesOf(this.roomId, docId);
     const checks: Array<[UpdateEnvelope | SnapshotEnvelope, Uint8Array]> = [];
@@ -623,9 +629,10 @@ export class RoomReplica {
     } catch {
       // Sealed under a key the record doesn't back (a rotation that lost a race): no one can read it under this record,
       // and its author sealed what it held again under the right key (see rescue). It holds nothing to wait for, an
-      // update or a snapshot alike.
+      // update or a snapshot alike. Unless the record here is the one behind (see unopened).
       if (this.backed(env.n, key)) {
         if (env.k === "u") this.markApplied(state, env.author, env.clock);
+        state.unopened.set(envelopeKey(env), env);
         return false;
       }
       // Not with the key held now: tried again when keys change (ours may have lost a race, see checkKeys).
@@ -706,8 +713,9 @@ export class RoomReplica {
       if (state) this.applyEnvelope(state, env.doc, env);
     }
     for (const [docId, state] of this.docs) {
-      const failed = [...state.undecryptable.values()];
+      const failed = [...state.undecryptable.values(), ...state.unopened.values()];
       state.undecryptable.clear();
+      state.unopened.clear();
       for (const env of failed) this.applyEnvelope(state, docId, env);
     }
   }
