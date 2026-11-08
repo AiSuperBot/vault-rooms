@@ -758,6 +758,12 @@ describe("room folder", () => {
     expect(names).toHaveLength(2);
     const loser = one < two ? two : one;
     expect(names.some((name) => name.includes(`(${loser.slice(1, 5)})`))).toBe(true);
+    // Someone gives it the clashing name again (renaming it back on a computer of theirs, say): settled again.
+    const settled = a.replica.files().get(loser)!.path;
+    a.replica.editIndex((files) => files.set(loser, { ...files.get(loser)!, path: loser === one ? "Same.md" : "same.md" }));
+    a.folder.remoteChanged();
+    await s.settle();
+    expect(a.replica.files().get(loser)!.path).toBe(settled);
   });
 
   it("never writes outside its folder, whatever a writer puts in the index", async () => {

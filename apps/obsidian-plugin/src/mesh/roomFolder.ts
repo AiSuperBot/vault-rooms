@@ -1128,9 +1128,11 @@ export class RoomFolder {
       });
     }
     // Writers settle the clash for everyone, the same way on every device. The same renames aren't asked again (a
-    // refused edit rebuilds the whole index; one waiting for the key would be queued twice), until Try again.
+    // refused edit rebuilds the whole index; one waiting for the key would be queued twice), until Try again, or
+    // until a clash comes back once settled.
     const tried = JSON.stringify(renames.map(([id, , path]) => [id, path]));
-    if (renames.length > 0 && this.o.replica.canWrite() && tried !== this.renamesTried) {
+    if (renames.length === 0) this.renamesTried = "";
+    else if (this.o.replica.canWrite() && tried !== this.renamesTried) {
       this.renamesTried = tried;
       this.o.replica.editIndex((files) => {
         for (const [id, entry, path] of renames) files.set(id, { ...entry, path });
