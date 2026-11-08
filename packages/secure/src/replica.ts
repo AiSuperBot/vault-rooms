@@ -376,11 +376,12 @@ export class RoomReplica {
 
   /**
    * The content key of a note whose text now is exactly what its held envelopes make: loaded, every envelope the store
-   * added since taken in, none waiting for a key or for what it builds on. Otherwise undefined (its text may lag).
+   * added since taken in, none waiting for a key or for what it builds on, nothing of a clash still to be taken out.
+   * Otherwise undefined (its text may lag). Text typed here doesn't lag: it is in the store as it is typed.
    */
   syncedKey(docId: DocId): string | undefined {
     const state = this.docs.get(docId);
-    if (!state || state.pending.size > 0 || state.undecryptable.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId) || this.clashes.busy(docId)) return undefined;
+    if (!state || state.pending.size > 0 || state.undecryptable.size > 0 || this.waitingDocs.has(docId) || this.unsent.has(docId) || this.clashes.pending(docId)) return undefined;
     if (state.base + state.received !== this.node.store.addsOf(this.roomId, docId)) return undefined;
     return this.contentKey(docId);
   }
