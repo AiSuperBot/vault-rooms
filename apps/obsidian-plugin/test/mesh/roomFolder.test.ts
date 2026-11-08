@@ -3241,6 +3241,53 @@ describe("room folder, renames waiting", () => {
 describe("room folder, everyday load", () => {
   const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  it("shares a folder of many notes with one change of the file list per batch, not one per note", async () => {
+    const s = setup();
+    const vault = new MemoryVault();
+    for (let i = 0; i < 450; i++) await vault.writeText(`Team/Note ${i}.md`, `note ${i}\n`);
+    await vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
+    const a = s.make(s.ana, "Team", vault);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    const edits = vi.spyOn(a.replica, "editIndex");
+    await a.folder.start();
+    expect(a.replica.files().size).toBe(451);
+    expect(edits.mock.calls.length).toBeLessThanOrEqual(3);
+    // All shared and remembered: a restart loads none of them.
+    expect(a.folder.health().rejected ?? []).toEqual([]);
+    await a.folder.stop();
+    expect(Object.values(a.saved.state!.known).filter((known) => known?.content !== undefined)).toHaveLength(450);
+    // The room's new member gets every one.
+    const c = s.make(s.cy, "Team");
+    s.giveKey(a, s.cy);
+    const again = s.make(s.ana, "Team", vault, a);
+    again.replica.refreshKeys();
+    await again.folder.start();
+    s.net.link(again.node, c.node);
+    await s.settle();
+    c.replica.refreshKeys();
+    await c.folder.start();
+    await s.settle();
+    expect(c.vault.files.size).toBe(451);
+    expect(c.vault.text("Team/Note 449.md")).toBe("note 449\n");
+  }, 30_000);
+
+  it("shares the notes one by one when the room refuses a batch of them, as far as it takes them", async () => {
+    const s = setup();
+    const vault = new MemoryVault();
+    for (let i = 0; i < 5; i++) await vault.writeText(`Team/Note ${i}.md`, `note ${i}\n`);
+    const a = s.make(s.ana, "Team", vault);
+    s.giveKey(a, s.ana);
+    a.replica.refreshKeys();
+    // The room refuses the batch and the fourth note's entry alone (its storage ran out there).
+    const editIndex = a.replica.editIndex.bind(a.replica);
+    let calls = 0;
+    vi.spyOn(a.replica, "editIndex").mockImplementation((change) => (++calls === 1 || calls === 5 ? "refused" : editIndex(change)));
+    await a.folder.start();
+    expect([...a.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["Note 0.md", "Note 1.md", "Note 2.md", "Note 4.md"]);
+    expect(a.folder.health().rejected).toEqual([{ path: "Note 3.md", reason: expect.stringContaining("storage is full") }]);
+  });
+
   it("goes over many files while many deletions are pending without comparing every file with every deletion", async () => {
     const s = setup();
     const a = s.make(s.ana, "Team");

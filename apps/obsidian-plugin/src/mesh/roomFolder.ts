@@ -180,6 +180,8 @@ const MAX_JOURNALED = 2_000;
 const LOCAL_ONLY_MISSING_MS = 30 * 86_400_000;
 /** As many as this at once, the folder still there: shared only once the user says so (see flushDeletions). */
 const MASS_DELETE = 20;
+/** Files taken in at once whose entries go into the file list as one change (see RoomFolder.adding). */
+const ADD_AT_ONCE = 200;
 /** A note changed here this recently counts as being worked on: a deletion by someone else doesn't take it away. */
 const RECENT_EDIT_MS = 10 * 60_000;
 /**
@@ -287,6 +289,11 @@ export class RoomFolder {
   private deletions = new Map<string, number>();
   /** The same by path key (see pathKey): asked for every file a pass goes over while deletions are pending. */
   private deletedKeys = new Map<string, number>();
+  /**
+   * Entries of files being taken in, to be added to the room's file list together (see adoptLocalFiles): one change,
+   * sealed and signed once, for many files. Null when each file's entry goes alone (a file saved while running).
+   */
+  private adding: Array<{ id: string; entry: FileEntry; then: (added: ReturnType<RoomReplica["editIndex"]>) => void }> | null = null;
   /** The user is being asked whether many deletions go out (see askAboutDeletions). */
   private askingAboutDeletions = false;
   /**
@@ -1543,31 +1550,40 @@ export class RoomFolder {
     for (const path of this.rejected.keys()) if (!present.has(path)) { this.rejected.delete(path); this.o.healthChanged?.(); }
     let done = true;
     this.left = paths.length;
-    for (const path of paths) {
-      if (this.stopped) break;
-      this.left--;
-      this.reportProgress();
-      // One that came by a rename not handled yet is tracked by that (under its new name, or put back), not as new.
-      if (this.o.inOtherRoom?.(path) || this.isLocalOnly(path) || this.renaming.has(path)) continue;
-      const relative = this.relative(path);
-      if (relative === null) {
-        if (this.unsafeInside(path)) this.notShared(path.slice(this.prefix.length), "name");
-        continue;
+    // The entries of the files taken in go into the file list a batch at a time (see adding): sharing a folder of
+    // thousands of notes is one sealed, signed change per batch rather than per note.
+    const adding: NonNullable<typeof this.adding> = (this.adding = []);
+    try {
+      for (const path of paths) {
+        if (this.stopped) break;
+        this.left--;
+        this.reportProgress();
+        // One that came by a rename not handled yet is tracked by that (under its new name, or put back), not as new.
+        if (this.o.inOtherRoom?.(path) || this.isLocalOnly(path) || this.renaming.has(path)) continue;
+        const relative = this.relative(path);
+        if (relative === null) {
+          if (this.unsafeInside(path)) this.notShared(path.slice(this.prefix.length), "name");
+          continue;
+        }
+        // Tracked under this name, or under another spelling that isn't a file of its own here (the same file then).
+        const spellings = tracked.get(pathKey(relative));
+        if (spellings && (spellings.has(relative) || ![...spellings].some((other) => present.has(other)))) continue;
+        if (reader) {
+          this.setLocalOnly(relative);
+          continue;
+        }
+        const before = this.known.size + adding.length;
+        // One that can't be taken in now (in use) is tried again with every pass, as a failed save is (see retryWrites).
+        if (!(await this.safely(relative, () => this.createEntry(relative)))) {
+          this.retryWrites.add(path);
+          done = false;
+        }
+        if (this.known.size + adding.length > before) track(relative);
+        if (adding.length >= ADD_AT_ONCE) this.flushAdding();
       }
-      // Tracked under this name, or under another spelling that isn't a file of its own here (the same file then).
-      const spellings = tracked.get(pathKey(relative));
-      if (spellings && (spellings.has(relative) || ![...spellings].some((other) => present.has(other)))) continue;
-      if (reader) {
-        this.setLocalOnly(relative);
-        continue;
-      }
-      const before = this.known.size;
-      // One that can't be taken in now (in use) is tried again with every pass, as a failed save is (see retryWrites).
-      if (!(await this.safely(relative, () => this.createEntry(relative)))) {
-        this.retryWrites.add(path);
-        done = false;
-      }
-      if (this.known.size > before) track(relative);
+      if (!this.stopped) this.flushAdding();
+    } finally {
+      this.adding = null;
     }
     this.left = 0;
     this.reportProgress(true);
@@ -1591,13 +1607,16 @@ export class RoomFolder {
       if (Buffer.byteLength(text, "utf8") > MAX_NOTE_BYTES) return this.notShared(relative, "size");
       // No live file entry until its content is accepted: a full room may refuse the cleanup too.
       const filled = text ? replica.edit(id, (doc) => doc.getText("content").insert(0, text)) : "published";
-      const added = filled === "refused" ? "refused" : replica.editIndex((files) => files.set(id, { path: relative, kind: "md" }));
-      if (added === "refused") return this.rejectLocal(relative, "The room's storage is full or the change was refused. Try again after space is available.");
-      const entryKey = replica.ownUpdateKey(INDEX_DOC);
-      // Remembered only once actually shared (a missing key leaves it to the next pass).
-      // With what the shared note holds now: the pass after it needn't read the note again.
-      if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true, replica.syncedKey(id));
-      else { this.queuedEntries.set(id, relative); this.queuedPaths.set(relative, id); }
+      const full = "The room's storage is full or the change was refused. Try again after space is available.";
+      if (filled === "refused") return this.rejectLocal(relative, full);
+      this.addEntry(id, { path: relative, kind: "md" }, (added) => {
+        if (added === "refused") return this.rejectLocal(relative, full);
+        const entryKey = replica.ownUpdateKey(INDEX_DOC);
+        // Remembered only once actually shared (a missing key leaves it to the next pass).
+        // With what the shared note holds now: the pass after it needn't read the note again.
+        if (added === "published" && filled === "published") this.remember(id, relative, sha(text), undefined, [entryKey], true, replica.syncedKey(id));
+        else { this.queuedEntries.set(id, relative); this.queuedPaths.set(relative, id); }
+      });
       return;
     }
     const bytes = await this.o.vault.readBytes(path);
@@ -1612,9 +1631,32 @@ export class RoomFolder {
       else this.rejectLocal(relative, `Couldn't share this file (${code(error)}). Try again after space is available.`);
       return;
     }
-    if (replica.editIndex((files) => files.set(id, { path: relative, kind: "bin", blob })) === "published") {
-      this.remember(id, relative, sha(bytes), blob, [replica.ownUpdateKey(INDEX_DOC), replica.ownBlobKey(blob.id)], true);
-    } else this.rejectLocal(relative, "Waiting to share the file's entry (a key is missing or the room's storage is full).");
+    this.addEntry(id, { path: relative, kind: "bin", blob }, (added) => {
+      if (added === "published") this.remember(id, relative, sha(bytes), blob, [replica.ownUpdateKey(INDEX_DOC), replica.ownBlobKey(blob.id)], true);
+      else this.rejectLocal(relative, "Waiting to share the file's entry (a key is missing or the room's storage is full).");
+    });
+  }
+
+  /** Add a file's entry to the room's file list: now, or with the others being taken in (see adding), then finish. */
+  private addEntry(id: string, entry: FileEntry, then: (added: ReturnType<RoomReplica["editIndex"]>) => void): void {
+    if (this.adding) this.adding.push({ id, entry, then });
+    else then(this.o.replica.editIndex((files) => files.set(id, entry)));
+  }
+
+  /** Add the entries being taken in as one change of the file list, and finish each file's sharing. */
+  private flushAdding(): void {
+    const items = this.adding?.splice(0) ?? [];
+    if (items.length === 0) return;
+    const replica = this.o.replica;
+    const added = replica.editIndex((files) => {
+      for (const { id, entry } of items) files.set(id, entry);
+    });
+    if (added !== "refused") {
+      for (const { then } of items) then(added);
+      return;
+    }
+    // Refused together (the room's storage nearly full, say): one by one, as far as it takes them, as when each goes alone.
+    for (const { id, entry, then } of items) then(replica.editIndex((files) => files.set(id, entry)));
   }
 
   /** Content changed here: put it into the shared state, or put the shared version back in a read-only room. */
