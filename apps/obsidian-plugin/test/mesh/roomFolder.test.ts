@@ -1192,6 +1192,39 @@ describe("reported file regressions", () => {
     expect(a.vault.text("Team/Other.md")).toBe("the note\n");
   });
 
+  it("keeps aside a note whose entry waits for the room key when a new file took its old name before its refused rename was put back", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    expect(a.vault.files.has("Team/New.md")).toBe(false);
+    let release!: () => void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    c.vault.gate = (path) => (path === "Team/Busy.md" ? slow : undefined);
+    await c.vault.writeText("Team/Busy.md", "busy\nmore\n");
+    // Renamed into another kind of file (to be put back), and a new note written under its old name meanwhile.
+    await c.vault.rename("Team/New.md", "Team/New.txt");
+    await c.vault.writeText("Team/New.md", "another note\n");
+    release();
+    c.vault.gate = undefined;
+    await s.settle();
+    // Cy gets the key: both notes go out, each as its own.
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      const files = [...pc.vault.files.keys()].filter((path) => path !== "Team/Busy.md").sort();
+      expect(files).toHaveLength(2);
+      expect(files[0]).toMatch(/^Team\/New \(kept Cy PC [\d-]+ \d{4}\)\.md$/);
+      expect(pc.vault.text(files[0]!)).toBe("the note\n");
+      expect(files[1]).toBe("Team/New.md");
+      expect(pc.vault.text("Team/New.md")).toBe("another note\n");
+    }
+  });
+
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
     const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
     await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));

@@ -2147,6 +2147,9 @@ export class RoomFolder {
             }
             if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: aside });
             else if (this.queuedEntries.has(id)) {
+              // Its entry waits for the room key: it goes out under the kept name (as a rename of one does, see below).
+              const entry = this.o.replica.entry(id);
+              if (entry && !entry.deleted) this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside }));
               this.dropQueued(id);
               this.queuedEntries.set(id, aside);
               this.queuedPaths.set(aside, id);
