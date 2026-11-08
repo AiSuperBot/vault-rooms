@@ -505,6 +505,26 @@ describe("devices and users", () => {
     return reduced;
   }
 
+  it("leaves a room the losing branch deleted as the winner has it, but keeps what it lowered there before", () => {
+    const { chain, admin: s } = founder("Team", "S");
+    const { joiner: a } = invite(chain, s, { userName: "A" });
+    const { joiner: b } = invite(chain, s, { userName: "B" });
+    const { joiner: m } = invite(chain, s, { userName: "M" });
+    const { joiner: x } = invite(chain, s, { userName: "X" });
+    const { joiner: z } = invite(chain, s, { userName: "Z" });
+    const { roomId } = createRoom(chain, s, "R", { [a.userId]: "manage", [b.userId]: "manage", [m.userId]: "write", [x.userId]: "write" });
+    const fork = chain.state;
+    // B makes X a reader and then deletes the room, while S revokes Z's computer; S's change wins.
+    const l1 = nextVersion(chain.workspaceId, chain.head, b.sign, (state) => (state.rooms[roomId]!.members[x.userId] = "read"));
+    const l2 = nextVersion(chain.workspaceId, l1, b.sign, (state) => void (state.rooms[roomId]!.deleted = true));
+    const won = nextVersion(chain.workspaceId, chain.head, s.sign, (state) => (state.devices[z.id]!.revoked = true));
+    chain.offer([won]);
+    reduce(chain, a, fork, [l1, l2], [won]);
+    // The deletion took nothing from anyone: only X's lower role holds.
+    expect(chain.state.rooms[roomId]!.deleted).toBeFalsy();
+    expect(chain.state.rooms[roomId]!.members).toEqual({ [s.userId]: "manage", [a.userId]: "manage", [b.userId]: "manage", [m.userId]: "write", [x.userId]: "read" });
+  });
+
   it("takes back what it can even when part of it can't be made", () => {
     // B's laptop is stolen. The thief raises U in a room A also manages, removes U, and makes X an admin, while A
     // revokes the laptop; the thief's branch wins. Lowering removed U again can't be made: X is demoted all the same.
