@@ -2135,17 +2135,28 @@ export class RoomFolder {
             if (!this.o.vault.stat(newVaultPath)) return void this.movedOn.set(newVaultPath, id);
             // Its old name taken meanwhile (a new file made there): kept next to it under a name of its own, the shared
             // file it was, so neither is taken for the other. Anything else in the way (the disk) is tried again.
-            if (to === null || !this.o.vault.stat(home)) throw error;
+            if (!this.o.vault.stat(home)) throw error;
             const aside = this.copyName(this.relative(home) ?? from!, "kept");
-            this.moving.add(movingMark(newVaultPath, this.vaultPath(aside)));
-            await this.o.vault.rename(newVaultPath, this.vaultPath(aside));
+            const mark = movingMark(newVaultPath, this.vaultPath(aside));
+            this.moving.add(mark);
+            try {
+              await this.o.vault.rename(newVaultPath, this.vaultPath(aside));
+            } catch (asideError) {
+              this.moving.delete(mark);
+              throw asideError;
+            }
             if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: aside });
             else if (this.queuedEntries.has(id)) {
               this.dropQueued(id);
               this.queuedEntries.set(id, aside);
               this.queuedPaths.set(aside, id);
             }
-            this.quietNotice(`A new file took the name of "${from}" meanwhile: the shared file is kept here as "${aside}".`);
+            // A pass settles the two (the shared file back at its name once the new one has a name of its own).
+            // shortcut: a pass between this and the new file's own event keeps that file as a conflict copy instead
+            // (nothing lost, but a notice of a clash that wasn't); handle if users meet it.
+            this.remoteChanged(INDEX_DOC);
+            // Told in full (the one before it, on the refused rename, would silence a quiet one): the user must find it.
+            this.o.notify(`A new file took the name of "${from}" meanwhile: the shared file is kept here as "${aside}".`);
           }
         };
         if (unusable) {
