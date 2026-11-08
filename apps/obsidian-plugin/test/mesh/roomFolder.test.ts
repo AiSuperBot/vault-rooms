@@ -408,6 +408,21 @@ describe("reported file regressions", () => {
     expect([...c.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["gone.md", "named.md", "pic.png"]);
   });
 
+  it("puts back a refused deletion after another file took the name, each file with its own text", async () => {
+    const { s, a, c } = await pair({ "A.md": "text of A\n", "B.md": "text of B\n" });
+    const edit = vi.spyOn(a.replica, "editIndex").mockReturnValue("refused");
+    // A is deleted, and B renamed to A while the deletion waits its moment; the room refuses both.
+    await a.vault.trash("Team/A.md");
+    await a.vault.rename("Team/B.md", "Team/A.md");
+    await s.settle();
+    edit.mockRestore();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect(pc.vault.text("Team/A.md")).toBe("text of A\n");
+      expect(pc.vault.text("Team/B.md")).toBe("text of B\n");
+    }
+  });
+
   it("keeps passes small: one note's pass skips the file list, unchanged notes aren't hashed, unchanged state isn't saved", async () => {
     const files = Object.fromEntries(Array.from({ length: 50 }, (_, i) => [`n${i}.md`, `note ${i}`]));
     const { s, a, c } = await pair(files);
@@ -3569,6 +3584,20 @@ describe("room folder, round 55", () => {
       await s.settle();
     };
     return { s, a, r, promote };
+  }
+
+  for (const away of ["deleted", "moved out of the room"] as const) {
+    it(`puts back for a reader a file ${away} and the one renamed to its name meanwhile, each with its own text`, async () => {
+      const { s, a, r } = await reader({ "B.md": "text of B\n" });
+      if (away === "deleted") await r.vault.trash("Team/Rules.md");
+      else await r.vault.rename("Team/Rules.md", "Rules.md");
+      await r.vault.rename("Team/B.md", "Team/Rules.md");
+      await s.settle();
+      for (const pc of [a, r]) {
+        expect(pc.vault.text("Team/Rules.md")).toBe("be nice\n");
+        expect(pc.vault.text("Team/B.md")).toBe("text of B\n");
+      }
+    });
   }
 
   it("keeps a file a reader added on their computer, as told, also once they may write and restart", async () => {
