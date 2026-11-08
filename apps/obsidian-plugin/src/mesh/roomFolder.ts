@@ -1238,6 +1238,8 @@ export class RoomFolder {
     // Whose each local name is, once the renames are done: a file still tracked as another's (whose rename or removal
     // is still to come, a file in the way being in use) is never taken for this one, nor written over.
     const owners = tidy ? new Map([...this.known].map(([id, known]) => [pathKey(known.path), id] as const)) : this.knownKeys;
+    // Files waiting for the room key stand where the user left them (see stayPut): theirs too, by key.
+    const queuedKeys = new Map([...this.queuedPaths].map(([path, id]) => [pathKey(path), id] as const));
     // A pass for some notes goes over those only, and one for a change of the index over the files it changed (desired
     // is compared with the one before, not each file looked at).
     const some = new Set([...dirty, ...this.toKeep.keys(), ...moved]);
@@ -1259,8 +1261,8 @@ export class RoomFolder {
         this.writeLater(id, wait);
         continue;
       }
-      // The file at its name may be another's: known there, or waiting for the room key there (see stayPut).
-      const owner = owners.get(pathKey(entry.path)) ?? this.queuedPaths.get(entry.path);
+      // The file at its name may be another's: known there, or waiting for the room key there.
+      const owner = owners.get(pathKey(entry.path)) ?? queuedKeys.get(pathKey(entry.path));
       // One that failed (a file in use, say), or must wait for another, is tried again by the next retry.
       if ((owner !== undefined && owner !== id) || !(await this.safely(entry.path, () => this.applyContent(id, entry)))) {
         this.retryIds.add(id);
@@ -1331,7 +1333,8 @@ export class RoomFolder {
       const [, move] = moves.entries().next().value as [string, { from: string; to: string }];
       // The name in the way as it is here (another case, on Windows), not as the move spells it.
       const inWay = [...(this.localNamesNow().get(pathKey(move.to)) ?? [])].find((name) => name !== move.from) ?? move.to;
-      const occupant = this.idAt(inWay);
+      // A file waiting for the room key is tracked there too (see queuedPaths): the renames wait for it as well.
+      const occupant = this.idAt(inWay) ?? this.queuedPaths.get(inWay);
       if (occupant && moves.has(occupant)) {
         const from = moves.get(occupant)!.from;
         const temporary = this.copyName(from, `moving ${occupant.slice(1, 5)}`);
@@ -1449,18 +1452,19 @@ export class RoomFolder {
         this.waitingForDeletions.add(id);
         return;
       }
-      // Its file stands where the user left it while its entry waited for the room key (see stayPut): moved to its
-      // shared name rather than written anew beside it, and looked at there.
+      const variant = this.untrackedCaseVariant(entry.path);
+      if (variant) await this.moveAside(variant);
+      // Its file stands where the user left it while its entry waited for the room key (see stayPut), still holding
+      // its text: moved to its shared name rather than written anew beside it, and looked at there. (A file of
+      // another's there by now is left alone.)
       const at = this.queuedEntries.get(id);
-      if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at))) {
+      if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at)) && sha(await this.readAs(this.vaultPath(at), entry.kind === "md")) === remoteHash) {
         await this.move(at, entry.path);
         this.dropQueued(id);
         this.queuedEntries.set(id, entry.path);
         this.queuedPaths.set(entry.path, id);
         return this.remoteChanged(id);
       }
-      const variant = this.untrackedCaseVariant(entry.path);
-      if (variant) await this.moveAside(variant);
       return this.write(id, entry, remote, remoteHash, undefined, content);
     }
     const unchangedHere = known !== undefined && unchanged(stat);
@@ -1575,6 +1579,7 @@ export class RoomFolder {
     const tracked = new Map<string, Set<string>>();
     const track = (path: string) => tracked.set(pathKey(path), (tracked.get(pathKey(path)) ?? new Set<string>()).add(path));
     for (const file of [...this.o.replica.files().values(), ...this.known.values()]) track(file.path);
+    for (const path of this.queuedEntries.values()) track(path);
     const paths = this.o.vault.listFiles(this.o.folder);
     const present = new Set(paths.map((path) => path.slice(this.prefix.length)));
     for (const path of this.rejected.keys()) if (!present.has(path)) { this.rejected.delete(path); this.o.healthChanged?.(); }
@@ -2005,10 +2010,10 @@ export class RoomFolder {
    */
   private inFlight(id: string, vaultPath: string): boolean {
     if (this.renaming.has(vaultPath)) return true;
-    // Renamed away from the name it is tracked under here, by the user, while its shared name is another (a rename
-    // elsewhere not applied here yet): the user's rename places it.
-    const known = this.known.get(id);
-    if (known && this.renaming.has(this.vaultPath(known.path))) return true;
+    // Renamed away from the name it is tracked under here (known, or waiting for the room key there), by the user,
+    // while its shared name is another (a rename elsewhere not applied here yet): the user's rename places it.
+    const at = this.known.get(id)?.path ?? this.queuedEntries.get(id);
+    if (at !== undefined && this.renaming.has(this.vaultPath(at))) return true;
     for (const [at, moved] of this.movedOn) {
       // A link outlives its event when that never comes (deletions put back unapplied, say): dropped, or the file
       // would wait for ever.
