@@ -82,6 +82,7 @@ npx pnpm@11.7.0 build:plugin   # builds main.js, copies the plugin files to the 
 
 - `packages/secure`: the protocol (identities, signed workspace record, room keys, invites, encrypted envelopes, sync between peers, TLS transport, discovery), with tests.
 - `apps/obsidian-plugin`: the Obsidian plugin (service, room folders, live editing, UI).
+- [TESTING.md](TESTING.md): the fuzz tests' options, and the checks to make by hand in Obsidian before a release.
 
 ## License and credits
 
