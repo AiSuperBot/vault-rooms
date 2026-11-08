@@ -215,6 +215,8 @@ describe("room replica", () => {
     const id = addNote(a.replica, "Plan.md", "first");
     s.net.pump();
     expect(c.replica.noteText(id)).toBe("first");
+    // Typed here (kept loaded for clashes with others' saves), and keyed all the same: what is typed is in the store.
+    expect(a.replica.syncedKey(id)).toBe(a.replica.contentKey(id));
     const docs = () => (c.replica as unknown as { docs: Map<string, unknown> }).docs;
     // Open in an editor (kept), then not.
     c.replica.releaseIdle(0, (doc) => doc === id);
