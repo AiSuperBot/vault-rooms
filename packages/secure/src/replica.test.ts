@@ -1191,6 +1191,8 @@ describe("room replica", () => {
     s.net.pump();
     for (const m of [a, c]) {
       expect(m.node.store.envelopesOf(s.roomId, fileId).updates.filter((u) => u.author === s.cy.id)).toEqual([]);
+      // Dropped from the store, they no longer mark the note's content key either (the folder needn't load the note).
+      expect(m.replica.syncedKey(fileId)).toBe(m.replica.contentKey(fileId));
       m.replica.reload(fileId);
       expect(m.replica.waitsForKey(fileId)).toBe(false);
     }
