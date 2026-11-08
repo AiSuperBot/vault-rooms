@@ -160,6 +160,16 @@ describe("the plugin's settings", () => {
     expect(plugin.settings.mountRoot).toBe("Shared");
   });
 
+  it("aren't written again at start when nothing in them changed", async () => {
+    const app: any = { vault: { adapter: { exists: async () => true } } };
+    const plugin: any = new VaultRoomsPlugin(app, { dir: ".obsidian/plugins/vault-rooms" } as any);
+    plugin.loadData = async () => ({ mesh: { scope: "testscope0000000", workspace: null }, mountRoot: "Shared" });
+    plugin.saveData = vi.fn();
+    await plugin.loadSettings();
+    expect(plugin.settings.mountRoot).toBe("Shared");
+    expect(plugin.saveData).not.toHaveBeenCalled();
+  });
+
   it("start fresh when there is no data.json yet", async () => {
     const app: any = { vault: { adapter: { exists: async () => false } } };
     const plugin: any = new VaultRoomsPlugin(app, { dir: ".obsidian/plugins/vault-rooms" } as any);
