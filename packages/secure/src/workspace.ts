@@ -727,7 +727,7 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
   };
 
   // What the losing branch took away, from signers that still stand: taken away here too.
-  const takenFrom = { devices: new Set<string>(), users: new Set<string>(), admins: new Set<string>(), rooms: new Set<string>() };
+  const takenFrom = { devices: new Set<string>(), users: new Set<string>(), admins: new Set<string>() };
   /** Roles the losing branch lowered for good, `<room>/<user>` -> the lower role (see the grants below). */
   const lowered = new Map<string, Role | undefined>();
   /** The version that last lowered something (`admin/<user>`, `room/<room>/<user>`), for what is still lower at the end. */
@@ -750,14 +750,19 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
     }
     for (const [userId, user] of Object.entries(prev.users)) if (user.admin && !next.users[userId]?.admin) lastLowered.set(`admin/${userId}`, version);
     for (const [roomId, room] of Object.entries(prev.rooms)) {
+      // Deleting a room takes nothing from anyone: only what was lowered while it was live counts.
+      if (next.rooms[roomId]?.deleted) continue;
       for (const [userId, role] of Object.entries(room.members)) {
-        const after = next.rooms[roomId]?.deleted ? undefined : next.rooms[roomId]?.members[userId];
+        const after = next.rooms[roomId]?.members[userId];
         if (after === undefined || !roleAtLeast(after, role)) lastLowered.set(`room/${roomId}/${userId}`, version);
       }
     }
     prev = next;
   }
   const end = lost[lost.length - 1]!.body.state;
+  // Each room as the losing branch last had it live (see above).
+  const live = new Map<string, RoomRecord>();
+  for (const state of [fork, ...lost.map((version) => version.body.state)]) for (const [roomId, room] of Object.entries(state.rooms)) if (!room.deleted) live.set(roomId, room);
   for (const [userId, user] of Object.entries(fork.users)) {
     const version = lastLowered.get(`admin/${userId}`);
     if (!user.admin || end.users[userId]?.admin || end.users[userId]?.removed || !version || !standing(version)?.admin) continue;
@@ -766,16 +771,14 @@ export function concurrentReductions(fork: WorkspaceState, lost: SignedVersion[]
   }
   for (const [roomId, room] of Object.entries(fork.rooms)) {
     for (const [userId, role] of Object.entries(room.members)) {
-      const after = end.rooms[roomId]?.deleted ? undefined : end.rooms[roomId]?.members[userId];
+      const after = live.get(roomId)?.members[userId];
       const version = lastLowered.get(`room/${roomId}/${userId}`);
       if ((after !== undefined && roleAtLeast(after, role)) || !version) continue;
-      // Room members are changed by the room's managers (anyone may leave); a room is deleted by them or an admin.
+      // Room members are changed by the room's managers (anyone may leave).
       const signer = standing(version);
-      const deleted = end.rooms[roomId]?.deleted === true;
-      if (!signer || !(roleIn(current, roomId, signer.id) === "manage" || (after === undefined && signer.id === userId) || (deleted && signer.admin))) continue;
-      if (role === "manage") takenFrom.rooms.add(`${roomId}/${userId}`);
+      if (!signer || !(roleIn(current, roomId, signer.id) === "manage" || (after === undefined && signer.id === userId))) continue;
       lowered.set(`${roomId}/${userId}`, after);
-      if (!deleted) setRole(roomId, userId, after, (now) => now === undefined || (after !== undefined && roleAtLeast(after, now)));
+      setRole(roomId, userId, after, (now) => now === undefined || (after !== undefined && roleAtLeast(after, now)));
     }
   }
   if (won.length === 0) return changed ? draft : null;
