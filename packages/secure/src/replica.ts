@@ -971,6 +971,8 @@ export class RoomReplica {
     // Everything up to each mark is in the checked snapshot, which is in this document.
     const state = this.docs.get(docId);
     if (state) for (const [author, clock] of Object.entries(marks)) this.markApplied(state, author, clock, true);
+    // One held unopened and dropped now (sealed under a lost key) no longer marks the content key (see syncedKey).
+    if (state) for (const env of remove) if (env.k !== "b") state.unopened.delete(envelopeKey(env));
   }
 
   // ---- outgoing ----
