@@ -917,7 +917,9 @@ export class RoomFolder {
     this.dropLocalOnly(path);
     const stat = this.o.vault.stat(this.vaultPath(path));
     const pending = this.unstoredNow.get(id) ?? { docs: new Set<string>(), keys: new Set<string>(), index: false, created: false };
-    if (isMarkdownPath(path)) pending.docs.add(id);
+    // A note's text counts as to be stored also when remembered under another kind of name (left there by a refused
+    // rename, see stayPut).
+    if (isMarkdownPath(path) || replica.entry(id)?.kind === "md") pending.docs.add(id);
     for (const key of made) if (key) pending.keys.add(key);
     pending.created ||= created;
     const queuedPath = this.queuedEntries.get(id);
@@ -1492,6 +1494,9 @@ export class RoomFolder {
     if (entry.kind === "md" && sha(normalizeNote(replica.noteText(id))) !== remoteHash) return this.remoteChanged(id);
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
+    // A differing file at a key-waiting note's own name is the user's version of it (moved there from where a refused
+    // rename left it, see above), not a stranger's.
+    if (!known && this.queuedEntries.get(id) === entry.path) return this.localChanged(id, entry, local, localHash);
     if (!known || (localHash === known.hash && !doubtful)) {
       // Nothing changed here since the last sync (or a file we never tracked sits at this path): the shared copy wins,
       // but an untracked file with content is kept aside first.
