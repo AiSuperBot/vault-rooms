@@ -2030,6 +2030,33 @@ describe("reported file regressions", () => {
     await s.settle();
     await s.settle();
     for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+    // Not a deletion of anything of Cy's: no word of a note deleted while he was working on it.
+    expect(c.notices.filter((message) => message.includes("while you were working on it"))).toEqual([]);
+  });
+
+  it("removes, as a known note, a key-waiting note deleted elsewhere after its text went out but before it was remembered here", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // Saved over the size a note may have: held back, so the pass after the key never remembers it here.
+    await c.vault.writeText("Team/New.md", "x".repeat((6 << 20) + 1));
+    await s.settle();
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    expect(a.vault.text("Team/New.md")).toBe("the note\n");
+    // Ana deletes the note. Cy's file, worked on here, is kept and goes out anew once saved small.
+    await a.vault.trash("Team/New.md");
+    await s.settle();
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\nmore\n");
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\nmore\n");
   });
 
   it("doesn't keep an empty file as a copy when a key-waiting note that went out empty got someone's text", async () => {
