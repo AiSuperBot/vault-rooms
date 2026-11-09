@@ -1947,6 +1947,59 @@ describe("reported file regressions", () => {
     for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\nmore\nAna\nCy\n");
   });
 
+  it("keeps what someone typed into a key-waiting note that went out empty, and the file here as a copy, when the user tries again", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    // As after a refused publish: held back, and the note reloaded from a store that holds nothing of it.
+    c.folder.holdBackNote(x);
+    c.replica.reload(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    // Ana gets the entry with an empty note and types into it; then Cy tries again.
+    expect(a.vault.text("Team/New.md")).toBe("");
+    await a.vault.writeText("Team/New.md", "Ana's text\n");
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    expect(c.replica.noteText(x)).toBe("Ana's text\n");
+    for (const pc of [a, c]) {
+      expect(pc.vault.text("Team/New.md")).toBe("Ana's text\n");
+      const copy = [...pc.vault.files.keys()].find((path) => path.includes("(conflict"));
+      expect(copy && pc.vault.text(copy)).toBe("the note\n");
+    }
+  });
+
+  it("takes a key-waiting note's file in again when its entry is gone from the file list (reloaded after a refused change)", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    // As after a refused publish of the file list: reloaded, without the entry that waited.
+    c.replica.reload(INDEX_DOC);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
+      expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+    }
+  });
+
   for (const empty of [false, true]) it(`waits with a deletion and a new file while the room's file list here isn't read${empty ? " (none of it, as at a start)" : ""}, and shares them once it is`, async () => {
     const { s, a, c } = await pair({ "gone.md": "one\n", "named.md": "two\n" });
     await a.vault.writeBytes("Team/pic.png", new Uint8Array([1, 2, 3]));
