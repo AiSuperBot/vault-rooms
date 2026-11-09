@@ -1196,14 +1196,21 @@ export class RoomFolder {
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
     // Entries that waited for the room key and are gone from the file list (reloaded after a refused change), or
-    // deleted by someone else before any text of ours was in them: their files are taken in again, as new ones.
+    // deleted by someone else before any text of ours was in them: their files are taken in again, as new ones. One
+    // deleted after our text went out but before it was remembered here (held back, say) is removed as a known one is:
+    // trashed if unchanged, kept and shared anew if worked on here.
     if (tidy) {
       for (const id of [...this.queuedEntries.keys()]) {
         const entry = this.o.replica.entry(id);
-        if (!entry || (entry.deleted && this.o.replica.ownUpdateKey(id) === null)) {
-          this.dropQueued(id);
-          this.forget(id);
-          this.needsAdopt = true;
+        const anew = () => { this.dropQueued(id); this.forget(id); this.needsAdopt = true; };
+        if (!entry) anew();
+        else if (entry.deleted) {
+          if (this.o.replica.ownUpdateKey(id) === null) anew();
+          else {
+            const path = this.queuedEntries.get(id)!;
+            await this.safely(path, () => this.applyRemoval(id, { path, hash: this.queuedHashes.get(id) ?? "", size: -1, mtime: -1 }));
+            this.dropQueued(id);
+          }
         }
       }
     }
