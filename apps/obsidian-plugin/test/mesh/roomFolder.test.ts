@@ -1986,17 +1986,76 @@ describe("reported file regressions", () => {
     await s.settle();
     await c.vault.writeText("Team/New.md", "the note\n");
     await s.settle();
-    // As after a refused publish of the file list: reloaded, without the entry that waited.
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    // As after refused publishes of the note and of the file list: the note held back, the list reloaded without the
+    // entry that waited.
+    c.folder.holdBackNote(x);
     c.replica.reload(INDEX_DOC);
     a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
     await s.settle();
     await s.settle();
-    c.folder.retryNow();
+    // A whole pass (as the key's arrival brings), not Try again: the hold must go with the entry.
+    c.folder.remoteChanged();
     await s.settle();
     await s.settle();
     for (const pc of [a, c]) {
       expect([...pc.vault.files.keys()].sort()).toEqual(["Team/Busy.md", "Team/New.md"]);
       expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+    }
+    // Nothing of the old entry is shown as held back.
+    expect(c.folder.health().heldBack).toEqual([]);
+  });
+
+  it("takes a key-waiting note's file in anew when someone deleted the note that went out empty", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    c.folder.holdBackNote(x);
+    c.replica.reload(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    // Ana gets the entry with an empty note and deletes it; Cy's file, nothing of which was ever in that note, is a
+    // file of its own: shared anew at the next whole pass.
+    expect(a.vault.text("Team/New.md")).toBe("");
+    await a.vault.trash("Team/New.md");
+    await s.settle();
+    await s.settle();
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+  });
+
+  it("doesn't keep an empty file as a copy when a key-waiting note that went out empty got someone's text", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    c.folder.holdBackNote(x);
+    c.replica.reload(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    await a.vault.writeText("Team/New.md", "Ana's text\n");
+    await s.settle();
+    await s.settle();
+    // Cy empties his file: Ana's text takes its place, and no copy of nothing is kept.
+    await c.vault.writeText("Team/New.md", "");
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect(pc.vault.text("Team/New.md")).toBe("Ana's text\n");
+      expect([...pc.vault.files.keys()].filter((path) => path.includes("(conflict"))).toEqual([]);
     }
   });
 
