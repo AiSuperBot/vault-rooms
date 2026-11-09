@@ -496,6 +496,7 @@ export class RoomFolder {
 
   /** Stop tracking a file (gone, or no longer the room's), and whatever was held back of it. */
   private forget(id: string): void {
+    this.dropQueued(id);
     this.unindex(id);
     this.incomplete.delete(id);
     this.noteWrites.delete(id);
@@ -514,7 +515,8 @@ export class RoomFolder {
     const path = this.queuedEntries.get(id);
     if (path === undefined) return;
     this.queuedEntries.delete(id);
-    this.queuedPaths.delete(path);
+    // (The name may be another entry's by now: a new one made there as this one was forgotten.)
+    if (this.queuedPaths.get(path) === id) this.queuedPaths.delete(path);
   }
 
   /** Remembered in an earlier session before what was made here got stored: settled by the next pass, not by an editor. */
@@ -1195,25 +1197,6 @@ export class RoomFolder {
     }
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
-    // Entries that waited for the room key and are gone from the file list (reloaded after a refused change), or
-    // deleted by someone else before any text of ours was in them: their files are taken in again, as new ones. One
-    // deleted after our text went out but before it was remembered here (held back, say) is removed as a known one is:
-    // trashed if unchanged, kept and shared anew if worked on here.
-    if (tidy) {
-      for (const id of [...this.queuedEntries.keys()]) {
-        const entry = this.o.replica.entry(id);
-        const anew = () => { this.dropQueued(id); this.forget(id); this.needsAdopt = true; };
-        if (!entry) anew();
-        else if (entry.deleted) {
-          if (this.o.replica.ownUpdateKey(id) === null) anew();
-          else {
-            const path = this.queuedEntries.get(id)!;
-            await this.safely(path, () => this.applyRemoval(id, { path, hash: this.queuedHashes.get(id) ?? "", size: -1, mtime: -1 }));
-            this.dropQueued(id);
-          }
-        }
-      }
-    }
     const writeNow = this.writeNow;
     this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
@@ -1231,6 +1214,27 @@ export class RoomFolder {
       if (!(await this.safely(path.slice(this.prefix.length), () => this.localWrite(path)))) this.retryWrites.add(path);
       // Failed, or put back to wait (see localWrite): not done, so the retries keep backing off.
       if (this.retryWrites.has(path)) done = false;
+    }
+    // Entries that waited for the room key and are gone from the file list (reloaded after a refused change), or
+    // deleted by someone else before any text of ours was in them: their files are taken in again, as new ones. One
+    // deleted after our text went out but before it was remembered here (held back, say) is removed as a known one is:
+    // trashed if unchanged, kept and shared anew if worked on here, tried again if that fails (it stays tracked).
+    if (tidy) {
+      for (const id of [...this.queuedEntries.keys()]) {
+        const entry = this.o.replica.entry(id);
+        const anew = () => { this.forget(id); this.needsAdopt = true; };
+        if (!entry) anew();
+        else if (entry.deleted) {
+          if (this.o.replica.ownUpdateKey(id) === null) anew();
+          else {
+            const path = this.queuedEntries.get(id)!;
+            if (!(await this.safely(path, () => this.applyRemoval(id, { path, hash: this.queuedHashes.get(id) ?? "", size: -1, mtime: -1 })))) {
+              this.retryAll = true;
+              done = false;
+            }
+          }
+        }
+      }
     }
     const replica = this.o.replica;
     // Built anew by a whole pass, and whenever the index changed: a pass for one note doesn't go over every file.
