@@ -1195,6 +1195,9 @@ export class RoomFolder {
     }
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
+    // Entries that waited for the room key and are gone from the file list (reloaded after a refused change): their
+    // files are taken in again, as new ones.
+    if (tidy) for (const id of [...this.queuedEntries.keys()]) if (!this.o.replica.entry(id)) { this.dropQueued(id); this.queuedHashes.delete(id); this.needsAdopt = true; }
     const writeNow = this.writeNow;
     this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
@@ -1502,12 +1505,13 @@ export class RoomFolder {
     // the user's version of it, unless the shared text moved on since the note was queued (someone's edit came in):
     // then, as for any file changed on both sides, theirs wins and the user's version is kept aside.
     if (!known && this.queuedEntries.get(id) === entry.path) {
-      // Judged against the baseline only once this computer's own text is out: reloaded before that (its first
-      // publish refused, say), the note is empty, and the file is all there is of it.
+      // Judged against the baseline only once this computer's own text is out. Before that (its first publish refused,
+      // say, and the note reloaded empty), whatever the note holds is someone else's: an empty note takes the file,
+      // text in it wins and the file is kept aside.
       const base = this.queuedHashes.get(id);
       const out = replica.ownUpdateKey(id) !== null;
-      if (base === undefined || !out || remoteHash === base) return this.localChanged(id, entry, local, localHash);
-      if (localHash !== base) await this.keepAside(entry.path, local);
+      if (base === undefined || remoteHash === base || (!out && remote.length === 0)) return this.localChanged(id, entry, local, localHash);
+      if (!out || localHash !== base) await this.keepAside(entry.path, local);
       return this.write(id, entry, remote, remoteHash, localHash, content);
     }
     if (!known || (localHash === known.hash && !doubtful)) {

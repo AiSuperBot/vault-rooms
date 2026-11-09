@@ -1,7 +1,7 @@
 import { hostname } from "node:os";
 import { MarkdownView, Notice, normalizePath, Plugin, TAbstractFile, TFile, TFolder, type WorkspaceLeaf } from "obsidian";
 import type { EditorView } from "@codemirror/view";
-import { cleanName, isWithin, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
+import { cleanName, INDEX_DOC, isWithin, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
 import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
 import { MeshService, MeshServiceError, type MeshDeps, type MeshSettings } from "./mesh/meshService.js";
 import { ObsidianVault } from "./mesh/obsidianVault.js";
@@ -760,7 +760,8 @@ export default class VaultRoomsPlugin extends Plugin {
       this.folders.get(roomId)?.remoteChanged(docId);
       return this.syncEditorsSoon();
     }
-    this.folders.get(roomId)?.holdBackNote(docId);
+    // The file list isn't a note to hold back: reloaded, entries that waited for the key are taken in again by a pass.
+    if (docId !== INDEX_DOC) this.folders.get(roomId)?.holdBackNote(docId);
     this.editors.unbindNote(roomId, docId);
     replica.reload(docId);
     this.syncEditorsSoon();
