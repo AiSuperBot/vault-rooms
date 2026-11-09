@@ -1604,7 +1604,13 @@ export class RoomFolder {
     // Changed here after someone else removed it, or being worked on here: keep it, and share it again as a new file.
     this.forget(id);
     if (!this.o.replica.canWrite()) return;
-    await this.createEntry(known.path);
+    try {
+      await this.createEntry(known.path);
+    } catch (error) {
+      // Not taken in now (in use, say): forgotten already, so tried again as a save of it would be (see retryWrites).
+      this.retryWrites.add(path);
+      throw error;
+    }
     this.o.notify(`"${known.path}" was deleted by someone else while you were working on it here. Your copy stays, and is shared again.`);
   }
 
