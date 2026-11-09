@@ -2085,9 +2085,43 @@ describe("reported file regressions", () => {
     c.folder.retryNow();
     await s.settle();
     await s.settle();
-    // Worked on here (just made): kept, and shared anew, with word of the deletion.
-    expect(c.notices.some((message) => message.includes("while you were working on it"))).toBe(true);
-    for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+    // Worked on here (just made): kept, and shared anew (once), with word of the deletion.
+    expect(c.notices.filter((message) => message.includes("while you were working on it"))).toHaveLength(1);
+    for (const pc of [a, c]) {
+      expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+      expect([...pc.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["Busy.md", "New.md"]);
+    }
+  });
+
+  it("shares again a note kept after someone's deletion also when taking it in failed at that moment", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    c.folder.holdBackNote(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    // Ana deletes the note. Cy's removal reads the file (worked on here: kept), but taking it in anew fails to read it
+    // (locked between the two reads): tried again.
+    let reads = 0;
+    c.vault.failReads = (path) => path === "Team/New.md" && ++reads === 2;
+    await a.vault.trash("Team/New.md");
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.md")).toBe("the note\n");
+    c.vault.failReads = undefined;
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    for (const pc of [a, c]) {
+      expect(pc.vault.text("Team/New.md")).toBe("the note\n");
+      expect([...pc.replica.files().values()].map((entry) => entry.path).sort()).toEqual(["Busy.md", "New.md"]);
+    }
   });
 
   it("doesn't keep an empty file as a copy when a key-waiting note that went out empty got someone's text", async () => {
