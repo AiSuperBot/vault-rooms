@@ -12,6 +12,7 @@ vi.mock("obsidian", async (original) => {
   };
 });
 
+import { INDEX_DOC } from "@vault-rooms/secure";
 import VaultRoomsPlugin from "../../src/plugin.js";
 import { RoomFolder } from "../../src/mesh/roomFolder.js";
 
@@ -44,6 +45,24 @@ function setup(folder: string, folders: string[], hidden = false) {
 }
 
 const cleanup = (plugin: any) => { for (const presence of plugin.presences.values()) presence.destroy(); };
+
+describe("a change the room refused", () => {
+  it("holds back the note it was about, but not the room's file list, and reloads both", () => {
+    const { plugin } = setup("Rooms/Plans", ["Rooms/Plans"]);
+    const reloaded: string[] = [];
+    plugin.service = { replica: () => ({ reload: (docId: string) => void reloaded.push(docId) }) };
+    const held: string[] = [];
+    plugin.folders.set("r1", { holdBackNote: (id: string) => void held.push(id), remoteChanged: () => {} });
+    plugin.editors = { unbindNote: () => {} };
+    plugin.syncEditorsSoon = () => {};
+    const note = `f${"a".repeat(22)}`;
+    plugin.handleRefused("r1", note, "publish_refused");
+    plugin.handleRefused("r1", INDEX_DOC, "publish_refused");
+    expect(held).toEqual([note]);
+    expect(reloaded).toEqual([note, INDEX_DOC]);
+    cleanup(plugin);
+  });
+});
 
 describe("a room's folder on this computer", () => {
   it("isn't made again when it is gone (renamed or deleted outside Obsidian): the room is hidden, not downloaded twice", async () => {
