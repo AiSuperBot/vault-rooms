@@ -2057,6 +2057,37 @@ describe("reported file regressions", () => {
     await s.settle();
     await s.settle();
     for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\nmore\n");
+    expect(c.notices.some((message) => message.includes("while you were working on it"))).toBe(true);
+  });
+
+  it("tries the removal of a key-waiting note deleted elsewhere again when its file can't be read, rather than losing track of it", async () => {
+    const { s, a, c } = await pair({ "Busy.md": "busy\n" });
+    const k2 = newRoomKey();
+    a.node.offerVersions([nextVersion(s.ws, a.node.chain.head, s.ana.sign, (state) => void state.rooms[s.roomId]!.epochs.push({ n: 2, commit: keyCommitment(s.ws, s.roomId, 2, k2) }))]);
+    a.replica.addOwnKey(2, k2);
+    await s.settle();
+    await c.vault.writeText("Team/New.md", "the note\n");
+    await s.settle();
+    const x = [...c.replica.files()].find(([, entry]) => entry.path === "New.md")![0];
+    // Held back (as after a refused publish): the pass after the key never remembers it here.
+    c.folder.holdBackNote(x);
+    a.node.addWrap(wrapRoomKey(s.ws, s.roomId, 2, k2, { id: s.cy.id, agree: s.cy.agree.publicKey }, s.ana.sign));
+    await s.settle();
+    await s.settle();
+    expect(a.vault.text("Team/New.md")).toBe("the note\n");
+    // Ana deletes the note while Cy's file can't be read: the removal fails, and must be tried again, not given up.
+    c.vault.failReads = (path) => path === "Team/New.md";
+    await a.vault.trash("Team/New.md");
+    await s.settle();
+    await s.settle();
+    expect(c.vault.text("Team/New.md")).toBe("the note\n");
+    c.vault.failReads = undefined;
+    c.folder.retryNow();
+    await s.settle();
+    await s.settle();
+    // Worked on here (just made): kept, and shared anew, with word of the deletion.
+    expect(c.notices.some((message) => message.includes("while you were working on it"))).toBe(true);
+    for (const pc of [a, c]) expect(pc.vault.text("Team/New.md")).toBe("the note\n");
   });
 
   it("doesn't keep an empty file as a copy when a key-waiting note that went out empty got someone's text", async () => {
