@@ -1195,9 +1195,18 @@ export class RoomFolder {
     }
     const { everything, dirty, retrying } = this;
     const tidy = everything || this.indexChanged;
-    // Entries that waited for the room key and are gone from the file list (reloaded after a refused change): their
-    // files are taken in again, as new ones.
-    if (tidy) for (const id of [...this.queuedEntries.keys()]) if (!this.o.replica.entry(id)) { this.dropQueued(id); this.queuedHashes.delete(id); this.needsAdopt = true; }
+    // Entries that waited for the room key and are gone from the file list (reloaded after a refused change), or
+    // deleted by someone else before any text of ours was in them: their files are taken in again, as new ones.
+    if (tidy) {
+      for (const id of [...this.queuedEntries.keys()]) {
+        const entry = this.o.replica.entry(id);
+        if (!entry || (entry.deleted && this.o.replica.ownUpdateKey(id) === null)) {
+          this.dropQueued(id);
+          this.forget(id);
+          this.needsAdopt = true;
+        }
+      }
+    }
     const writeNow = this.writeNow;
     this.writeNow = false;
     this.everything = this.retrying = this.indexChanged = false;
@@ -1511,7 +1520,7 @@ export class RoomFolder {
       const base = this.queuedHashes.get(id);
       const out = replica.ownUpdateKey(id) !== null;
       if (base === undefined || remoteHash === base || (!out && remote.length === 0)) return this.localChanged(id, entry, local, localHash);
-      if (!out || localHash !== base) await this.keepAside(entry.path, local);
+      if (!out ? local.length > 0 : localHash !== base) await this.keepAside(entry.path, local);
       return this.write(id, entry, remote, remoteHash, localHash, content);
     }
     if (!known || (localHash === known.hash && !doubtful)) {
