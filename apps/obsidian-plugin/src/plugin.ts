@@ -1,5 +1,5 @@
 import { hostname } from "node:os";
-import { MarkdownView, Notice, normalizePath, Plugin, TAbstractFile, TFile, TFolder, type WorkspaceLeaf } from "obsidian";
+import { getLinkpath, MarkdownView, Notice, normalizePath, Plugin, TAbstractFile, TFile, TFolder, type WorkspaceLeaf } from "obsidian";
 import type { EditorView } from "@codemirror/view";
 import { cleanName, INDEX_DOC, isWithin, MAX_PATH, MAX_SEGMENT, pathKey, randomId, safeRoomPath, type Role, type RoomReplica } from "@vault-rooms/secure";
 import { EditorBinding, type BindTarget } from "./mesh/editorBinding.js";
@@ -105,6 +105,17 @@ export default class VaultRoomsPlugin extends Plugin {
     };
     this.register(() => {
       if (files.getAvailablePathForAttachment !== attachmentPath) files.getAvailablePathForAttachment = attachmentPath;
+    });
+    // Likewise a note made by opening a room note's link that leads nowhere yet (a Kanban card's link, say): it goes into
+    // the room, so the link leads to it for the others too. A note you start yourself (new note, daily note) stays where
+    // Obsidian puts it: that may be private.
+    const newFileParent = files.getNewFileParent.bind(files);
+    files.getNewFileParent = (sourcePath, newFilePath) => {
+      const parent = newFileParent(sourcePath, newFilePath);
+      return this.linkedNoteFolder(parent, sourcePath, newFilePath) ?? parent;
+    };
+    this.register(() => {
+      if (files.getNewFileParent !== newFileParent) files.getNewFileParent = newFileParent;
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -388,6 +399,21 @@ export default class VaultRoomsPlugin extends Plugin {
       const candidate = `${dir ? `${dir}/` : ""}${stem}${i > 1 ? ` ${i}` : ""}${ext}`;
       if (!taken.has(pathKey(candidate)) && !this.app.vault.getAbstractFileByPath(candidate)) return candidate;
     }
+  }
+
+  /**
+   * Where a note made by opening `linktext`, a link of `note` that leads nowhere yet, goes when Obsidian's choice
+   * (`parent`) is outside the room `note` is in: next to `note`. Null (Obsidian's choice stays) for a note in no room or
+   * in a room you may only read, and for a new note none of the note's links asked for.
+   */
+  linkedNoteFolder(parent: TFolder, note: string, linktext?: string): TFolder | null {
+    const roomId = note && linktext ? this.roomAt(note) : null;
+    if (!roomId || this.canWrite(note) === false) return null;
+    const target = getLinkpath(linktext!);
+    if (this.roomAt(normalizePath(`${parent.path}/${target}.md`)) === roomId) return null;
+    if (this.app.metadataCache.unresolvedLinks[note]?.[target] === undefined) return null;
+    const folder = this.app.vault.getAbstractFileByPath(note.slice(0, note.lastIndexOf("/")));
+    return folder instanceof TFolder ? folder : null;
   }
 
   /** Why a folder can't be (or become) a room's folder (see folderProblem), rooms shown here counted, but `exceptRoomIds`. */

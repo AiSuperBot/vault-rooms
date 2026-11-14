@@ -129,6 +129,26 @@ describe("a room's folder on this computer", () => {
     expect(plugin.attachmentInRoom("Team/Images/scan.png", "scan.png", "Today.md")).toBe("scan.png");
   });
 
+  it("puts a note made from a room note's link into the room, next to that note", () => {
+    const { plugin } = setup("Team", ["Team", "Team/Notes"]);
+    let writable = true;
+    plugin.service.replica = () => ({ canWrite: () => writable });
+    plugin.app.metadataCache = { unresolvedLinks: { "Team/Notes/Board.md": { "Connection pool": 1 }, "Private/Plan.md": { "Connection pool": 1 } } };
+    const root = folderAt("/");
+    expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md", "Connection pool")?.path).toBe("Team/Notes");
+    expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md", "Connection pool#Steps")?.path).toBe("Team/Notes");
+    expect(plugin.linkedNoteFolder(folderAt("Elsewhere"), "Team/Notes/Board.md", "Connection pool")?.path).toBe("Team/Notes");
+    // Obsidian's choice already in the room, a note outside rooms, a new note no link asked for: Obsidian's choice stays.
+    expect(plugin.linkedNoteFolder(folderAt("Team/Inbox"), "Team/Notes/Board.md", "Connection pool")).toBeNull();
+    expect(plugin.linkedNoteFolder(root, "Private/Plan.md", "Connection pool")).toBeNull();
+    expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md", "Untitled")).toBeNull();
+    expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md")).toBeNull();
+    expect(plugin.linkedNoteFolder(root, "", "Connection pool")).toBeNull();
+    // A room you may only read would refuse the note.
+    writable = false;
+    expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md", "Connection pool")).toBeNull();
+  });
+
   it("gives an attachment a name no file of that folder has, whatever its case", () => {
     const { plugin, items } = setup("Team", ["Team"]);
     items.set("Team/Notes", Object.assign(folderAt("Team/Notes"), { children: [{ path: "Team/Notes/Scan.pdf" }] }));

@@ -9,6 +9,12 @@ export function normalizePath(path: string): string {
   return path.replace(/\\/g, "/").replace(/\/+/g, "/").replace(/^\/+/, "").replace(/\/+$/, "");
 }
 
+/** A link's note, without its `#heading` or `#^block`. */
+export function getLinkpath(linktext: string): string {
+  const hash = linktext.indexOf("#");
+  return hash < 0 ? linktext : linktext.slice(0, hash);
+}
+
 export class TFile {
   constructor(readonly path: string) {}
   get extension(): string {
