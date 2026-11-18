@@ -94,29 +94,16 @@ export default class VaultRoomsPlugin extends Plugin {
     // Fired on every pane drag and sidebar toggle: one check for a burst of them.
     this.registerEvent(this.app.workspace.on("layout-change", () => this.syncEditorsSoon()));
 
-    // A file dropped or pasted into a room's note goes into the room, so the others get it too (Obsidian's default puts
-    // attachments in the vault's root folder).
-    const files = this.app.fileManager;
-    const attachmentPath = files.getAvailablePathForAttachment.bind(files);
-    files.getAvailablePathForAttachment = async (filename, sourcePath) => {
-      const path = await attachmentPath(filename, sourcePath);
-      const note = sourcePath ?? this.app.workspace.getActiveFile()?.path;
-      return note ? this.attachmentInRoom(path, filename, note) : path;
-    };
-    this.register(() => {
-      if (files.getAvailablePathForAttachment !== attachmentPath) files.getAvailablePathForAttachment = attachmentPath;
-    });
+    // A file dropped or pasted into a room's note (or onto a card of a room's board) goes into the room, so the others
+    // get it too (Obsidian's default puts attachments in the vault's root folder).
+    this.hookAttachments();
     // Likewise a note made by opening a room note's link that leads nowhere yet (a Kanban card's link, say), or with
     // Kanban's "New note from card" on a board in a room: it goes into the room, so the card's link leads to it for the
     // others too. A note you start yourself (new note, daily note, a new board) stays where Obsidian puts it: that may be
     // private.
-    const newFileParent = files.getNewFileParent.bind(files);
-    files.getNewFileParent = (sourcePath, newFilePath) => {
+    this.patch(this.app.fileManager, "getNewFileParent", (newFileParent) => (sourcePath, newFilePath) => {
       const parent = newFileParent(sourcePath, newFilePath);
       return this.linkedNoteFolder(parent, sourcePath, newFilePath) ?? this.cardNoteFolder(parent, sourcePath, newFilePath) ?? parent;
-    };
-    this.register(() => {
-      if (files.getNewFileParent !== newFileParent) files.getNewFileParent = newFileParent;
     });
 
     this.app.workspace.onLayoutReady(() => {
@@ -386,6 +373,37 @@ export default class VaultRoomsPlugin extends Plugin {
   }
 
   /**
+   * Wrap `obj[name]` while the plugin runs. At unload it is put back only if still ours: a wrapper another plugin added
+   * after ours stays.
+   */
+  private patch<T extends object, K extends keyof T>(obj: T, name: K, wrap: (original: T[K]) => T[K]): void {
+    const own = Object.prototype.hasOwnProperty.call(obj, name);
+    const fn = obj[name];
+    const wrapper = wrap((fn as unknown as (...args: unknown[]) => unknown).bind(obj) as T[K]);
+    obj[name] = wrapper;
+    this.register(() => {
+      if (obj[name] !== wrapper) return;
+      if (own) obj[name] = fn;
+      else Reflect.deleteProperty(obj, name);
+    });
+  }
+
+  /**
+   * Attachments of a room's note go into the room. Hooked on the vault: Obsidian's paste and drop, its FileManager
+   * method and Kanban's card paste all ask it for the path (the FileManager method alone is asked by none of them).
+   */
+  hookAttachments(): void {
+    type Attachments = { getAvailablePathForAttachments?: (name: string, extension: string, file: TFile | null) => Promise<string> };
+    const vault = this.app.vault as unknown as Attachments;
+    if (typeof vault.getAvailablePathForAttachments !== "function") return;
+    this.patch(vault, "getAvailablePathForAttachments", (original) => async (name: string, extension: string, file: TFile | null) => {
+      const path = await original!(name, extension, file);
+      const note = file?.path ?? this.app.workspace.getActiveFile()?.path;
+      return note ? this.attachmentInRoom(path, extension ? `${name}.${extension}` : name, note) : path;
+    });
+  }
+
+  /**
    * Where an attachment of `note` goes: `path` (Obsidian's choice) if that is in the note's room (or, for a note in no
    * room, in no room either), else next to the note: a note's picture never goes to a room it isn't in.
    */
@@ -578,7 +596,7 @@ export default class VaultRoomsPlugin extends Plugin {
     const assigned = !ws.rooms[roomId];
     if (assigned) {
       // Name the folder after the room, which needs the room key: wait for it rather than invent a name.
-      const name = svc.rooms().find((room) => room.id === roomId)?.name;
+      const name = svc.roomName(roomId);
       if (!name) {
         this.pendingMounts.add(roomId);
         return;
@@ -702,7 +720,7 @@ export default class VaultRoomsPlugin extends Plugin {
     await this.unmount(roomId);
     room.hidden = true;
     await this.saveSettings();
-    const name = this.service?.rooms().find((r) => r.id === roomId)?.name ?? room.folder;
+    const name = this.service?.roomName(roomId) ?? room.folder;
     new Notice(`The folder of "${name}" is gone from this vault (deleted, or renamed outside Obsidian). The room stays shared with the others; it just isn't shown in this vault any more. You can show it again from the Vault Rooms panel.`, 12000);
     this.changed();
   }
@@ -722,7 +740,7 @@ export default class VaultRoomsPlugin extends Plugin {
     for (const roomId of [...this.pendingMounts]) {
       const replica = svc?.replica(roomId);
       if (!replica) this.pendingMounts.delete(roomId);
-      else if (svc!.rooms().find((room) => room.id === roomId)?.name) void this.onReplica(roomId, replica);
+      else if (svc!.roomName(roomId)) void this.onReplica(roomId, replica);
     }
   }
 

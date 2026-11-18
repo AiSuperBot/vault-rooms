@@ -160,6 +160,8 @@ export interface RoomFolderOptions {
   notify(message: string): void;
   log(message: string): void;
   now?: () => Date;
+  /** How often the saves may be stored while the folder runs (see storeSaves); SAVES_EVERY by default, 0 in tests. */
+  savesEveryMs?: number;
 }
 
 const DELETED = "\u0000deleted";
@@ -168,6 +170,8 @@ const RETRY_FIRST_MS = 1_000;
 const RETRY_MAX_MS = 300_000;
 /** A note not used for this long is unloaded (see RoomReplica.releaseIdle). */
 const IDLE_NOTE_MS = 5 * 60_000;
+/** The saves (see storeSaves) are stored at most this often while the folder runs. */
+const SAVES_EVERY = 60_000;
 /**
  * Deletions of the folder's files are taken as such once none has come for this long: Explorer deletes a folder file by
  * file (moving it to another drive, Shift+Delete, one too large for the Recycle Bin), and the folder itself last, which
@@ -425,8 +429,9 @@ export class RoomFolder {
   private left = 0;
   private reported = 0;
   private reportedAt = 0;
-  /** What RoomReplica.savesChanged was when the saves were last stored. */
+  /** What RoomReplica.savesChanged was when the saves were last stored, and when. */
   private savesStored = -1;
+  private savesStoredAt = 0;
   /** The stored saves couldn't be read when the folder started: read again before they are stored, never written over. */
   private savesUnread = false;
 
@@ -508,6 +513,18 @@ export class RoomFolder {
     // An editor tied to it is tied again (to the copy shared under a new id, say), not left feeding a deleted note.
     const bound = this.o.isBound(id);
     if (this.heldBack.delete(id) || bound) this.o.heldBackChanged?.();
+  }
+
+  /** A new note's entry waiting for the room key (see queuedEntries) now stands for the file at `path`. */
+  private requeue(id: string, path: string): void {
+    this.dropQueued(id);
+    this.queuedEntries.set(id, path);
+    this.queuedPaths.set(path, id);
+  }
+
+  /** What the shared note holds now, hashed as a file of it would be. */
+  private sharedHash(id: string): string {
+    return sha(normalizeNote(this.o.replica.noteText(id)));
   }
 
   /** A new note's entry waiting for the room key (see queuedEntries) no longer stands for a file here. */
@@ -886,15 +903,17 @@ export class RoomFolder {
         throw error;
       }
     }
-    await this.storeSaves();
+    await this.storeSaves(this.stopped);
   }
 
   /**
-   * The saves (see RoomReplica.recentSaves), stored apart and only when they changed; never over stored ones that
+   * The saves (see RoomReplica.recentSaves), stored apart and only when they changed, at most once a minute (they can
+   * reach a megabyte, and every save of a note changes them): within the minute they wait for a later save of the state
+   * (one comes with every change), and they are always stored at stop; never over stored ones that
    * couldn't be read (they are read first). Saves not stored only miss a clash after a restart: a failure here never
    * stops the state being stored.
    */
-  private async storeSaves(): Promise<void> {
+  private async storeSaves(now = false): Promise<void> {
     try {
       if (this.savesUnread) {
         this.o.replica.restoreSaves(await this.o.loadSaves());
@@ -902,8 +921,10 @@ export class RoomFolder {
       }
       const saves = this.o.replica.savesChanged;
       if (saves === this.savesStored) return;
+      if (!now && Date.now() - this.savesStoredAt < (this.o.savesEveryMs ?? SAVES_EVERY)) return;
       await this.o.saveSaves(this.o.replica.recentSaves());
       this.savesStored = saves;
+      this.savesStoredAt = Date.now();
     } catch (error) {
       this.o.log(`room folder, saves: ${(error as Error).message}`);
     }
@@ -1489,9 +1510,7 @@ export class RoomFolder {
       const at = this.queuedEntries.get(id);
       if (at !== undefined && at !== entry.path && this.o.vault.stat(this.vaultPath(at))) {
         await this.move(at, entry.path);
-        this.dropQueued(id);
-        this.queuedEntries.set(id, entry.path);
-        this.queuedPaths.set(entry.path, id);
+        this.requeue(id, entry.path);
         return this.remoteChanged(id);
       }
       return this.write(id, entry, remote, remoteHash, undefined, content);
@@ -1518,7 +1537,7 @@ export class RoomFolder {
     }
     // The shared note moved on while the file was read (someone's edit came in): what was taken for the shared text is
     // stale, and a change made here would be put over their edit. Decided again on what the note holds now.
-    if (entry.kind === "md" && sha(normalizeNote(replica.noteText(id))) !== remoteHash) return this.remoteChanged(id);
+    if (entry.kind === "md" && this.sharedHash(id) !== remoteHash) return this.remoteChanged(id);
     const localHash = sha(local);
     if (localHash === remoteHash) return this.remember(id, entry.path, remoteHash, entry.blob, [], false, content);
     // A differing file at a key-waiting note's own name (moved there from where a refused rename left it, see above) is
@@ -1771,7 +1790,8 @@ export class RoomFolder {
       const result = replica.edit(id, (doc) => reconcileYTextByLines(doc.getText("content"), local, "disk"), true);
       if (result === "refused") return this.holdBack(id, entry.path, localHash);
       if (result === "queued") return void this.queuedHashes.set(id, localHash);
-      this.remember(id, entry.path, localHash);
+      // With what the shared note holds now (the file's text): the pass its own echo starts needn't read the note again.
+      this.remember(id, entry.path, localHash, undefined, [], false, replica.syncedKey(id));
       return;
     }
     if (!(local instanceof Uint8Array)) return;
@@ -1794,7 +1814,7 @@ export class RoomFolder {
   /** Whether the shared version of a file differs from what was last synced here (our own unsent edits aside). */
   private async sharedMovedOn(id: string, entry: FileEntry, known: Known): Promise<boolean> {
     const replica = this.o.replica;
-    if (entry.kind === "md") return !replica.hasUnsent(id) && (!replica.isComplete(id) || sha(normalizeNote(replica.noteText(id))) !== known.hash);
+    if (entry.kind === "md") return !replica.hasUnsent(id) && (!replica.isComplete(id) || this.sharedHash(id) !== known.hash);
     if (!entry.blob || entry.blob.id === known.blob) return false;
     const remote = await replica.readBlob(entry.blob);
     return remote === null || sha(remote) !== known.hash;
@@ -1903,7 +1923,7 @@ export class RoomFolder {
       // The shared text moved on since the note was queued here (someone's edit came in): a pass decides on both.
       const base = this.queuedHashes.get(id);
       const replica = this.o.replica;
-      if (base !== undefined && !replica.hasUnsent(id) && (!replica.isComplete(id) || sha(normalizeNote(replica.noteText(id))) !== base)) return this.remoteChanged(id);
+      if (base !== undefined && !replica.hasUnsent(id) && (!replica.isComplete(id) || this.sharedHash(id) !== base)) return this.remoteChanged(id);
       await this.localChanged(id, where, content, hash);
       if (where !== entry) this.remoteChanged(INDEX_DOC);
       return;
@@ -2229,9 +2249,7 @@ export class RoomFolder {
               if (to !== null) {
                 if (this.known.has(id)) this.setKnown(id, { ...this.known.get(id)!, path: to });
                 else if (this.queuedEntries.has(id)) {
-                  this.dropQueued(id);
-                  this.queuedEntries.set(id, to);
-                  this.queuedPaths.set(to, id);
+                  this.requeue(id, to);
                 }
                 this.remoteChanged(INDEX_DOC);
               }
@@ -2259,9 +2277,7 @@ export class RoomFolder {
               // Its entry waits for the room key: it goes out under the kept name (as a rename of one does, see below).
               const entry = this.o.replica.entry(id);
               refused = entry !== undefined && !entry.deleted && this.o.replica.canWrite() && this.o.replica.editIndex((files) => files.set(id, { ...entry, path: aside })) === "refused";
-              this.dropQueued(id);
-              this.queuedEntries.set(id, aside);
-              this.queuedPaths.set(aside, id);
+              this.requeue(id, aside);
             }
             // A pass settles the two (the shared file back at its name once the new one has a name of its own).
             // shortcut: a pass between this and the new file's own event keeps that file as a conflict copy instead
@@ -2300,9 +2316,7 @@ export class RoomFolder {
         else {
           // Its entry still waits for the room key: it goes out under the new name (not the queued one, which may not be
           // `from`: see movedOn).
-          this.dropQueued(id);
-          this.queuedEntries.set(id, to!);
-          this.queuedPaths.set(to!, id);
+          this.requeue(id, to!);
         }
         this.saveSoon();
         return;

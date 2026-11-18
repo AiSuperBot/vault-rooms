@@ -54,6 +54,7 @@ function setup(raeRole: "read" | "write" = "read") {
       replica: pc.replica,
       vault: pc.vault,
       deviceName: pc.device.name,
+      savesEveryMs: 0,
       isBound: (id) => pc.bound.has(id),
       folderGone: () => void pc.gone.push(pc.folderPath),
       loadState: async () => {
@@ -4013,6 +4014,27 @@ describe("room folder", () => {
     await a.vault.writeText("Team/Task.md", "due: 3\n");
     await s.settle();
     expect(Object.keys((await stored()) as object)).toHaveLength(1);
+  });
+
+  it("stores the saves at most once a minute while running, and always when it stops", async () => {
+    const { s, a } = await pair({ "Team/Task.md": "due: 1\n" });
+    const stored = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+      await a.folder.settled();
+      return a.saved.saves;
+    };
+    await a.vault.writeText("Team/Task.md", "due: 2\n");
+    await s.settle();
+    const first = await stored();
+    expect(Object.keys(first as object)).toHaveLength(1);
+    // Within the minute after storing them, another save waits...
+    (a.folder as any).o.savesEveryMs = 60_000;
+    await a.vault.writeText("Team/Task.md", "due: 3\n");
+    await s.settle();
+    expect(await stored()).toBe(first);
+    // ...and is stored when the folder stops.
+    await a.folder.stop();
+    expect(a.saved.saves).not.toEqual(first);
   });
 
   it("still notices a clash with a save made before a restart", async () => {

@@ -539,7 +539,7 @@ export class MeshService {
     const last = this.quotaNoticeAt.get(roomId) ?? 0;
     if (Date.now() - last < 3_600_000 || !this.replicas.has(roomId)) return;
     this.quotaNoticeAt.set(roomId, Date.now());
-    const name = this.rooms().find((room) => room.id === roomId)?.name ?? "a room";
+    const name = this.roomName(roomId) ?? "a room";
     this.deps.notify(`"${name}" has reached its storage limit on this computer; new changes to it aren't stored or shared.`);
   }
 
@@ -722,18 +722,22 @@ export class MeshService {
     return Object.entries(state.rooms)
       .filter(([, room]) => !room.deleted)
       .map(([id, room]) => {
-        const replica = this.replicas.get(id);
-        const key = replica?.keyFor(room.name.n);
-        let name: string | null = null;
-        if (key) {
-          try {
-            name = openRoomName(this.settings.id, id, key, room.name);
-          } catch {
-            name = null;
-          }
-        }
+        const name = this.roomName(id);
         return { id, name, role: roleIn(state, id, this.settings.userId), members: { ...room.members }, epochs: room.epochs.length, managed: managed.has(id) };
       });
+  }
+
+  /** One room's name, opened alone (rooms() opens every room's). Null for a room that's gone or whose key isn't held. */
+  roomName(roomId: string): string | null {
+    const room = this.state.rooms[roomId];
+    if (!room || room.deleted) return null;
+    const key = this.replicas.get(roomId)?.keyFor(room.name.n);
+    if (!key) return null;
+    try {
+      return openRoomName(this.settings.id, roomId, key, room.name);
+    } catch {
+      return null;
+    }
   }
 
   replica(roomId: string): RoomReplica | null {
