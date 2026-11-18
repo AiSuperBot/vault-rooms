@@ -116,7 +116,7 @@ export class RoomsView extends ItemView {
     const { devicesByUser } = membershipLabels(state);
     const me = state.users[svc.me.userId];
     const label = (userId: string) => personLabel(state, userId);
-    const roomName = (roomId: string) => `"${svc.rooms().find((room) => room.id === roomId)?.name ?? `a room you aren't in (${roomId.slice(1, 5)})`}"`;
+    const roomName = (roomId: string) => `"${svc.roomName(roomId) ?? `a room you aren't in (${roomId.slice(1, 5)})`}"`;
     const online = new Set(svc.connectedDevices());
     const otherDevices = Object.entries(state.devices).filter(([deviceId]) => deviceId !== svc.me.deviceId && activeDevice(state, deviceId));
 

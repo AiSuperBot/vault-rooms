@@ -36,7 +36,7 @@ function setup(folder: string, folders: string[], hidden = false) {
   const plugin: any = new VaultRoomsPlugin(app, {} as any);
   plugin.settings = { mountRoot: "Rooms", mesh: { scope: "testscope", workspace: { id: "ws", rooms: { r1: { folder, ...(hidden ? { hidden } : {}) } } } } };
   const replica = {};
-  plugin.service = { rooms: () => [{ id: "r1", name: "Plans" }], replica: () => replica, state: { devices: {}, users: {} }, me: { deviceId: "d" }, secrets: { sign: {} } };
+  plugin.service = { rooms: () => [{ id: "r1", name: "Plans" }], roomName(id: string) { return this.rooms().find((r: { id: string }) => r.id === id)?.name ?? null; }, replica: () => replica, state: { devices: {}, users: {} }, me: { deviceId: "d" }, secrets: { sign: {} } };
   plugin.saveSettings = async () => {};
   plugin.syncEditors = () => {};
   plugin.editors = { unbindRoom: () => {}, isBound: () => false };
@@ -175,6 +175,17 @@ describe("a room's folder on this computer", () => {
     // A room you may only read would refuse the note.
     writable = false;
     expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, kanban)).toBeNull();
+  });
+
+  it("hooks attachments where Obsidian's paste and drop and Kanban ask for their path: the vault", async () => {
+    const { plugin, items } = setup("Team", ["Team", "Team/Notes"]);
+    items.set("Team/Notes", Object.assign(folderAt("Team/Notes"), { children: [] }));
+    plugin.register = () => {};
+    plugin.app.vault.getAvailablePathForAttachments = async (name: string, ext: string) => `${name}.${ext}`;
+    plugin.hookAttachments();
+    expect(await plugin.app.vault.getAvailablePathForAttachments("Pasted image", "png", { path: "Team/Notes/Plan.md" })).toBe("Team/Notes/Pasted image.png");
+    expect(await plugin.app.vault.getAvailablePathForAttachments("Pasted image", "png", { path: "Private/Plan.md" })).toBe("Pasted image.png");
+    expect(await plugin.app.vault.getAvailablePathForAttachments("Pasted image", "png", null)).toBe("Pasted image.png");
   });
 
   it("gives an attachment a name no file of that folder has, whatever its case", () => {
