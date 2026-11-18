@@ -106,13 +106,14 @@ export default class VaultRoomsPlugin extends Plugin {
     this.register(() => {
       if (files.getAvailablePathForAttachment !== attachmentPath) files.getAvailablePathForAttachment = attachmentPath;
     });
-    // Likewise a note made by opening a room note's link that leads nowhere yet (a Kanban card's link, say): it goes into
-    // the room, so the link leads to it for the others too. A note you start yourself (new note, daily note) stays where
-    // Obsidian puts it: that may be private.
+    // Likewise a note made by opening a room note's link that leads nowhere yet (a Kanban card's link, say), or with
+    // Kanban's "New note from card" on a board in a room: it goes into the room, so the card's link leads to it for the
+    // others too. A note you start yourself (new note, daily note, a new board) stays where Obsidian puts it: that may be
+    // private.
     const newFileParent = files.getNewFileParent.bind(files);
     files.getNewFileParent = (sourcePath, newFilePath) => {
       const parent = newFileParent(sourcePath, newFilePath);
-      return this.linkedNoteFolder(parent, sourcePath, newFilePath) ?? parent;
+      return this.linkedNoteFolder(parent, sourcePath, newFilePath) ?? this.cardNoteFolder(parent, sourcePath, newFilePath) ?? parent;
     };
     this.register(() => {
       if (files.getNewFileParent !== newFileParent) files.getNewFileParent = newFileParent;
@@ -407,11 +408,33 @@ export default class VaultRoomsPlugin extends Plugin {
    * in a room you may only read, and for a new note none of the note's links asked for.
    */
   linkedNoteFolder(parent: TFolder, note: string, linktext?: string): TFolder | null {
-    const roomId = note && linktext ? this.roomAt(note) : null;
-    if (!roomId || this.canWrite(note) === false) return null;
-    const target = getLinkpath(linktext!);
-    if (this.roomAt(normalizePath(`${parent.path}/${target}.md`)) === roomId) return null;
+    if (!note || !linktext) return null;
+    const target = getLinkpath(linktext);
     if (this.app.metadataCache.unresolvedLinks[note]?.[target] === undefined) return null;
+    return this.folderInRoom(parent, note, target);
+  }
+
+  /**
+   * Where Kanban's "New note from card" puts the note when the board is in a room you can edit and Obsidian's choice
+   * (`parent`) is outside it: next to the board, as for a note made from a room note's link. Kanban asks with the board's
+   * path alone, as Obsidian's own New note does with the open note, so the call is told apart by who asks: the first frame
+   * of the stack outside vault-rooms (Obsidian names each plugin's code `plugin:<id>`). Only the immediate caller counts:
+   * Kanban wraps Obsidian's command runner, so it shows up deeper in every command, New note included. A board you start
+   * yourself (Kanban's new board) stays where Obsidian puts it. `stack` is for tests; the trace is taken only for a board.
+   * shortcut: relies on Obsidian's plugin:<id> stack names and Kanban's id; if either changes, Obsidian's choice stays (the safe side)
+   */
+  cardNoteFolder(parent: TFolder, board: string, newFilePath?: string, stack?: string): TFolder | null {
+    if (newFilePath || !board || this.app.metadataCache.getCache(board)?.frontmatter?.["kanban-plugin"] === undefined) return null;
+    const caller = (stack ?? new Error().stack ?? "").split("\n").slice(1).find((frame) => !frame.includes("plugin:vault-rooms")) ?? "";
+    if (!caller.includes("plugin:obsidian-kanban") || caller.includes("newKanban")) return null;
+    return this.folderInRoom(parent, board);
+  }
+
+  /** `note`'s folder, when `note` is in a room you can edit and `parent` (Obsidian's choice for a new note called `name`) is outside that room. */
+  private folderInRoom(parent: TFolder, note: string, name = "Untitled"): TFolder | null {
+    const roomId = this.roomAt(note);
+    if (!roomId || this.canWrite(note) === false) return null;
+    if (this.roomAt(normalizePath(`${parent.path}/${name}.md`)) === roomId) return null;
     const folder = this.app.vault.getAbstractFileByPath(note.slice(0, note.lastIndexOf("/")));
     return folder instanceof TFolder ? folder : null;
   }
