@@ -149,6 +149,34 @@ describe("a room's folder on this computer", () => {
     expect(plugin.linkedNoteFolder(root, "Team/Notes/Board.md", "Connection pool")).toBeNull();
   });
 
+  it("puts a note Kanban makes from a card of a room's board into the room, next to the board", () => {
+    const { plugin } = setup("Team", ["Team", "Team/Notes"]);
+    let writable = true;
+    plugin.service.replica = () => ({ canWrite: () => writable });
+    const boards = new Set(["Team/Notes/Board.md", "Private/Board.md"]);
+    plugin.app.metadataCache = { unresolvedLinks: {}, getCache: (p: string) => ({ frontmatter: boards.has(p) ? { "kanban-plugin": "basic" } : {} }) };
+    const root = folderAt("/");
+    const kanban = "Error\n    at onClick (plugin:obsidian-kanban:67:20000)";
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, kanban)?.path).toBe("Team/Notes");
+    expect(plugin.cardNoteFolder(folderAt("Elsewhere"), "Team/Notes/Board.md", undefined, kanban)?.path).toBe("Team/Notes");
+    // Obsidian's own New note, Kanban's new board, a note that isn't a board, a board outside rooms, a link to follow (the
+    // link rule's case) and Obsidian's choice already in the room: Obsidian's choice stays.
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, "Error\n    at JI.executeCommand (app://obsidian.md/app.js:585:12523)")).toBeNull();
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, "Error\n    at wf.newKanban (plugin:obsidian-kanban:67:11381)")).toBeNull();
+    // Kanban wraps the command runner, so it is deeper in every command's stack: only the immediate caller counts.
+    const command = "Error\n    at Object.callback (app://obsidian.md/app.js:585:10910)\n    at JI.<anonymous> (plugin:obsidian-kanban:67:17160)";
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, command)).toBeNull();
+    // vault-rooms' own frames (this wrapper) are skipped when finding the caller.
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, `Error\n    at files.getNewFileParent (plugin:vault-rooms:1:1)${kanban.slice(5)}`)?.path).toBe("Team/Notes");
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Plan.md", undefined, kanban)).toBeNull();
+    expect(plugin.cardNoteFolder(root, "Private/Board.md", undefined, kanban)).toBeNull();
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", "Connection pool", kanban)).toBeNull();
+    expect(plugin.cardNoteFolder(folderAt("Team/Inbox"), "Team/Notes/Board.md", undefined, kanban)).toBeNull();
+    // A room you may only read would refuse the note.
+    writable = false;
+    expect(plugin.cardNoteFolder(root, "Team/Notes/Board.md", undefined, kanban)).toBeNull();
+  });
+
   it("gives an attachment a name no file of that folder has, whatever its case", () => {
     const { plugin, items } = setup("Team", ["Team"]);
     items.set("Team/Notes", Object.assign(folderAt("Team/Notes"), { children: [{ path: "Team/Notes/Scan.pdf" }] }));
