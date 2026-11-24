@@ -4,7 +4,7 @@
   "version": "0.3.14",
   "minAppVersion": "1.11.4",
   "description": "Share vault folders with people on your local network and edit notes together live, end-to-end encrypted, with no server: every computer is an equal peer. Per-folder access (read, edit, manage), invite links, LAN discovery.",
-  "author": "DNDark (original), AiSuperBot (secure mesh fork)",
+  "author": "DNDark, AiSuperBot",
   "authorUrl": "https://github.com/AiSuperBot/vault-rooms",
   "isDesktopOnly": true
 }

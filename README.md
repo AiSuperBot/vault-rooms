@@ -1,10 +1,10 @@
-# Vault Rooms (secure mesh fork)
+# Vault Rooms
 
 ![Status: Beta](https://img.shields.io/badge/status-beta-orange) ![Platform: Desktop only](https://img.shields.io/badge/platform-desktop--only-blue) ![Network: Local network](https://img.shields.io/badge/network-local%20network-informational)
 
 Share folders of your Obsidian vault ("rooms") with people on the same local network and edit notes together, live, with each other's cursors. There is no server and no cloud: every computer is an equal peer, so it keeps working whoever is switched on. Everything a room shares is end-to-end encrypted.
 
-This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms). It keeps the original's idea and its live editing in Obsidian, and replaces the relay host with an encrypted peer-to-peer design built for an office or lab network where no computer is always on and security matters most. How it works and what it protects against: [SECURE-MESH.md](SECURE-MESH.md).
+It is built for an office or lab network where no computer is always on and security matters most. How it works and what it protects against: [SECURE-MESH.md](SECURE-MESH.md).
 
 ## What you get
 
@@ -36,7 +36,7 @@ This is a fork of [DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms
 
 Each release lists the SHA-256 of its files, and the build is reproducible: building its tag with `npx pnpm@11.7.0 install` and `npx pnpm@11.7.0 build:plugin` gives the same `main.js`.
 
-This fork has the same plugin id as upstream Vault Rooms but a different, incompatible protocol: use it on every computer of the workspace.
+It has the same plugin id as [DNDark's Vault Rooms](https://github.com/DNDark12/vault-rooms) but a different, incompatible protocol: use this build on every computer of the workspace.
 
 ## Getting started
 
@@ -86,4 +86,4 @@ npx pnpm@11.7.0 build:plugin   # builds main.js, copies the plugin files to the 
 
 ## License and credits
 
-MIT. Original Vault Rooms by DNDark ([DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms)); secure mesh fork by AiSuperBot.
+MIT. By DNDark ([DNDark12/vault-rooms](https://github.com/DNDark12/vault-rooms)) and AiSuperBot.
